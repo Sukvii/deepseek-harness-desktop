@@ -9,6 +9,8 @@ export interface AppConfig {
   close_action: string
   backup_retention_count: number
   backup_include_credentials: boolean
+  /** 选定的 WSL 发行版（未选择 / 已清除时为 null；W 系列方案 W5） */
+  wsl_distro?: string | null
 }
 
 /// 共享的 app 配置查询：config-close-action 与 config-debug 共用同一份

@@ -11,8 +11,16 @@ import { ConfigCore } from './config-core'
 import { ConfigDebug } from './config-debug'
 import { ConfigPlugin } from './config-plugin'
 import { ConfigProfile } from './config-profile'
+import { ConfigWslCore } from './config-wsl-core'
 
 export interface ConfigDialogProps extends PropsWithOverlays {}
+
+/** WSL 面板只在 Windows 上挂载：其它平台 `list_wsl_distros` 必然失败（R-W5-5）。 */
+function detectWindows() {
+  return navigator.userAgent.includes('Windows')
+}
+
+const IS_WINDOWS = detectWindows()
 
 export function ConfigDialog(props: ConfigDialogProps) {
   const disclosure = useDisclosure({ props })
@@ -82,6 +90,9 @@ export function ConfigDialog(props: ConfigDialogProps) {
                   </Case>
                   <Case cond="harness">
                     <ConfigCore />
+                    <If cond={IS_WINDOWS}>
+                      <ConfigWslCore />
+                    </If>
                   </Case>
                 </Switch>
               </div>

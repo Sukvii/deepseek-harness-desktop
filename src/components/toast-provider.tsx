@@ -37,6 +37,8 @@ export function ToastProvider(props: ToastProviderProps) {
           queue={activeQueues[placement]}
           className="[&_[data-frontmost=true]_[data-slot=toast-close]]:pointer-events-auto [&_[data-frontmost=true]_[data-slot=toast-close]]:opacity-100"
         >
+          {/* HeroUI 只在 children 为 `undefined` 时用默认渲染器；`null` 会让主窗口
+              toast 完全不渲染（R-W5-6，上游既有问题的最小修复）。 */}
           {props.custom
             ? ({ toast: item }) => {
                 const content = { ...item.content, ...updates.get(item.key) }
@@ -60,7 +62,7 @@ export function ToastProvider(props: ToastProviderProps) {
                   </Toast>
                 )
               }
-            : null}
+            : undefined}
         </Toast.Provider>
       ))}
       {props.children}
