@@ -15,6 +15,26 @@ directory (the Tauri app-data dir for identifier
 
 No manual Node.js or pnpm installation is required.
 
+## WSL core runtime — `wsl-runtime/<dsh-version>/`
+
+The "WSL core" feature runs dsh inside a WSL distro from a **managed runtime**:
+an app-private npm project at `$HOME/.dsh-desktop[.dev]/runtime` inside the
+distro. It is deliberately separate from the user's global npm prefix and from
+any `dsh` they installed themselves — the app never uninstalls, downgrades or
+re-patches those.
+
+Each supported dsh version ships `package.json` + `package-lock.json` under
+`wsl-runtime/<version>/`. The manifest pins the six Cordis compatibility
+components (`@deepseek-ai/cordis`, `-plugin-loader`, `-plugin-hmr`,
+`-plugin-timer`, `-plugin-include`, `-plugin-group`) via `overrides`; the
+lockfile pins every transitive dependency. Upgrades are an `npm ci` of that
+lock into a candidate directory, followed by `--skip-auth` patching, a real
+boot/readiness check, and only then an atomic swap of the whole runtime
+(the previous one is restored if the swap fails). A missing resource for the
+requested version stops the install: there is **no lockless fallback** — an
+`npm install` would re-resolve `^` ranges and produce a HMR/Cordis combination
+that cannot boot with `patchReload: "live"`.
+
 ## `$DSH_HOME` — shared with the official Node.js install
 
 The user data directory (`$DSH_HOME`) used by the running `dsh` process follows
