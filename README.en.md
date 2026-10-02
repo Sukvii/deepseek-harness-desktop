@@ -56,6 +56,7 @@
 - 🧭 **Launch wizard** — On first launch, choose recommended plugins, or re-select them later in config.
 - 🚀 **Self-update** — In-app updates; no need to re-download.
 - 🐾 **Desktop pets** — Manage Pets and Codex sources, download preset pets, import Codex `.zip` packs, and show activity states from conversations.
+- 🐧 **WSL core** — On Windows, run the Harness core inside a WSL distro: data directory, workspaces and commands all live on the Linux side; needs your own Node ≥ 20.
 
 ## Presets
 
