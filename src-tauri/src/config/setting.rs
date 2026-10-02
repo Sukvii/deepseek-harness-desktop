@@ -42,9 +42,15 @@ pub struct Setting {
     #[serde(default)]
     pub desktop_profile_ready: bool,
     /// 活动核心的显式选择：`Some("local")` = 用户 CLI 安装的本地核心，
-    /// `Some("app")` = 桌面端预打包核心；`None` = 自动（本地核心存在时优先）。
+    /// `Some("app")` = 桌面端预打包核心，`Some("wsl")` = WSL 发行版内的核心；
+    /// `None` = 自动（本地核心存在时优先）。
     #[serde(default)]
     pub active_core: Option<String>,
+    /// WSL 核心使用的发行版名（`wsl -l` 中的 NAME）；`None` = 未选择。
+    /// `active_core == Some("wsl")` 但本字段为 `None` 时按自动来源处理
+    /// （归一化在 `service::core::active_source`，不在 setting 层改写）。
+    #[serde(default)]
+    pub wsl_distro: Option<String>,
     /// 用户手动设置的服务端口（设置页「端口」输入，见 bridge::config）。
     /// 自动避让递增（配置端口被占 → 逐级顶高，见 workflow::launch）后，启动时
     /// 该端口空闲则回落回用户选择的值；`None` = 从未手动设置，回落目标为默认
@@ -168,6 +174,7 @@ impl Default for Setting {
             active_profile: default_active_profile(),
             desktop_profile_ready: false,
             active_core: None,
+            wsl_distro: None,
             manual_port: None,
             zoom_factor: default_zoom_factor(),
             close_action: default_close_action(),
@@ -501,5 +508,33 @@ mod tests {
         }))
         .expect("legacy setting should deserialize");
         assert!(legacy.pet_enabled, "旧版临时隐藏字段不得关闭永久启用状态");
+    }
+
+    #[test]
+    fn wsl_distro_defaults_for_legacy_settings() {
+        let setting: Setting = serde_json::from_value(serde_json::json!({
+            "installed": true,
+            "port": 3080,
+            "auto_start": true,
+            "language": "zh-CN"
+        }))
+        .expect("legacy setting without wsl_distro should deserialize");
+
+        assert_eq!(
+            setting.wsl_distro, None,
+            "旧配置缺失 wsl_distro 时应回落 None"
+        );
+    }
+
+    #[test]
+    fn wsl_distro_round_trips() {
+        let setting = Setting {
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&setting).expect("setting should serialize");
+        let restored: Setting = serde_json::from_str(&json).expect("setting should deserialize");
+
+        assert_eq!(restored.wsl_distro.as_deref(), Some("Ubuntu"));
     }
 }

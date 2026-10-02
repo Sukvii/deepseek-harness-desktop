@@ -5,7 +5,7 @@
 //! 核心的探测见 [`super::local`]，来源判定与活动入口见 [`super::source`]。
 
 use crate::config;
-use crate::service::{download, fs_guard, workflow};
+use crate::service::{download, fs_guard, workflow, wsl_core};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
@@ -99,6 +99,36 @@ pub async fn list(app_handle: &AppHandle) -> Vec<HarnessCore> {
         recommended_version: config::recommended_dsh_version(app_handle),
         error: None,
     }];
+
+    // WSL 核心行：仅在已选择发行版时列出（未选择时无 `<distro>`/`<user>` 可填，
+    // 且需保持默认 Windows 核心下的列表不变，见 WSL-CORE-DECISIONS D-W1-3）。
+    // present/version 取 W2 的进程内探测缓存；未探测过时呈「未安装」形态。
+    if let Some(distro) = config::get_store_dat_setting(app_handle).wsl_distro {
+        let probe = wsl_core::probe::cached(&distro);
+        let version = probe
+            .as_ref()
+            .and_then(|p| p.dsh_version.clone())
+            .unwrap_or_default();
+        rows.push(HarnessCore {
+            id: "wsl".to_string(),
+            source: CoreSource::Wsl,
+            above_recommended: !version.is_empty()
+                && config::is_dsh_version_above_recommended(app_handle, &version),
+            version,
+            tag: String::new(),
+            path: format!("wsl.exe -d {distro}"),
+            dir: probe
+                .as_ref()
+                .map(|p| wsl_data_dir_unc(&distro, &p.home))
+                .unwrap_or_default(),
+            present: probe.as_ref().is_some_and(|p| p.dsh.is_some()),
+            active: source == CoreSource::Wsl,
+            preview: false,
+            orphaned: false,
+            recommended_version: config::recommended_dsh_version(app_handle),
+            error: None,
+        });
+    }
 
     // 激活的预打包信息：tag（可空，旧安装无记录）+ 安装目录状态
     let active_tag = config::get_dsh_pkg_tag(app_handle);
@@ -342,9 +372,9 @@ async fn stop_harness_for_core_switch(app_handle: &AppHandle) -> Result<(), Stri
 
 /// 切换活动核心（持久化 + 预打包版本目录互换；服务重启由前端负责）。
 ///
-/// `id` 取值：`local` | `app`（无 tag 记录的旧激活行）| `app-<tag>`。
+/// `id` 取值：`local` | `app`（无 tag 记录的旧激活行）| `app-<tag>` | `wsl`。
 pub async fn set_active(app_handle: &AppHandle, id: &str) -> Result<HarnessCore, String> {
-    let transition_guard = if id == "app" || id == "local" {
+    let transition_guard = if id == "app" || id == "local" || id == "wsl" {
         Some(workflow::acquire_core_transition().await?)
     } else {
         None
@@ -365,6 +395,29 @@ pub async fn set_active(app_handle: &AppHandle, id: &str) -> Result<HarnessCore,
         let mut setting = config::get_store_dat_setting(app_handle);
         setting.active_core = Some(CoreSource::App.as_str().to_string());
         config::set_store_dat_setting(app_handle, setting);
+    } else if id == "wsl" {
+        let Some(distro) = config::get_store_dat_setting(app_handle).wsl_distro else {
+            // 错误串即协议码（W5 面板据 distro_missing 文案展示）
+            return Err("WSL_DISTRO_NOT_SET".to_string());
+        };
+        // R-5：set_active_core 是公开命令，不能只靠 UI 的 present 拦截；
+        // R-W2-1：缓存是进程内的（重启即空），必须能现场探测——放 spawn_blocking
+        // （最长 30 s），不能阻塞 runtime worker。
+        let probed = {
+            let distro = distro.clone();
+            tauri::async_runtime::spawn_blocking(move || wsl_core::probe::cached_or_probe(&distro))
+                .await
+                .map_err(|e| format!("WSL_PROBE_JOIN_FAILED: {e}"))?
+        };
+        if !probed.is_ok_and(|probe| probe.dsh.is_some()) {
+            return Err("WSL_DSH_NOT_INSTALLED".to_string());
+        }
+        stop_harness_for_core_switch(app_handle).await?;
+        // 精确写入 active_core：停服期间（含 800ms sleep 与 spawn_blocking）其它
+        // update_app_config 写入不得被整对象回写覆盖（W1 审核 R-3）
+        config::update_store_dat_setting(app_handle, |setting| {
+            setting.active_core = Some(CoreSource::Wsl.as_str().to_string());
+        });
     } else if let Some(tag) = id.strip_prefix("app-") {
         switch_app_version(app_handle, tag).await?;
     } else {
@@ -396,17 +449,22 @@ async fn switch_app_version(app_handle: &AppHandle, tag: &str) -> Result<(), Str
     let deps = dependencies_dir(app_handle);
     let active_dir = config::get_dsh_install_path(app_handle);
     fs_guard::validate_id(tag)?;
-    let target_dir = existing_slot_dir(app_handle, tag)
-        .ok_or_else(|| format!("CORE_VERSION_NOT_DOWNLOADED: {tag}"))?;
     let cur_tag = config::get_dsh_pkg_tag(app_handle);
 
-    // 激活目录已是目标版本（tag 相同）→ 仅切来源标记（如 local → app 同版本）
+    // 激活目录已是目标版本（tag 相同）→ 仅切来源标记（如 local / wsl → app 同版本）。
+    // 必须**早于**槽位存在性检查：激活目录固定名为 `dependencies/dsh`，同 tag 时磁盘上
+    // 并不存在 `dependencies/<tag>` 槽位，先查槽位会误报 `CORE_VERSION_NOT_DOWNLOADED`。
+    // WSL 核心激活期间该行不再显示为激活（`is_active` 要求来源为 App），因而变成可点击，
+    // 会把「切回 app 同版本」走到这里（W5 验收实测）。
     if cur_tag.as_deref() == Some(tag) {
         let mut setting = config::get_store_dat_setting(app_handle);
         setting.active_core = Some(CoreSource::App.as_str().to_string());
         config::set_store_dat_setting(app_handle, setting);
         return Ok(());
     }
+
+    let target_dir = existing_slot_dir(app_handle, tag)
+        .ok_or_else(|| format!("CORE_VERSION_NOT_DOWNLOADED: {tag}"))?;
 
     // 切换前停止运行中的服务，避免目录被进程句柄锁定
     if workflow::has_owned_process() {
@@ -581,6 +639,17 @@ fn active_app_version(
         .or(manifest_version)
 }
 
+/// WSL 核心行的数据目录（Windows UNC 形态）：
+/// `\\wsl.localhost\<distro>\<linux home>\.dsh-desktop[.dev]`。
+fn wsl_data_dir_unc(distro: &str, linux_home: &str) -> String {
+    format!(
+        r"\\wsl.localhost\{}{}\{}",
+        distro,
+        linux_home.replace('/', r"\"),
+        wsl_core::dsh_home_dir_name()
+    )
+}
+
 /// 构造某个已下载 tag 的核心行（下载完成/已存在时返回）。
 fn row_for_tag(app_handle: &AppHandle, tag: &str, dir: &Path) -> HarnessCore {
     let active = config::get_dsh_pkg_tag(app_handle).as_deref() == Some(tag)
@@ -636,6 +705,25 @@ mod tests {
         assert!(safe_slot_path(&root, "dsh-evil").is_err());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn wsl_data_dir_unc_maps_linux_home_to_unc() {
+        assert_eq!(
+            wsl_data_dir_unc("Ubuntu", "/home/pixel"),
+            format!(
+                r"\\wsl.localhost\Ubuntu\home\pixel\{}",
+                wsl_core::dsh_home_dir_name()
+            )
+        );
+        // 非 /home 起始的 home（如 root）同样整体映射
+        assert_eq!(
+            wsl_data_dir_unc("Debian", "/root"),
+            format!(
+                r"\\wsl.localhost\Debian\root\{}",
+                wsl_core::dsh_home_dir_name()
+            )
+        );
     }
 
     #[test]

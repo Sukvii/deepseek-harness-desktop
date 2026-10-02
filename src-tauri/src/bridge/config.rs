@@ -53,6 +53,25 @@ fn persist_zoom_factor(app_handle: &AppHandle, zoom_factor: f64) -> Result<f64, 
     Ok(setting.zoom_factor)
 }
 
+/// 归一化 `update_app_config` 的 `wsl_distro` 入参（纯函数，便于单测）。
+///
+/// - `Ok(None)`：`input` 为 `None`，调用方不修改现有值；
+/// - `Ok(Some(None))`：空串 / 全空白 → 清除为 `None`；
+/// - `Ok(Some(Some(name)))`：trim 后的发行版名；
+/// - `Err("WSL_DISTRO_INVALID")`：含控制字符（随后会作为 `wsl.exe -d <name>` 的
+///   位置参数，控制字符只会让调用直接失败）。
+fn normalize_wsl_distro(input: Option<String>) -> Result<Option<Option<String>>, String> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(Some(None));
+    }
+    // 校验与 bridge 命令共用同一纯函数（R-W2-11）。
+    let distro = crate::service::wsl_core::validate_distro(&raw)?;
+    Ok(Some(Some(distro.to_string())))
+}
+
 /// 当前桌面端配置
 #[tauri::command]
 pub async fn get_app_config(app_handle: AppHandle) -> Result<config::Setting, String> {
@@ -67,6 +86,12 @@ pub async fn get_app_config(app_handle: AppHandle) -> Result<config::Setting, St
 ///
 /// 备份字段（backup_retention_count / backup_include_credentials）由前端
 /// 设置页写入，归一化由 `normalize_backup_fields` 统一负责。
+///
+/// `wsl_distro` 为 WSL 核心使用的发行版名（设置页选择后持久化）：`None` = 不修改，
+/// 空串（trim 后）= 清除为 `None`，含控制字符 → `Err("WSL_DISTRO_INVALID")`（W1 审核 R-3）。
+// Tauri 命令的参数就是前端 invoke 的字段名，选项式参数只能逐个平铺（拆结构体会
+// 改变 invoke 载荷形态）；参数超阈值属该形态固有代价。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn update_app_config(
     app_handle: AppHandle,
@@ -76,6 +101,7 @@ pub async fn update_app_config(
     close_action: Option<String>,
     backup_retention_count: Option<u32>,
     backup_include_credentials: Option<bool>,
+    wsl_distro: Option<String>,
 ) -> Result<config::Setting, String> {
     if let Some(port) = port {
         if port == 0 {
@@ -89,6 +115,23 @@ pub async fn update_app_config(
             cli::ensure(&app_handle)?;
         } else {
             cli::remove(&app_handle)?;
+        }
+    }
+    // 入参校验在闭包外完成（闭包不能返回 Result）；归一化结果的 `Some(None)` = 清除
+    let wsl_distro = normalize_wsl_distro(wsl_distro)?;
+    // WSL 服务运行中禁止改／清空发行版（R-W3-1）：停止路径按**登记表里**的目标
+    // kill，改到新发行版后旧发行版的 dsh 就成了孤儿并继续占端口。与「改端口
+    // 需重启」同一思路；W5 的下拉框据此禁用或提示。
+    if let Some(requested) = wsl_distro.as_ref() {
+        let current = config::get_store_dat_setting(&app_handle).wsl_distro;
+        if requested.as_deref() != current.as_deref()
+            && crate::service::workflow::has_owned_process()
+            && crate::service::core::is_wsl_active(&app_handle)
+        {
+            return Err(
+                "WSL_DISTRO_LOCKED: stop the WSL core service before changing the distro"
+                    .to_string(),
+            );
         }
     }
     let setting = config::update_store_dat_setting(&app_handle, |setting| {
@@ -112,6 +155,9 @@ pub async fn update_app_config(
         }
         if let Some(include) = backup_include_credentials {
             setting.backup_include_credentials = include;
+        }
+        if let Some(distro) = wsl_distro {
+            setting.wsl_distro = distro;
         }
     });
     Ok(setting)
@@ -184,7 +230,7 @@ pub fn get_dsh_theme(app_handle: AppHandle) -> config::DshTheme {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_zoom_factor, ZoomAction};
+    use super::{next_zoom_factor, normalize_wsl_distro, ZoomAction};
     use crate::config::{ZOOM_FACTOR_MAX, ZOOM_FACTOR_MIN};
 
     #[test]
@@ -200,5 +246,32 @@ mod tests {
             next_zoom_factor(ZOOM_FACTOR_MIN, ZoomAction::Decrease),
             ZOOM_FACTOR_MIN
         );
+    }
+
+    #[test]
+    fn normalize_wsl_distro_distinguishes_keep_clear_and_set() {
+        assert_eq!(normalize_wsl_distro(None).unwrap(), None);
+        assert_eq!(
+            normalize_wsl_distro(Some(String::new())).unwrap(),
+            Some(None),
+            "空串 = 清除"
+        );
+        assert_eq!(
+            normalize_wsl_distro(Some("   ".to_string())).unwrap(),
+            Some(None),
+            "全空白 = 清除"
+        );
+        assert_eq!(
+            normalize_wsl_distro(Some("  Ubuntu  ".to_string())).unwrap(),
+            Some(Some("Ubuntu".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_wsl_distro_rejects_control_characters() {
+        for raw in ["a\nb", "a\tb"] {
+            let err = normalize_wsl_distro(Some(raw.to_string())).unwrap_err();
+            assert!(err.starts_with("WSL_DISTRO_INVALID"), "{err}");
+        }
     }
 }

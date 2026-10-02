@@ -3,12 +3,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useEffect } from 'react'
 
-/** 核心来源：local = 用户 CLI 安装；app = 桌面端预打包 */
-export type CoreSource = 'local' | 'app'
+/** 核心来源：local = 用户 CLI 安装；app = 桌面端预打包；wsl = WSL 发行版内的核心（W 系列方案） */
+export type CoreSource = 'local' | 'app' | 'wsl'
 
 /** Rust 侧 service::core::HarnessCore 的序列化形态（camelCase） */
 export interface HarnessCore {
-  /** `local` | `app`（无 tag 记录的旧激活行）| `app-<tag>` */
+  /** `local` | `wsl` | `app`（无 tag 记录的旧激活行）| `app-<tag>` */
   id: string
   source: CoreSource
   /** 版本号（不含 v 前缀；缺失为空串） */
@@ -37,7 +37,7 @@ export interface UseDshCoresResult {
   cores: HarnessCore[]
   loading: boolean
   error: string
-  /** 切换活动核心（id: local | app | app-<tag>；持久化；服务重启由调用方触发） */
+  /** 切换活动核心（id: local | wsl | app | app-<tag>；持久化；服务重启由调用方触发） */
   setActiveCore: (id: string) => Promise<HarnessCore>
   /** 下载指定 tag 的预打包核心到历史槽位（不激活） */
   downloadCore: (tag: string) => Promise<HarnessCore>

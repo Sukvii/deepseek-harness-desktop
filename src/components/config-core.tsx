@@ -1,4 +1,4 @@
-import type { HarnessCore } from '../hooks/use-dsh-cores'
+import type { CoreSource, HarnessCore } from '../hooks/use-dsh-cores'
 import { ArrowRotateRight, CircleArrowDown as DownloadIcon, FolderOpen } from '@gravity-ui/icons'
 import { Button, Checkbox, Chip, Description, Label, Spinner } from '@heroui/react'
 import { useOverlay } from '@overlastic/react'
@@ -18,6 +18,9 @@ import { Item } from './item'
 import { Modal } from './modal'
 import { PanelHeader } from './panel-header'
 import { PanelState } from './panel-state'
+
+/** 核心列表的来源展示顺序（全序；W1 审核 R-2：旧比较器对 wsl 不满足全序） */
+const SOURCE_RANK: Record<CoreSource, number> = { local: 0, wsl: 1, app: 2 }
 
 /**
  * 「核心」面板：管理 Harness 引擎来源与多版本。
@@ -49,13 +52,13 @@ export function ConfigCore() {
 
   // 本地核心未检测到时不渲染 local 行（保留 local_missing_hint 提示）
   // 后端列表在部分缓存/旧版本返回路径中可能仍保持远程顺序，前端统一按版本从高到低排序。
-  // 本地核心固定放在版本列表前，预打包核心按 SemVer 排序。
+  // 来源顺序固定为 local → wsl → app（SOURCE_RANK 全序），预打包核心内部按 SemVer 排序。
   const rows = cores
     .filter(core => !(core.source === 'local' && !core.present))
     .sort((a, b) => {
       if (a.source !== b.source)
-        return a.source === 'local' ? -1 : 1
-      if (a.source === 'local')
+        return SOURCE_RANK[a.source] - SOURCE_RANK[b.source]
+      if (a.source !== 'app')
         return 0
       // 后端可能从历史 package.json 得到带 src-/dsh-src- 前缀的版本，
       // 排序时使用 tag 作为兜底，避免当前激活版本被排到末尾。
@@ -280,6 +283,11 @@ export function ConfigCore() {
                         {t('core.app')}
                       </Chip>
                     </If>
+                    <If cond={core.source === 'wsl'}>
+                      <Chip size="sm" variant="soft" color="accent" className="shrink-0 font-medium">
+                        {t('core.wsl')}
+                      </Chip>
+                    </If>
                     <If cond={core.orphaned}>
                       <Chip size="sm" variant="soft" color="warning" className="shrink-0 font-medium">
                         {t('core.orphaned')}
@@ -309,7 +317,7 @@ export function ConfigCore() {
                     </If>
                     <If cond={!core.present}>
                       <Description className="min-w-0 text-xs text-muted">
-                        {t('core.not_downloaded')}
+                        {core.source === 'wsl' ? t('core.wsl_not_installed') : t('core.not_downloaded')}
                       </Description>
                     </If>
                   </>
@@ -398,7 +406,7 @@ export function ConfigCore() {
   )
 }
 
-/** 版本展示：优先版本号，缺失回落来源 id */
+/** 版本展示：优先版本号，缺失回落来源 id（W1 审核 R-2：不再一律写死 'app'） */
 function displayVersion(version: HarnessCore): string {
-  return version.version || (version.source === 'local' ? 'local' : 'app')
+  return version.version || version.source
 }
