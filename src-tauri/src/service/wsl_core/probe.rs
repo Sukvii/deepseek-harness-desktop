@@ -72,6 +72,7 @@ pub fn cached(distro: &str) -> Option<WslCoreProbe> {
 /// 开机路径上 `runtime_ready` 刚探测过几百毫秒，`launch_wsl` 的启动前探测可以
 /// 直接复用，省掉一次 2–7 s 的完整探测；超过窗口仍走现场探测（`skip_auth_ready`
 /// 这类判定的可信度依赖「刚刚测过」，R-W2-2）。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub fn cached_fresh(distro: &str, max_age: std::time::Duration) -> Option<WslCoreProbe> {
     cache()
         .lock()

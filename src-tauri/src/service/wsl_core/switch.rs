@@ -141,6 +141,7 @@ impl PendingSwitch {
     }
 
     /// 标记是否指向这次启动目标（发行版 + 数据目录名；stamp 只影响清理范围）。
+    #[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
     pub fn matches(&self, distro: &str, dir_name: &str) -> bool {
         self.distro == distro && self.dir_name == dir_name
     }
@@ -187,6 +188,7 @@ pub fn claim_health_target(app: &AppHandle, port: u16) -> HealthClaim {
 ///
 /// 用于探测**发起前**的判定（后端截止任务先确认「要自测的就是本次切换」再探测）；
 /// 完成后的判定用 [`claim_resolves`]，两者共用 [`target_matches`] 的目标规则。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub fn claim_matches_pending(claim: &HealthClaim, pending: &PendingSwitch) -> bool {
     let owned = claim
         .owned
@@ -260,6 +262,7 @@ pub fn claim_resolves(
 ///
 /// 只放宽「owned 由本次目标 → `None`」这一种情形；owned 比较本身不放宽。返回 `true`
 /// 表示失败结果可按原 pending 处置（本判定只用于截止点的失败，不采信成功结果）。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub fn exit_rebind_matches(
     claim: &HealthClaim,
     world_distro: Option<&str>,
@@ -324,6 +327,7 @@ fn resolve_claim(app: &AppHandle, claim: &HealthClaim) -> Option<PendingSwitch> 
 /// [`exit_rebind_matches`] 的实参版：读取当前世界与标记后判定，返回本次切换。
 ///
 /// 只读、不改变任何状态——处置仍由 `rollback` 在其自身的身份复核与共享互斥下执行。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 fn rebind_exited_target(
     app: &AppHandle,
     claim: &HealthClaim,
@@ -434,6 +438,7 @@ pub async fn arm(
 }
 
 /// 后端截止时刻（`started_at + PENDING_GRACE`，饱和加）。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub fn deadline_at(started_at: u64) -> u64 {
     started_at.saturating_add(PENDING_GRACE.as_secs())
 }
@@ -498,6 +503,7 @@ pub fn runtime_baseline_matches(pending: &PendingSwitch) -> Option<bool> {
 ///
 /// R-V8-1B-2：启动登记同样是标记变更，与确认 / 回滚共用处置互斥——确认的
 /// 「读取-核对-清除」不会与这里的「读取-核对-改写」交错。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub async fn note_launch_started(app: &AppHandle, distro: &str, dir_name: &str) {
     let _disposal = disposal().lock().await;
     let Some(mut pending) = read(app) else {
@@ -527,6 +533,7 @@ pub async fn note_launch_started(app: &AppHandle, distro: &str, dir_name: &str) 
 /// 本次切换（被确认 / 已回滚 / 被替换 / 重新启动过 → 直接退出，不碰任何文件）→
 /// 自测一次健康：成功按与前端健康路径完全相同的规则确认；失败则宽限已到点
 /// （本任务就是宽限的终点），身份核对通过即回滚。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 async fn deadline_task(app: AppHandle, pending: PendingSwitch) {
     let Some(started_at) = pending.started_at else {
         return;
@@ -668,6 +675,7 @@ pub async fn try_confirm(app: &AppHandle, pending: &PendingSwitch) -> bool {
 }
 
 /// 正式启动失败路径（`workflow::launch` 的 WSL 分支调用）：有待确认切换即回滚。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub async fn on_launch_failure(app: &AppHandle, distro: &str, dir_name: &str) {
     let Some(pending) = read(app) else {
         return;

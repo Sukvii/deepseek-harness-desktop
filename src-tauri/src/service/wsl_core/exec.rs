@@ -19,6 +19,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 子进程输出流标记（流式转发时区分 stdout / stderr）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 不构造变体（R-W3-9）
 pub enum WslStream {
     Stdout,
     Stderr,

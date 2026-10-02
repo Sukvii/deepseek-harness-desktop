@@ -86,6 +86,7 @@ pub const RESOLVE_DSH: &str = concat!(
 ///
 /// `--skip-auth` 固定传；能否传由调用方用探测结果的 `skip_auth_ready` 提前把关
 /// （未命中直接拒绝启动，不盲传，R-W2-2）。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub const START: &str = concat!(
     env_preamble!(),
     "\n",
@@ -112,6 +113,7 @@ exec "$b" --profile web --port "$2" --no-open --skip-auth"#
 /// **execve 时给定的路径**（不是解析后的符号链接目标）交给解释器，故 cmdline 形如
 /// `node /…/runtime/node_modules/.bin/dsh --profile …`，`dsh --profile` 仍然命中
 /// （v8 集成验收对新入口复验过）。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 调用路径可达（R-W3-9）
 pub const STOP: &str = concat!(
     env_preamble!(),
     r#"d="$HOME/$1"; f="$d/.harness.pid"; p=$(sed -n 1p "$f" 2>/dev/null); b=$(sed -n 2p "$f" 2>/dev/null); cur=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); if [ -n "$p" ] && [ "$b" = "$cur" ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- 'dsh --profile'; then kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; sleep 1; kill -KILL -- "-$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; fi; rm -f "$f"; true"#
