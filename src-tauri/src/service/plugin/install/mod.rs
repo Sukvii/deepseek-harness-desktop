@@ -186,6 +186,15 @@ async fn install_with_cancel(
     // 确保 pnpm/dsh shim 存在
     cli::ensure_shims(app_handle)?;
 
+    // WSL 核心（W3.6）：插件管理不适用于发行版内的核心（入口是 `wsl.exe`，
+    // 本机解析不到 dsh 文件），返回明确错误码而不是误导性的 HARNESS_NOT_FOUND。
+    if core::is_wsl_active(app_handle) {
+        return Err(
+            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
+                .to_string(),
+        );
+    }
+
     let node = config::get_node_binary_path(app_handle);
     // 活动核心的 dsh 入口：本地核心存在时用本地 CLI，否则预打包
     let dsh_bin = core::active_dsh_binary(app_handle);

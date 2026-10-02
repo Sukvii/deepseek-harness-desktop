@@ -16,6 +16,7 @@ pub mod preset_pet;
 pub mod profile;
 pub mod system_os;
 pub mod updater;
+pub mod wsl_core;
 
 pub use backup::*;
 pub use clipboard::*;
@@ -28,3 +29,4 @@ pub use preset_pet::*;
 pub use profile::*;
 pub use system_os::*;
 pub use updater::*;
+pub use wsl_core::*;

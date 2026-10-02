@@ -106,6 +106,11 @@ pub async fn cancel_internal_plugins() -> Result<(), String> {
 /// 资源文件每次安装都被强制覆盖不可比对，只能比对 app-data 里记录的内容指纹。
 #[tauri::command]
 pub fn get_preinstall_pending(app_handle: AppHandle) -> Result<bool, String> {
+    // WSL 核心（W3.6）：预设插件引导针对 Windows 侧档案，WSL 核心没有可引导的
+    // 内置插件，直接返回 false（跳过引导界面）。
+    if crate::service::core::is_wsl_active(&app_handle) {
+        return Ok(false);
+    }
     Ok(plugin::preinstall_pending(&app_handle))
 }
 

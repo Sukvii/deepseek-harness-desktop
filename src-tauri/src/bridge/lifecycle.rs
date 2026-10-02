@@ -81,6 +81,45 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
         return Ok(false);
     };
 
+    // WSL 核心（W3.4）：就绪与安装都走 `wsl_core::install::ensure`——幂等版在
+    // 「已装且已是目标版本」时只有两次 probe + 一次 `npm view`，秒级返回，因此
+    // 每次开机的自愈调用不会真的跑一遍 npm（R-W2-1）。
+    if core::is_wsl_active(&app_handle) {
+        let Some(distro) = config::get_store_dat_setting(&app_handle).wsl_distro else {
+            return Err("WSL_DISTRO_NOT_SET: no WSL distro is selected".to_string());
+        };
+        // 服务运行中且已就绪 → no-op 快路径（D-W3-4：boot 阶段 `launch` 已经在跑，
+        // 这次自愈调用不该做任何事）；确实需要安装时交给 `ensure` 的统一闸门
+        // （R-W3-3 已下沉到 ensure 内，返回 `WSL_INSTALL_BUSY`）。
+        if workflow::has_owned_process() {
+            let probed = tauri::async_runtime::spawn_blocking({
+                let distro = distro.clone();
+                move || crate::service::wsl_core::probe::probe(&distro)
+            })
+            .await
+            .map_err(|e| format!("WSL_PROBE_JOIN_FAILED: {e}"))?;
+            if probed.is_ok_and(|probe| probe.dsh.is_some() && probe.skip_auth_ready) {
+                return Ok(false);
+            }
+        }
+        let before = crate::service::wsl_core::probe::cached(&distro).and_then(|p| p.dsh_version);
+        // D-W5R-2 / R-V8-2：默认目标 = 桌面端推荐版本；缺失/无效对**所有调用方**
+        // 一律报错（不再以已装版本兜底——那会让缺配置在自愈路径上静默 no-op）。
+        let spec = crate::service::wsl_core::install::default_version_spec(&app_handle)?;
+        let after = crate::service::wsl_core::install::ensure(&app_handle, &distro, &spec).await?;
+        // `installed` 标记同样适用于 WSL 核心：让前端跳过「正在安装依赖」界面；
+        // 切回 Windows 核心时若文件缺失会由 `start` 的文件检查复位（既有自愈）。
+        let mut setting = config::get_store_dat_setting(&app_handle);
+        setting.installed = true;
+        config::set_store_dat_setting(&app_handle, setting);
+        log::info!(
+            "WSL core ensure finished (version {:?} -> {:?})",
+            before,
+            after.dsh_version
+        );
+        return Ok(before.as_deref() != after.dsh_version.as_deref());
+    }
+
     // 以实际安装状态为准：本地安装与 GitHub 最新 release 的 commit hash
     // 不一致时，说明上游 pkg 有更新/修复，需要自动重新下载。
     let node_ok = download::Nodejs.check_installed(&app_handle);
@@ -265,6 +304,13 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
 pub async fn check_dsh_update(
     app_handle: AppHandle,
 ) -> Result<Option<download::LatestDshPkg>, String> {
+    // WSL 核心（W3.6）：WSL 内的 dsh 更新走「安装 / 更新」面板（W5），这里不做
+    // Windows 侧 pkg 的更新提示（两者版本线互相独立）。
+    if core::is_wsl_active(&app_handle) {
+        log::info!("Suppressing dsh update check because the WSL core is active");
+        return Ok(None);
+    }
+
     // 本地没有安装时无需提示更新
     let dsh_files_ok = download::Dsh.check_installed(&app_handle);
     if !dsh_files_ok {
@@ -366,7 +412,22 @@ pub fn get_dsh_status() -> workflow::status::Status {
 /// 已就绪——此时前端跳过安装/下载界面，交给 install_dependencies 内部自愈
 /// 补记 installed 后直接启动，避免自动重开时闪现误导用户的安装界面。
 #[tauri::command]
-pub fn runtime_ready(app_handle: AppHandle) -> bool {
+pub async fn runtime_ready(app_handle: AppHandle) -> bool {
+    // WSL 核心：就绪 = 发行版内已装 dsh 且 `--skip-auth` 补丁就位。缓存是进程
+    // 内的、重启即空（R-W2-1），因此必须现场探测；该命令由前端 boot 阶段
+    // `await`，绝不能把最长 30 s 的 WSL 探测放在主线程，故改为 async 命令并在
+    // `spawn_blocking` 内探测（W3.4）。
+    if core::is_wsl_active(&app_handle) {
+        let Some(distro) = config::get_store_dat_setting(&app_handle).wsl_distro else {
+            return false;
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::service::wsl_core::probe::cached_or_probe(&distro)
+        })
+        .await
+        .is_ok_and(|probed| probed.is_ok_and(|p| p.dsh.is_some() && p.skip_auth_ready));
+    }
+
     download::Nodejs.check_installed(&app_handle)
         && download::Dsh.check_installed(&app_handle)
         && download::Pnpm.check_installed(&app_handle)

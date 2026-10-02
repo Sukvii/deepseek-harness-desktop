@@ -14,7 +14,7 @@ pub async fn get_cores(app_handle: AppHandle) -> Vec<core::HarnessCore> {
     core::list(&app_handle).await
 }
 
-/// 切换活动核心（id: `local` | `app` | `app-<tag>`；持久化 + 预打包版本目录
+/// 切换活动核心（id: `local` | `wsl` | `app` | `app-<tag>`；持久化 + 预打包版本目录
 /// 互换；自动重启由前端负责）
 #[tauri::command]
 pub async fn set_active_core(

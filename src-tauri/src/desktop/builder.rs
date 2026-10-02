@@ -47,7 +47,11 @@ pub fn setup(app_handle: tauri::AppHandle) {
     }
 
     // 启动前清扫上次崩溃残留的孤儿 Harness（端口/PID 双重确认，见
-    // workflow::sweep_orphan_harness），避免新实例一路漂移端口
+    // workflow::sweep_orphan_harness），避免新实例一路漂移端口。
+    // 顺序保证（R-W4-1）：本函数在 `.setup()` 内同步执行，事件循环尚未启动，
+    // 前端 boot 的 `launch_harness` / `install_dependencies` 不可能与下面的数据
+    // 迁移、档案引导并发；WSL 核心下 sweep 会跳过发行版内的 STOP（残留由首次
+    // launch 的 STOP 回收），因此这里没有任何 `wsl.exe` 调用（R-W3-4）。
     crate::service::workflow::sweep_orphan_harness(&app_handle);
 
     // 旧版 AppData data/dsh → 官方 $DSH_HOME（~/.dsh）数据迁移。
@@ -554,6 +558,10 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::download_core,
         crate::bridge::remove_core,
         crate::bridge::update_local_core,
+        crate::bridge::list_wsl_distros,
+        crate::bridge::probe_wsl_core,
+        crate::bridge::install_wsl_core,
+        crate::bridge::import_wsl_credentials,
         crate::bridge::proxy_health_check,
         crate::bridge::get_runtime_info,
         crate::bridge::runtime_ready,

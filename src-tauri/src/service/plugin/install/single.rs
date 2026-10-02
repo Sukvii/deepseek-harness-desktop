@@ -161,6 +161,14 @@ async fn run_single_plugin_command(
 
     cli::ensure_shims(app_handle)?;
 
+    // WSL 核心（W3.6）：同 install/mod.rs——插件管理对 WSL 核心不可用。
+    if core::is_wsl_active(app_handle) {
+        return Err(
+            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
+                .to_string(),
+        );
+    }
+
     let node = config::get_node_binary_path(app_handle);
     let dsh_bin = core::active_dsh_binary(app_handle);
     if !node.exists() {

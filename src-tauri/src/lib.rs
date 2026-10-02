@@ -54,8 +54,10 @@ pub fn run() {
             // 残留并把原生模块 DLL（如 sharp 的 libvips-42.dll）锁在内存，
             // 下次启动重新解压时会失败（Windows os error 32）
             tauri::RunEvent::Exit => {
+                // 条件含「持有进程」：WSL 核心用户可能从未安装 Windows 核心
+                // （`installed=false`），但登记表里有中继要回收（R-W3-1）。
                 let setting = config::get_store_dat_setting(app_handle);
-                if setting.installed {
+                if setting.installed || service::workflow::has_owned_process() {
                     service::workflow::stop_on_exit(app_handle.clone(), setting.port);
                 }
             }

@@ -239,6 +239,14 @@ pub(crate) fn repair_loader_state(app_handle: &AppHandle) -> Result<(), String> 
 }
 
 pub(crate) async fn ensure(app_handle: &AppHandle) -> Result<(), String> {
+    // WSL 核心（W3.6）：内置插件只注入 Windows 侧档案（`~/.dsh` 的 desktop
+    // profile），WSL 核心有独立的 Linux 数据目录与插件解析根，注入既不生效也会
+    // 让启动阶段误判。前端 boot 会 `await` 本命令，因此返回 Ok 而非 Err。
+    if crate::service::core::is_wsl_active(app_handle) {
+        log::info!("internal plugins are not injected into the WSL core profile");
+        return Ok(());
+    }
+
     let presets = load_presets(app_handle);
     let internal: Vec<_> = presets.into_iter().filter(|p| p.internal).collect();
     if internal.is_empty() {

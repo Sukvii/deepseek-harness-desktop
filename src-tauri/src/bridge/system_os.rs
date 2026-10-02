@@ -11,10 +11,21 @@ use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
 /// 健康检查（通过 Rust 代理，避免 WebView CORS 问题）
+///
+/// R-V8-1：这也正是桌面 readiness 的完成路径——WSL 核心有待确认切换时，健康结果
+/// 在这里驱动「确认（清理本次备份槽）」或「回滚（恢复切换前的运行时）」，前端
+/// 启动状态机不需要任何改动。
+///
+/// R-V8-1B-1：探测开始**前**固定探测上下文（`claim_health_target`）——健康结果
+/// 本身不携带身份，完成时按这份上下文核对（旧请求 / 另一目标的结果不得处置当前
+/// 待确认切换）。
 #[tauri::command]
 pub async fn proxy_health_check(app_handle: AppHandle) -> Result<String, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
-    crate::service::workflow::proxy_health_check(port).await
+    let claim = crate::service::wsl_core::switch::claim_health_target(&app_handle, port);
+    let result = crate::service::workflow::proxy_health_check(port).await;
+    crate::service::wsl_core::switch::note_health(&app_handle, &claim, &result).await;
+    result
 }
 
 /// 运行时/版本/诊断信息（侧边栏展示）

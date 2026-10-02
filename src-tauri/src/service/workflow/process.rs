@@ -34,13 +34,29 @@ pub(crate) static LAUNCH_GUARD: AtomicBool = AtomicBool::new(false);
 /// 「PID 清空」与「句柄关闭」之间不存在跨原子竞态（WARN-6）。历史上 PID/句柄
 /// 分两个 `Atomic*` 存储，`stop` 读 PID 与监视线程清句柄之间有微窗口可能导致
 /// 漏杀或重复 close。
-#[derive(Clone, Copy)]
+/// WSL 核心中继的停止目标：在哪个发行版、哪个数据目录名下执行 `STOP`。
+///
+/// 随进程登记（R-W3-1）：停止那一刻的 store 可能与启动时不同（用户改或清空
+/// `wsl_distro`），若仍按「当前设置」决定在哪个发行版 kill，旧发行版里的 dsh
+/// 就会成为孤儿并继续占端口（F5 回归）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))] // 仅在 Windows 构造与读取（R-W4-5）
+pub(super) struct WslTarget {
+    pub(super) distro: String,
+    /// 相对 `$HOME` 的数据目录名（见 `workflow::wsl_launch::wsl_dsh_home`）。
+    pub(super) dsh_home: String,
+}
+
+#[derive(Clone)]
 pub(super) struct OwnedProcess {
     pub(super) pid: u32,
     /// Windows 进程句柄（原始 HANDLE 转 usize 存储，避免 `*mut c_void` 非 Send）。
     /// 只在 Windows 存在；Unix 无句柄概念。
     #[cfg(windows)]
     pub(super) handle: usize,
+    /// `Some` = 这是 WSL 中继：停止前必须先在 Linux 侧按该目标跑 `STOP`。
+    #[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 读取（R-W4-5）
+    pub(super) wsl: Option<WslTarget>,
 }
 
 fn owned_process_lock() -> &'static Mutex<Option<OwnedProcess>> {
@@ -54,7 +70,7 @@ pub(super) fn set_owned_process(pid: u32) {
     let mut guard = owned_process_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    *guard = Some(OwnedProcess { pid });
+    *guard = Some(OwnedProcess { pid, wsl: None });
 }
 
 /// 若调用方 owns 该进程（Windows 额外存句柄），记录之。
@@ -63,7 +79,24 @@ pub(super) fn set_owned_process_with_handle(pid: u32, handle: usize) {
     let mut guard = owned_process_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    *guard = Some(OwnedProcess { pid, handle });
+    *guard = Some(OwnedProcess {
+        pid,
+        handle,
+        wsl: None,
+    });
+}
+
+/// 记录 WSL 中继（Windows）：停止时按 `target` 在 Linux 侧先跑 `STOP`（R-W3-1）。
+#[cfg(windows)]
+pub(super) fn set_owned_wsl_process_with_handle(pid: u32, handle: usize, target: WslTarget) {
+    let mut guard = owned_process_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(OwnedProcess {
+        pid,
+        handle,
+        wsl: Some(target),
+    });
 }
 
 /// 原子取出持有的进程（PID+句柄一起）。取走者负责关闭 Windows 句柄；
@@ -147,6 +180,20 @@ pub fn has_owned_process() -> bool {
         .is_some()
 }
 
+/// 当前持有进程的 WSL 目标（发行版 + 数据目录名）；无持有进程 / Windows 核心 → `None`。
+///
+/// R-V8-1B：健康结果必须绑定**实际探测的运行目标**——确认或回滚待确认切换前
+/// 用它核对 pending 身份，避免另一发行版（或另一数据目录）的健康结果被当成
+/// 本次切换的就绪证据。
+pub fn owned_wsl_target() -> Option<(String, String)> {
+    owned_process_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|owned| owned.wsl.as_ref())
+        .map(|target| (target.distro.clone(), target.dsh_home.clone()))
+}
+
 /// 处理「持有的 dsh 进程退出」这一事实（由退出监视线程与健康检查 tick 共用）：
 ///
 /// - 仅当退出的 PID 仍是当前登记的那个进程时才清空持有（`take_owned_process_if`
@@ -192,12 +239,55 @@ pub(super) fn on_owned_process_exit(
     Some(owned)
 }
 
+/// 结束 WSL 发行版内的 Harness（F5/R-W2-7：杀 `wsl.exe` 中继不会带走 Linux
+/// 子进程，必须在发行版内按进程组 kill）。
+///
+/// 只在 [`terminate_stale_harness_processes`]（清扫**上一进程**遗留的孤儿、没有
+/// 登记表可依据）里使用；停止当前持有进程的路径走 [`terminate_owned_process`]，
+/// 后者按登记表里的 [`WslTarget`] 决定目标（R-W3-1）。
+///
+/// `STOP` 幂等（无进程时也以 0 退出）。发行版已停时首次访问会触发其启动，
+/// 因此本函数可能阻塞数秒——调用方要么已经在 `spawn_blocking` 内，要么明确
+/// 接受退出路径上的这点开销。
+#[cfg(windows)]
+fn stop_wsl_harness(app_handle: &tauri::AppHandle) {
+    use crate::config;
+    use crate::service::core::is_wsl_active;
+    use crate::service::workflow::wsl_launch;
+
+    if !is_wsl_active(app_handle) {
+        return;
+    }
+    let Some(distro) = config::get_store_dat_setting(app_handle).wsl_distro else {
+        return;
+    };
+    let home = wsl_launch::wsl_dsh_home();
+    match wsl_launch::stop_in_distro(&distro, home) {
+        Ok(()) => log::info!("Stopped WSL Harness processes in {distro}"),
+        Err(e) => log::warn!("WSL STOP failed in {distro}: {e}"),
+    }
+}
+
 /// 只结束本应用当前进程创建并仍持有的 Harness 进程树。
+///
+/// WSL 中继：先按**登记时记录的目标**（[`WslTarget`]）在 Linux 侧跑 `STOP`
+/// （进程组 kill），再终止中继；顺序反了会把中继杀掉却留下 Linux 侧孤儿（F5）。
+/// 目标不看 store——用户可能在运行中改过 `wsl_distro`，那时按当前设置去新发行版
+/// 里 STOP 只会留下旧发行版的孤儿（R-W3-1）。
 fn terminate_owned_process() {
     // 一次性取出 PID+句柄（成对），杜绝「PID 已清空/句柄未清」的漏杀窗口
     let Some(owned) = take_owned_process() else {
         return;
     };
+
+    // 无持有进程时不跑 STOP：发行版 Stopped 时冷启动 VM 只为执行空操作（R-W3-1）
+    #[cfg(windows)]
+    if let Some(target) = owned.wsl.as_ref() {
+        match super::wsl_launch::stop_in_distro(&target.distro, &target.dsh_home) {
+            Ok(()) => log::info!("Stopped WSL Harness processes in {}", target.distro),
+            Err(e) => log::warn!("WSL STOP failed in {}: {e}", target.distro),
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -350,6 +440,20 @@ fn is_harness_command_line(cmdline: &str, dsh_bin: &str) -> bool {
 /// 的 node 进程可判定为本应用的服务实例——路径精确匹配不会误杀用户其它 node
 /// 程序，因此可安全地全部结束（taskkill /T /F）。
 pub fn terminate_stale_harness_processes(app_handle: &tauri::AppHandle) {
+    // WSL 核心的残留由发行版内数据目录的 `.harness.pid` + 进程组 kill 回收
+    // （`STOP` 幂等）。该 pid 文件位于 WSL 的 `$HOME`，与 Windows 侧
+    // release/debug 数据目录天然隔离，因此 debug 构建也必须执行——这里不使用
+    // 下面的 `cfg!(debug_assertions)` 捷径。
+    //
+    // 执行完 STOP 后**不 return**（R-W4-6）：继续走上游按路径清扫 Windows 侧残留。
+    // WSL 核心激活期间 Windows 侧理论上不会产生残留（切到 WSL 前已停服清扫），
+    // 但保持一致的成本只是 release 下每次切核心 / 安装多一次 ~1 s 的 PowerShell
+    // 枚举（debug 走下面的 `cfg!(debug_assertions)` 捷径，零成本）。
+    #[cfg(windows)]
+    if crate::service::core::is_wsl_active(app_handle) {
+        stop_wsl_harness(app_handle);
+    }
+
     // 开发（debug）构建不做按路径清扫：生产与开发共用同一个 `dependencies/dsh`
     // 安装目录（核心共用），按命令行路径匹配会把同时运行的 release 服务进程
     // 一并结束——`pnpm tauri dev` 每次后端重编译都会重启应用并触发清扫，导致
@@ -488,11 +592,15 @@ mod tests {
     /// 构造一个测试用 `OwnedProcess`（跨平台处理 Windows 句柄字段）。
     #[cfg(windows)]
     fn test_owned(pid: u32) -> OwnedProcess {
-        OwnedProcess { pid, handle: 0 }
+        OwnedProcess {
+            pid,
+            handle: 0,
+            wsl: None,
+        }
     }
     #[cfg(not(windows))]
     fn test_owned(pid: u32) -> OwnedProcess {
-        OwnedProcess { pid }
+        OwnedProcess { pid, wsl: None }
     }
 
     /// 退出监视线程只能清掉「与自己 PID 匹配」的登记，不许误清刚启动的新进程，
@@ -514,6 +622,25 @@ mod tests {
         // 幂等：已清空后再次取出返回 None
         let mut slot: Option<OwnedProcess> = None;
         assert!(take_owned_process_if_matching(&mut slot, 42).is_none());
+    }
+
+    /// R-W3-1：登记表里的 WSL 目标必须跟着进程一起取出——停止路径据此决定在
+    /// 哪个发行版、哪个数据目录名下跑 `STOP`，而不是读那一刻的 store。
+    #[cfg(windows)]
+    #[test]
+    fn wsl_target_survives_take() {
+        let target = WslTarget {
+            distro: "Ubuntu".to_string(),
+            dsh_home: ".dsh-desktop.dev".to_string(),
+        };
+        let mut slot = Some(OwnedProcess {
+            pid: 7,
+            handle: 0,
+            wsl: Some(target.clone()),
+        });
+        let taken = take_owned_process_if_matching(&mut slot, 7).expect("take matching pid");
+        assert_eq!(taken.wsl, Some(target));
+        assert!(slot.is_none());
     }
 
     /// 退出载荷保留退出码（含 0），无法取得时显式序列化为 null。

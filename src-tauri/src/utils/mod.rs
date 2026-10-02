@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
 
@@ -20,11 +20,17 @@ pub enum PatchOutcome {
 ///
 /// 与 [`crate::service::core::active_dsh_binary`] 的取舍一致——本地核心解析在调用
 /// 瞬间失效时回退预打包目录，绝不让补丁打到永不加载的预打包文件上。
-fn active_core_install_dir(app_handle: &tauri::AppHandle) -> PathBuf {
+///
+/// WSL 核心没有本机安装目录（其 `--skip-auth` 补丁由 W2 经 UNC 直接改 WSL 内文件），
+/// 返回 `None`，调用方按「不适用」跳过。
+fn active_core_install_dir(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     match active_source(app_handle) {
-        CoreSource::Local => local_core_package_dir(app_handle)
-            .unwrap_or_else(|| config::get_dsh_install_path(app_handle)),
-        CoreSource::App => config::get_dsh_install_path(app_handle),
+        CoreSource::Local => Some(
+            local_core_package_dir(app_handle)
+                .unwrap_or_else(|| config::get_dsh_install_path(app_handle)),
+        ),
+        CoreSource::App => Some(config::get_dsh_install_path(app_handle)),
+        CoreSource::Wsl => None,
     }
 }
 
@@ -43,36 +49,58 @@ pub fn patch_dsh(
     rel_path: &str,
     patch: impl FnOnce(&str) -> PatchOutcome,
 ) -> Result<(), String> {
-    let target = active_core_install_dir(app_handle).join(rel_path);
-    if !target.exists() {
-        log::info!("dsh patch target not found, skip: {}", target.display());
+    let Some(target) = active_core_install_dir(app_handle).map(|dir| dir.join(rel_path)) else {
+        log::info!("dsh patch not applicable for current core, skip: {rel_path}");
         return Ok(());
-    }
-    let source = std::fs::read_to_string(&target)
-        .map_err(|e| format!("DSH_PATCH_READ: {} failed: {e}", target.display()))?;
-    match patch(&source) {
-        PatchOutcome::AlreadyPatched => {
+    };
+    match patch_file_at(&target, patch)? {
+        None => log::info!("dsh patch target not found, skip: {}", target.display()),
+        Some(PatchOutcome::AlreadyPatched) => {
             log::info!("dsh patch already applied: {}", target.display());
         }
-        PatchOutcome::AnchorMissing => {
+        Some(PatchOutcome::AnchorMissing) => {
             log::warn!("dsh patch anchor missing, skip: {}", target.display());
         }
-        PatchOutcome::Patched(patched) => {
-            std::fs::write(&target, patched)
-                .map_err(|e| format!("DSH_PATCH_WRITE: {} failed: {e}", target.display()))?;
+        Some(PatchOutcome::Patched(_)) => {
             log::info!("dsh patch applied: {}", target.display());
         }
     }
     Ok(())
 }
 
+/// 对**任意路径**应用一次性幂等补丁（[`patch_dsh`] 的通用版；W2.4 供 WSL 的
+/// UNC 文件使用）。
+///
+/// - 目标不存在 → `Ok(None)`（调用方自行决定日志与跳过）；
+/// - 三态 `PatchOutcome`：`Patched` 时已写回文件，`AlreadyPatched` / `AnchorMissing`
+///   原样返回（不写文件）；
+/// - 读 / 写失败 → `Err`。
+pub fn patch_file_at(
+    path: &Path,
+    patch: impl FnOnce(&str) -> PatchOutcome,
+) -> Result<Option<PatchOutcome>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("DSH_PATCH_READ: {} failed: {e}", path.display()))?;
+    let outcome = patch(&source);
+    if let PatchOutcome::Patched(patched) = &outcome {
+        std::fs::write(path, patched)
+            .map_err(|e| format!("DSH_PATCH_WRITE: {} failed: {e}", path.display()))?;
+    }
+    Ok(Some(outcome))
+}
+
 /// 判定活动核心安装目录下的某个 dsh 包文件是否包含给定子串。
 ///
 /// 用于「按能力追加启动参数」：例如 web 启动命令已具备 `--skip-auth`（本工具已打
 /// 过补丁或上游官方合并）才向服务参数追加该标志。目标不存在或读取失败一律视为
-/// 不包含，调用方据此保守不传标志。
+/// 不包含，调用方据此保守不传标志；WSL 核心（无本机安装目录）同样视为不包含。
 pub fn dsh_rel_contains(app_handle: &tauri::AppHandle, rel_path: &str, needle: &str) -> bool {
-    let target = active_core_install_dir(app_handle).join(rel_path);
+    let Some(target) = active_core_install_dir(app_handle).map(|dir| dir.join(rel_path)) else {
+        return false;
+    };
     match std::fs::read_to_string(&target) {
         Ok(content) => content.contains(needle),
         Err(_) => false,
@@ -124,4 +152,58 @@ pub fn app_icon_temp_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> 
     let img = image::RgbaImage::from_raw(icon.width(), icon.height(), rgba)?;
     img.save(&path).ok()?;
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{patch_file_at, PatchOutcome};
+
+    #[test]
+    fn patch_file_at_handles_missing_and_three_outcomes() {
+        let dir = std::env::temp_dir().join(format!("dsh-patch-file-at-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sample.js");
+        let patch = |source: &str| {
+            if source.contains("PATCHED") {
+                PatchOutcome::AlreadyPatched
+            } else if source.contains("anchor") {
+                PatchOutcome::Patched(source.replace("anchor", "PATCHED"))
+            } else {
+                PatchOutcome::AnchorMissing
+            }
+        };
+
+        // 目标缺失：Ok(None)，不创建文件
+        assert_eq!(patch_file_at(&target, patch).unwrap(), None);
+        assert!(!target.exists());
+
+        // Patched：写回文件
+        std::fs::write(&target, "anchor line\n").unwrap();
+        assert!(matches!(
+            patch_file_at(&target, patch).unwrap(),
+            Some(PatchOutcome::Patched(_))
+        ));
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("PATCHED"));
+
+        // AlreadyPatched：不再改写
+        assert_eq!(
+            patch_file_at(&target, patch).unwrap(),
+            Some(PatchOutcome::AlreadyPatched)
+        );
+
+        // AnchorMissing：跳过且保留原文
+        std::fs::write(&target, "no markers here\n").unwrap();
+        assert_eq!(
+            patch_file_at(&target, patch).unwrap(),
+            Some(PatchOutcome::AnchorMissing)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "no markers here\n"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

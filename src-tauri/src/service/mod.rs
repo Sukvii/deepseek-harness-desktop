@@ -10,3 +10,4 @@ pub mod profile;
 pub mod scheduler;
 pub mod update;
 pub mod workflow;
+pub mod wsl_core;

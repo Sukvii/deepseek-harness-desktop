@@ -95,12 +95,58 @@ fn find_available_port_by(
 /// 留给 `find_available_port` 逐级递增。用户手动设置的端口经 `manual_port`
 /// 记录，回落目标即用户值；从未手动设置时回落目标是默认端口（3080/3081）。
 /// 返回值与 `configured` 相同表示无需自愈。
-fn resolve_heal_port(configured: u16, heal_target: u16, heal_target_free: bool) -> u16 {
+///
+/// 占用判定由调用方在各自的网络命名空间内给出：Windows 侧是 [`is_port_in_use`]，
+/// WSL 侧是发行版内的 `PORT_SCAN`（[`super::wsl_launch::resolve_port_wsl`]，R-W3-2）。
+pub(super) fn resolve_heal_port(configured: u16, heal_target: u16, heal_target_free: bool) -> u16 {
     if configured != heal_target && heal_target_free {
         heal_target
     } else {
         configured
     }
+}
+
+/// 端口自愈与冲突避让（Windows 与 WSL 两条启动路径共用）。
+///
+/// 步骤：先按「自动避让递增遗留的非默认端口在回落目标空闲时回落」修正
+/// （issue #91：端口只增不减、一路从 3080 漂到 3084+），再等配置端口真正
+/// 释放为空闲，最后从当前值逐个递增到第一个空闲端口；每次变更都持久化，
+/// 供所有调用方（含前端展示）复用。
+async fn resolve_port(
+    app_handle: &tauri::AppHandle,
+    setting: &mut config::Setting,
+) -> Result<(), String> {
+    // 先于 wait_for_port_release 探测：既然放弃旧端口，就无需等它释放。
+    let heal_target = setting.manual_port.unwrap_or(config::default_port());
+    let healed_port = resolve_heal_port(setting.port, heal_target, !is_port_in_use(heal_target));
+    if healed_port != setting.port {
+        log::info!(
+            "Harness port healed from {} back to {} (no longer occupied)",
+            setting.port,
+            healed_port
+        );
+        setting.port = healed_port;
+        config::set_store_dat_setting(app_handle, setting.clone());
+    }
+
+    // 端口冲突时从当前值开始逐个递增，并持久化最终选择供所有调用方复用。
+    // 注意：上个会话的残留 dsh 进程刚被我们结束/清扫（sweep_orphan、stop、
+    // stop_on_exit），TCP 端口释放存在短暂滞后——此刻立刻探测会把“刚释放的
+    // 端口”误判为仍占用，从而把配置端口永久顶高（dev 热更新下 3081→3082→…
+    // 一路漂移，表现为“端口持续累加 + 首次启动超时、刷新后恢复”）。先留出
+    // 窗口等配置端口回落为空闲，再决定是否真的逐级递增。
+    wait_for_port_release(setting.port).await;
+    let available_port = find_available_port(setting.port)?;
+    if available_port != setting.port {
+        log::info!(
+            "Harness port changed from {} to {} because the configured port is occupied",
+            setting.port,
+            available_port
+        );
+        setting.port = available_port;
+        config::set_store_dat_setting(app_handle, setting.clone());
+    }
+    Ok(())
 }
 
 /// dsh 版本是否支持 `--no-open` 标志。
@@ -159,6 +205,24 @@ fn web_supports_no_open_flag(
 /// 检测并启动 Harness 服务
 pub async fn start(app_handle: tauri::AppHandle) -> Result<(), String> {
     let setting = config::get_store_dat_setting(&app_handle);
+
+    // WSL 核心没有本机 node/dsh 文件，也不依赖 Windows 侧的 installed 标记：
+    // 就绪判定完全交给 launch_wsl 的现场 probe（W3.2），下面这些文件级检查
+    // 一律跳过——否则用户未装 Windows 核心时 WSL 核心永远不会被拉起。
+    #[cfg(windows)]
+    if crate::service::core::active_source(&app_handle) == crate::service::core::CoreSource::Wsl {
+        if has_owned_process() {
+            log::info!("Owned Harness process is already running");
+            status::set_status(status::Status::Running);
+            status::emit_status(&app_handle);
+            return Ok(());
+        }
+        log::info!("Starting WSL Harness service");
+        status::set_status(status::Status::Starting);
+        status::emit_status(&app_handle);
+        return launch(app_handle).await;
+    }
+
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的入口：本地核心存在时优先本地（需求 3），否则预打包
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
@@ -260,6 +324,62 @@ fn is_duplicate_loader_exit(exit_code: u32, stderr: &str) -> bool {
 /// 启动 Harness 服务进程
 pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut setting = config::get_store_dat_setting(&app_handle);
+
+    // WSL 核心走独立编排（W3.1/W3.2）：入口是 `wsl.exe` 而不是本机 node/dsh
+    // 文件，存在性检查无意义；端口自愈与 Windows 分支共用 `resolve_port`。
+    // 核心转换锁在此获取并持有到中继登记完成（与 Windows 分支同一临界区）。
+    #[cfg(windows)]
+    if crate::service::core::active_source(&app_handle) == crate::service::core::CoreSource::Wsl {
+        let distro = setting
+            .wsl_distro
+            .clone()
+            .ok_or_else(|| "WSL_DISTRO_NOT_SET: no WSL distro is selected".to_string())?;
+        // 从探测到 spawn 的整条链路包成一块：任一失败都可能在「待确认切换」窗口内
+        // 发生——按 R-V8-1 回滚到切换前的运行时（没有待确认切换时是 no-op），
+        // 避免用户卡在启动不了的新树上。
+        let launched: Result<(), String> = async {
+            // 探测（最长 30 s，含发行版冷启动）在核心转换锁**之外**：锁内会让并发的
+            // `set_active_core` 撞上 `CORE_TRANSITION_TIMEOUT`（R-W3-7）；15 s 窗口内
+            // 的新鲜缓存直接复用，省掉开机路径上重复的探测（R-W3-6）。
+            super::wsl_launch::preflight(&distro).await?;
+            let _transition_guard = super::process::acquire_core_transition().await?;
+            // 已在运行时不碰端口：`resolve_port` 会把「本进程正在监听的端口」判为占用
+            // 并递增，随后 spawn 又因 has_owned_process 直接返回——前端于是按新端口做
+            // 健康检查而永远失败（D-W3-3）。Windows 分支的同等检查也在端口处理之前。
+            if has_owned_process() {
+                log::info!("Owned Harness process is already running, skipping launch");
+                return Ok(());
+            }
+            // 清残留**先于**端口判定（R-W4-3）：崩溃残留占着配置端口时，若先扫描会
+            // 白白漂移一次端口并持久化，下次重启才 heal 回来。STOP 幂等、失败仅告警。
+            super::wsl_launch::clear_stale(&distro).await;
+            // 锁内重读设置（R-W4-4）：preflight 最长 30 s 且期间进程尚未登记，
+            // `WSL_DISTRO_LOCKED`（以 `has_owned_process()` 为条件）挡不住用户改
+            // `wsl_distro`；按旧目标启动会与设置不一致。
+            let current_distro = config::get_store_dat_setting(&app_handle).wsl_distro;
+            if current_distro.as_deref() != Some(distro.as_str()) {
+                return Err(
+                    "WSL_DISTRO_CHANGED: distro changed during preflight, retry".to_string()
+                );
+            }
+            // 端口判定全部在发行版内做（R-W3-2）：镜像网络下 Windows 的
+            // `TcpListener::bind` 看不见 Linux 侧的 TIME_WAIT，会让 WSL 内 dsh
+            // 直接 `EADDRINUSE` 退出（D-W3-6 / F12）。
+            super::wsl_launch::resolve_port_wsl(&app_handle, &distro, &mut setting).await?;
+            super::wsl_launch::spawn(&app_handle, &distro, setting.port).await
+        }
+        .await;
+        if launched.is_err() {
+            crate::service::wsl_core::switch::on_launch_failure(
+                &app_handle,
+                &distro,
+                super::wsl_launch::wsl_dsh_home(),
+            )
+            .await;
+        }
+        return launched;
+    }
+
     let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的 dsh 入口（本地核心优先，未检测到走预打包）
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
@@ -312,39 +432,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         }
     }
 
-    // 端口自愈：自动避让递增（配置端口被占 → 逐级顶高）遗留的非默认端口，
-    // 在回落目标（用户手动端口 manual_port，否则默认端口）空闲时回落，避免
-    // 端口只增不减、一路从 3080 漂到 3084+（issue #91）。先于
-    // wait_for_port_release 探测：既然放弃旧端口，就无需等它释放。
-    let heal_target = setting.manual_port.unwrap_or(config::default_port());
-    let healed_port = resolve_heal_port(setting.port, heal_target, !is_port_in_use(heal_target));
-    if healed_port != setting.port {
-        log::info!(
-            "Harness port healed from {} back to {} (no longer occupied)",
-            setting.port,
-            healed_port
-        );
-        setting.port = healed_port;
-        config::set_store_dat_setting(&app_handle, setting.clone());
-    }
-
-    // 端口冲突时从当前值开始逐个递增，并持久化最终选择供所有调用方复用。
-    // 注意：上个会话的残留 dsh 进程刚被我们结束/清扫（sweep_orphan、stop、
-    // stop_on_exit），TCP 端口释放存在短暂滞后——此刻立刻探测会把“刚释放的
-    // 端口”误判为仍占用，从而把配置端口永久顶高（dev 热更新下 3081→3082→…
-    // 一路漂移，表现为“端口持续累加 + 首次启动超时、刷新后恢复”）。先留出
-    // 窗口等配置端口回落为空闲，再决定是否真的逐级递增。
-    wait_for_port_release(setting.port).await;
-    let available_port = find_available_port(setting.port)?;
-    if available_port != setting.port {
-        log::info!(
-            "Harness port changed from {} to {} because the configured port is occupied",
-            setting.port,
-            available_port
-        );
-        setting.port = available_port;
-        config::set_store_dat_setting(&app_handle, setting.clone());
-    }
+    resolve_port(&app_handle, &mut setting).await?;
 
     // 构造环境变量：隔离的 $DSH_HOME + 隐私默认（关闭遥测）
     let dsh_home = config::get_dsh_data_path(&app_handle);

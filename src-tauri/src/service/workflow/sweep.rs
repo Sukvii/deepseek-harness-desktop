@@ -41,7 +41,19 @@ pub fn sweep_orphan_harness(app_handle: &tauri::AppHandle) {
     // 句柄，导致更新切换目录失败（INSTALL_BACKUP_FAILED, os error 32）。
     // 路径精确匹配不会误杀用户其它 node 程序；标记中的进程若在其中会被一并
     // 结束，随后的 PID/端口双重确认自然落空，仅清理陈旧标记。
-    terminate_stale_harness_processes(app_handle);
+    //
+    // WSL 核心下**不进发行版**清扫（R-W4-1）：发行版 Stopped 时首次 `wsl.exe -e`
+    // 访问要冷启动 VM（最长 `STOP_TIMEOUT` = 15 s），放在 `.setup()` 的同步路径上
+    // 会冻结窗口（R-W3-4）。残留由首次 launch 的 STOP（持核心转换锁，位于端口
+    // 扫描之前，R-W4-3）与切核心 / 安装路径的 `terminate_stale_harness_processes`
+    // 回收——前端 boot 必定调用 `launch_harness`，不存在「开机后无人清扫」的窗口。
+    #[cfg(windows)]
+    let wsl_active = crate::service::core::is_wsl_active(app_handle);
+    #[cfg(not(windows))]
+    let wsl_active = false;
+    if !wsl_active {
+        terminate_stale_harness_processes(app_handle);
+    }
     let pid_file = harness_pid_path(app_handle);
     let Ok(text) = fs::read_to_string(&pid_file) else {
         return;

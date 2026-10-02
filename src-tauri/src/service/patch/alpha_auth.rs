@@ -47,7 +47,9 @@ const AUTHORIZE_PATCHED: &str = "\tauthorizeIndex(request, response) {\n\t\tif (
 
 /// 替换 web 启动命令：接受 `--skip-auth`；命中时写入 `DSH_SKIP_AUTH=1` 作为与
 /// connection 层之间的进程级开关。
-fn patch_startup(source: &str) -> PatchOutcome {
+///
+/// `pub(crate)`：W2.4 的 WSL UNC 补丁（`service::wsl_core::patch`）直接复用。
+pub(crate) fn patch_startup(source: &str) -> PatchOutcome {
     if source.contains(PATCH_MARKER) {
         return PatchOutcome::AlreadyPatched;
     }
@@ -63,7 +65,9 @@ fn patch_startup(source: &str) -> PatchOutcome {
 
 /// 替换 alpha 的 connection 鉴权：仅在 `DSH_SKIP_AUTH=1` 时跳过 browser-session，
 /// 始终保留 Host/Origin trust fence；未设置时行为与上游一致。
-fn patch_connection(source: &str) -> PatchOutcome {
+///
+/// `pub(crate)`：W2.4 的 WSL UNC 补丁（`service::wsl_core::patch`）直接复用。
+pub(crate) fn patch_connection(source: &str) -> PatchOutcome {
     if source.contains(PATCH_MARKER) {
         return PatchOutcome::AlreadyPatched;
     }
@@ -136,6 +140,40 @@ mod tests {
             STARTUP_ACTION_ANCHOR,
             "\t\tconst options = program.opts();\n\t\tconst allowLan = process.env.DSH_PKG_ALLOW_LAN === \"1\";",
         );
+        source
+    }
+
+    /// 真实 npm 样本形态（D-W5R-3）：`0.1.2-rc.1`（推荐版本）与 `0.1.5-rc.2`
+    /// （web-app / connection 均为 0.1.5-rc.3）的隔离干净安装实测——`startup.js`
+    /// 的整条 option 链在**同一行**，action 是 `opts()` 单行后紧跟 `--host` 校验。
+    ///
+    /// 早前「单行链式使锚点失配」的诊断不成立（审核端 D-W5R-3 指出）：OPTION 锚点
+    /// 没有行首/缩进条件，`contains` 匹配在单行链式里同样命中；两个样本实测
+    /// OPTION / ACTION / REJECTION / AUTHORIZE 计数均为 1。
+    fn startup_fixture_single_line_chain() -> String {
+        let mut source = String::new();
+        source.push_str("function webCommand() {\n");
+        source.push_str("\treturn new Command().name(\"dsh --profile web\").description(\"Serve the DeepSeek Harness browser UI.\").option(\"--host <host>\", \"bind host\").option(\"--no-open\", \"do not open the Web UI in the default browser\").option(\"--port <port>\", \"listen port; pass 0 to let the OS pick a free one\").option(\"--trusted-host <authority...>\", \"extra authority the /api browser-trust fence accepts\");\n");
+        source.push_str("}\n\n");
+        source.push_str("function apply(ctx) {\n");
+        source.push_str("\tconst program = webCommand();\n");
+        source.push_str("\tprogram.action(() => {\n");
+        source.push_str(STARTUP_ACTION_ANCHOR);
+        source.push_str("\n\t\tif (options.host === \"0.0.0.0\") program.error(\"error: --host 0.0.0.0 is intentionally not supported yet\");\n");
+        source.push_str("\t});\n");
+        source.push_str("}\n");
+        source
+    }
+
+    /// 真实样本形态的 connection：委托方法前还有上游自己的 `authorizeIndex(req, res)`
+    /// 实现（0.1.2-rc.1 实测 L363），锚点带参数名 `request, response` 不得误伤它。
+    fn connection_fixture_with_real_extra_method() -> String {
+        let mut source = String::new();
+        source.push_str("\tauthorizeIndex(req, res) {\n");
+        source.push_str("\t\tconst url = new URL(req.url ?? \"/\", \"http://dsh.invalid\");\n");
+        source.push_str("\t\tconst tokens = url.searchParams.get(\"token\");\n");
+        source.push_str("\t}\n");
+        source.push_str(&connection_fixture());
         source
     }
 
@@ -214,6 +252,35 @@ mod tests {
             panic!("expected connection patch");
         };
         assert_eq!(patch_connection(&connection), PatchOutcome::AlreadyPatched);
+    }
+
+    /// D-W5R-3：按隔离干净安装的真实样本形态验证——未修改样本可打、已补丁样本
+    /// 重复打是 `AlreadyPatched`；connection 的 `authorizeIndex(req, res)` 变体
+    /// （同一文件里的另一处方法）不被误伤。
+    #[test]
+    fn patches_match_real_npm_sample_shapes() {
+        // startup：单行链式 option + opts() action（0.1.2-rc.1 / 0.1.5-rc.3 实测）
+        let sample = startup_fixture_single_line_chain();
+        let PatchOutcome::Patched(patched) = patch_startup(&sample) else {
+            panic!("expected startup patch on the real single-line sample shape");
+        };
+        assert!(patched.contains(PATCH_MARKER));
+        assert!(patched.contains(".option(\"--skip-auth\""));
+        assert!(patched.contains("\t\tif (options.skipAuth) process.env.DSH_SKIP_AUTH = \"1\";"));
+        // `--host` 校验行原样保留
+        assert!(patched.contains("if (options.host === \"0.0.0.0\")"));
+        // 重复补丁幂等
+        assert_eq!(patch_startup(&patched), PatchOutcome::AlreadyPatched);
+
+        // connection：另一处 `authorizeIndex(req, res)`（真实样本 L363）不受影响
+        let sample = connection_fixture_with_real_extra_method();
+        let PatchOutcome::Patched(patched) = patch_connection(&sample) else {
+            panic!("expected connection patch on the real delegated-method sample");
+        };
+        assert!(patched.contains(PATCH_MARKER));
+        assert!(patched.contains("\tauthorizeIndex(req, res) {"));
+        assert!(patched.contains("if (process.env.DSH_SKIP_AUTH === \"1\") return true;"));
+        assert_eq!(patch_connection(&patched), PatchOutcome::AlreadyPatched);
     }
 
     #[test]
