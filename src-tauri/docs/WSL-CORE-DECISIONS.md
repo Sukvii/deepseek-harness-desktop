@@ -1790,3 +1790,21 @@ REVIEW §H 两项返修完成并逐项复跑：**R-V8-1B-1**（健康结果绑�
 
 `git status` 变更范围与 PLAN W6.4 允许清单一致（`src-tauri/src/**`、`src-tauri/resources/wsl-runtime/**` 及资源声明、前端组件/hooks、i18n 两个 json、文档、CI 配置）；未触碰 `packages/dsh-tauri-wsl/`。推送到 fork `Sukvii/deepseek-harness-desktop` 的 `origin/feat/wsl-core`；三平台矩阵与 ubuntu / macos 新增 `warning:` 核对结果记录于 `E:/DSH-WSL/validation/w6-20261002/`。
 
+### S.5 三平台 CI 核对与 R-W3-9 修复（2026-10-02）
+
+**第一次推送**（`f5a32a3`，run `37026086203`）：三平台全部通过；但对照基线（`fe056f8` 的 upstream run `34480406119`）发现 **ubuntu / macos 新增 12 项 dead_code 告警**——WSL 核心的若干函数 / 常量 / 枚举变体只在 Windows 调用路径可达，非 Windows 构建下不可达属预期（R-W3-9 预先安排在本阶段核对）。
+
+修复（`49f5ce8`）：按 **R-W4-5 先例**逐项加 `#[cfg_attr(not(windows), allow(dead_code))]` 并注明原因，共 4 个文件 12 处——`exec.rs`（`WslStream` 变体）、`probe.rs`（`cached_fresh`）、`script.rs`（`START` / `STOP`）、`switch.rs`（`PendingSwitch::matches`、`claim_matches_pending`、`exit_rebind_matches`、`rebind_exited_target`、`deadline_at`、`note_launch_started`、`deadline_task`、`on_launch_failure`）。Windows 行为不变（属性在 Windows 下不生效；本机 `cargo test` 582 passed、clippy 81 = 基线）。
+
+**第二次推送**（`49f5ce8`，run `37027390404`）核对结果：
+
+| 平台 | 结果 |
+|---|---|
+| ubuntu-22.04 | 27 行 warning = 基线 27 行，**无新增**（原 12 项具体告警全部消除） |
+| macos-14 | 28 行 = 基线 28 行，**无新增具体告警**；仅 cargo 汇总行统计文本随工具链演进（`14 duplicates / 1 suggestion` → `15 duplicates / 2 suggestions`；警告总数 `16 / 23` 不变，且与当前 ubuntu / 基线 ubuntu 文本一致） |
+| windows-latest | 3 行 = 基线，无新增 |
+
+过程注记：首轮 ubuntu 曾失败一次——上游既有测试 `service::cli::shim::build::tests::pnpm_sh_shim_prefers_existing_bundle_over_selected_path` 偶发 `ETXTBSY`（"Text file busy"，exec 时内核级竞态，与本次改动无关；同一提交重跑即通过，且首轮 f5a32a3 的 ubuntu 相同测试通过）。已重跑该 job，最终 run 结论 success。
+
+核对方法：`gh run view <id> --log` 日志含 ANSI 色码（`warning` 与 `:` 之间），先剥 `\x1b\[[0-9;]*m` 与时间戳前缀再按行提取比较；脚本与原始日志见证据目录。
+
