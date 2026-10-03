@@ -2367,7 +2367,7 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 - **台账缺行修补**：`u8/rerun/u8-2-lanes.exit` 里 `vitest-unit` / `vitest-core-list` 两行曾缺失（`rerun-lanes.sh` 无 `set -e`，这两步用 `echo | tee -a`）。由 `u8/finish-lanes.sh`（刻意只用 `>>` 追加、绝不用 tee）补齐：`STEP vitest-unit EXIT=1`、`STEP vitest-core-list EXIT=0`。
 - **汇总产物**：`validation/sync-v0.21.0-20261003/gates-final.json`、`gates-final.md`。
 
-## U9. 冲突闭环、文档与交付门禁（2026-10-03，执行端；合并挂起树）
+## U9. 冲突闭环、文档与交付门禁（2026-10-03，执行端；已提交为 merge commit `16df39ae`）
 
 ### U9.1 README ×3 冲突收口（完成）
 
@@ -2385,6 +2385,33 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 | `wsl-smoke.md` | 10,147 字符 | U8.1 实测 7 项 PASS → U8.2 车道表 → U8.3 T1–T8（全 PASS）→ U8.4 真机 17 行与 U8.5 四项**全部 `NOT_RUN`** → 5 条证据缺口 → 交付口径 |
 | `commands.md` | 已完成 | 追加 §U9 与 #96–#113 |
 
+### U9.3 提交与交付门禁（完成）
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| 祖先检查 | `git merge-base --is-ancestor v0.21.0 HEAD` | **exit 0**（计划硬门禁通过） |
+| 差异归属 | `git diff --name-status v0.21.0 HEAD` | 64 项：M 43 / A 21，**D 0 / R 0**（无上游模块被回退） |
+| 差异规模 | `git diff --stat v0.21.0 HEAD` | 64 files changed, 18250 insertions(+), 126 deletions(-) |
+| 空白错误 | `git diff --check v0.21.0 HEAD` vs `git diff --check fe056f82 v0.21.0` | 合并侧 0 条；上游侧 14 条（`inheritedFromUpstream=0`、`introducedByMerge=0`、`fixedByMerge=14`） |
+| 工作区 | `git status --porcelain --untracked-files=normal` / `git rev-parse --verify MERGE_HEAD` | 条目 0；`MERGE_HEAD` 已不存在（合并状态结束） |
+
+- **提交**：merge commit `16df39aee70aa041f6ca6231b866a6afe90155cd`（分支 `sync/wsl-core-v0.21.0`），parents = `cd8af2414aa26ca0210b3421449c8c914f76be68`（合并前 fork HEAD）+ `aff39a991fda3558c5459b54fb3fa1c6984d3227`（v0.21.0），2 亲即非快进。提交正文（`validation/sync-v0.21.0-20261003/u9-merge-commit-message.txt`）列出 20 个冲突文件的逐项归属与双树验证口径。
+- **本次未推送、未生成发布包**：计划 §U9.3 要求「核对无误后按授权推送同步分支供审核」，推送需单独授权；本分支 CI（三平台）因此未运行。
+- **证据**：`validation/sync-v0.21.0-20261003/SUMMARY.md`（六项固定交付说明）、`u9-post-commit-gates.log`、`u9-whitespace.json`、`u9-diff-stat-v0.21.0-HEAD.txt`、`u9-name-status-v0.21.0-HEAD.txt`；`baseline.json` 已回填 `merge.mergeCommit` 与 `diffVsUpstreamTag`。
+
+### D-U9-5（口径）空白错误必须做归因，不能只看绝对条数
+
+- **阶段**：U9.3。
+- **实际**：`git diff --cached --check`（暂存区相对合并基点）曾报 14 条空白错误，粗看像是本合并引入。按「相对路径 + 消息」对齐两侧：上游侧 `git diff --check fe056f82 v0.21.0` 同样 14 条（分布 `docs/specs/plugin.client.panel.md`、`docs/specs/plugin.host.md`、`packages/dsh-tauri-extension/skills/skill-creator/scripts/*.py`、`src-tauri/vendor/tauri-plugin-notifications/**`、`src-tauri/vendor/tauri-plugin-wdio-webdriver/**` 等，均为 v0.21.0 自身改动），合并侧 `git diff --check v0.21.0 HEAD` 为 **0** 条。
+- **决定**：定论为「本合并新增 0 条空白错误，且上游那 14 条没有进入合并结果」，不作为门禁失败项。
+- **影响**：与 D-U8-8（rustfmt）同一条方法论——**diff 类门禁一律做逐项归因，绝对条数不构成结论**。
+
+### D-U9-6（交付定性）真机未运行，只可交付迁移候选
+
+- **阶段**：U9.3。
+- **决定**：交付摘要固定写「目标桌面标签 v0.21.0；WSL 受控基线 0.1.2-rc.1；本地车道与双树门禁结果；WSL 真机结果未运行；尚未运行项 = U8.4 17 场景 + U8.5 四项 + 推送；发布包未生成」；定性为「静态与构建完成的迁移候选」，**不得标注「WSL 同步完成」**。
+- **影响**：`SUMMARY.md` 即该固定说明的落盘版本，供审核端直接引用。
+
 ### U9 裁决
 
 - **D-U9-1（环境限制，证据已留）真机车道不在本环境执行**：U8.4 的 17 个场景与 U8.5 的四项（插件 E2E / 桌面 E2E / 三平台 CI / `pnpm tauri build`）一律记 `NOT_RUN`，**不把静态或单测证据写成 PASS**；每项仍逐条给出代码路径作为执行指引。
@@ -2392,3 +2419,4 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 - **D-U9-3（环境隔离要求，真机执行前必读）**：Windows 侧 `DSH_E2E_HOME`/`USERPROFILE` 隔离**不改变** `wsl.exe` 内的 Linux `$HOME`；WSL debug 固定 `.dsh-desktop.dev`；失败注入必须用专用测试发行版或专用 Linux 测试用户，不得使用真实会话/凭据；不得自动导入或删除发行版、不得改默认用户、不得改 `.wslconfig`、不得执行 `wsl --shutdown`。
 - **D-U9-4（已知证据缺口，不为对齐文档而造证据）**：帧身份握手（#7）在仓库内零命中；网络模式 mirrored/NAT（#17）在 `src-tauri/src` 零命中；同一 PID 热生效（#6）无仓库内断言；凭据 `umask 077`（#14）无现成夹具；前端 WSL 配置（#8/#11）无单测（仓库无 `src-tauri/tests/`、无 `wsl*.test.ts*`）。
 - **交付口径**：目标桌面标签 v0.21.0；WSL 受控基线 `0.1.2-rc.1`；真机与发布包**未运行/未生成**；交付物定性为「**静态与构建完成的迁移候选**」，不得标注「WSL 同步完成」。
+- **落盘**：上述交付口径的固定说明见 `validation/sync-v0.21.0-20261003/SUMMARY.md`（§U9.3 / D-U9-6）。
