@@ -50,13 +50,10 @@ pub fn allowed_roots(app_handle: &AppHandle) -> Vec<PathBuf> {
     if let Some(distro) = crate::config::get_store_dat_setting(app_handle).wsl_distro {
         if crate::service::wsl_core::validate_distro(&distro).is_ok() {
             if let Some(probed) = crate::service::wsl_core::probe::cached(&distro) {
-                let linux_dir = format!(
-                    "{}/{}",
-                    probed.home.trim_end_matches('/'),
-                    crate::service::wsl_core::dsh_home_dir_name()
-                );
+                // 数据根 UNC 由 `patch::wsl_data_root_unc` 统一构造：真机核对脚本与
+                // 这里同源，避免两处各拼一次导致核对面与实际允许根分叉（R-U9-5）。
                 roots.push(PathBuf::from(
-                    crate::service::wsl_core::patch::wsl_unc_path(&distro, &linux_dir),
+                    crate::service::wsl_core::patch::wsl_data_root_unc(&distro, &probed.home),
                 ));
             }
         }

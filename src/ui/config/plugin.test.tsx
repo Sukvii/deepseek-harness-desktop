@@ -5,15 +5,24 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfigPlugin } from './plugin'
 
-const { manager, openDialog } = vi.hoisted(() => ({
+const { manager, openDialog, runtimeInfo } = vi.hoisted(() => ({
   manager: { installed: [] as Plugin[], processes: [], loading: false, error: '', disable: vi.fn(), enable: vi.fn() },
   openDialog: vi.fn(),
+  /**
+   * 面板不再自行比对 `active_core`，而是消费后端 `get_runtime_info` 的
+   * `active_source`（R-U9-4）。这里把这个查询桩出来，让用例能按来源切换渲染。
+   */
+  runtimeInfo: { data: undefined as { active_source: string } | undefined },
 }))
 
 vi.mock('@/hooks/use-plugins-manager', () => ({ useDshPluginsManager: () => manager }))
 vi.mock('@overlastic/react', () => ({ useOverlay: () => [null, openDialog] }))
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }))
-vi.mock('@tanstack/react-query', () => ({ useQueryClient: () => ({}), useMutation: () => ({}) }))
+vi.mock('@tanstack/react-query', () => ({
+  useQueryClient: () => ({}),
+  useMutation: () => ({}),
+  useQuery: () => runtimeInfo,
+}))
 vi.mock('@/store', () => ({ store: { preinstall: { open: vi.fn(), installing: false }, setting: { active_core: null } } }))
 vi.mock('valtio-define', () => ({ useStore: (value: unknown) => value }))
 vi.mock('@/utils/toast', () => ({ toast: vi.fn() }))
@@ -69,6 +78,7 @@ beforeEach(() => {
   manager.disable.mockReset().mockResolvedValue(undefined)
   manager.enable.mockReset().mockResolvedValue(undefined)
   openDialog.mockReset()
+  runtimeInfo.data = { active_source: 'local' }
 })
 
 afterEach(() => {
@@ -126,5 +136,32 @@ describe('built-in plugin toggles', () => {
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'plugins.disable' })))
     expect(manager.disable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-pet')
     expect(openDialog).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * R-U9-4：WSL 判定必须跟后端「有效 WSL 选择」一致（平台支持 + 发行版非空），
+ * 不能只看 `active_core === 'wsl'`——清除发行版后后端会回落到本机来源。
+ */
+describe('来源判定与后端一致（R-U9-4）', () => {
+  it('来源为 wsl 时显示说明而不挂载插件内容', () => {
+    runtimeInfo.data = { active_source: 'wsl' }
+    render(<ConfigPlugin />)
+    expect(screen.getByText('plugins.wsl_active_notice')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'plugins.disable' })).toBeNull()
+  })
+
+  it('清除发行版后按本机来源渲染（即使设置里仍是 active_core=wsl）', () => {
+    runtimeInfo.data = { active_source: 'local' }
+    render(<ConfigPlugin />)
+    expect(screen.queryByText('plugins.wsl_active_notice')).toBeNull()
+    expect(screen.getByRole('button', { name: 'plugins.builtin_title' })).toBeTruthy()
+  })
+
+  it('来源尚未取到时按本机来源渲染，不留空白面板', () => {
+    runtimeInfo.data = undefined
+    render(<ConfigPlugin />)
+    expect(screen.queryByText('plugins.wsl_active_notice')).toBeNull()
+    expect(screen.getByRole('button', { name: 'plugins.builtin_title' })).toBeTruthy()
   })
 })

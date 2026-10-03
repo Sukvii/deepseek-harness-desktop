@@ -596,6 +596,14 @@ pub struct RuntimeInfo {
     pub log_path: String,
     pub platform: String,
     pub arch: String,
+    /// 后端判定的实际生效核心来源（`local` / `app` / `wsl`）。
+    ///
+    /// 由 `bridge::system_os::get_runtime_info` 用 `service::core::active_source`
+    /// 填充（R-U9-4）：前端要判断「谁在跑」时以此为准，不要自行用 store 的
+    /// `active_core` 拼状态组合——`{active_core: "wsl"}` 配已清空的 `wsl_distro`
+    /// 会被后端按本机来源规则回退。此处默认值只服务不经 bridge 的直接构造。
+    #[serde(default)]
+    pub active_source: String,
 }
 
 pub fn runtime_info<R: Runtime>(app: &AppHandle<R>, port: u16) -> RuntimeInfo {
@@ -610,6 +618,9 @@ pub fn runtime_info<R: Runtime>(app: &AppHandle<R>, port: u16) -> RuntimeInfo {
         log_path: get_service_log_path(app).to_string_lossy().into_owned(),
         platform: env::consts::OS.to_string(),
         arch: env::consts::ARCH.to_string(),
+        // 生效来源由 bridge 用 `service::core::active_source` 覆写（此处只保证字段
+        // 存在）；`config` 层不依赖 `service`，避免反向引用。
+        active_source: String::new(),
     }
 }
 

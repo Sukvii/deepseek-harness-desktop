@@ -18,6 +18,7 @@ import { ConfigLaunchOnLogin } from '@/ui/config/components/launch-on-login'
 import { useCoreBreakingConfirm } from '@/ui/config/hooks/use-core-breaking-confirm'
 import { useCoreProfileSwitch } from '@/ui/config/hooks/use-core-profile-switch'
 import { toast } from '@/utils/toast'
+import { isWslDataDirProbePending } from '@/utils/wsl-runtime-info'
 
 const ZOOM_OPTIONS = Array.from({ length: 16 }, (_, index) => Number((0.5 + index * 0.1).toFixed(1)))
 
@@ -174,8 +175,21 @@ export function ConfigDebug() {
     },
   })
 
+  /**
+   * R-U9-2：WSL 核心下 probe 缓存缺失时后端把 Linux 专属字段置成「未取得」——
+   * `node_version` 为空、`data_dir` 是显式未探测标记。界面必须照实显示「未探测」，
+   * 不能回落填充宿主 Node / Windows 数据根，否则会误导用户以为这就是发行版内的信息。
+   */
+  const dataDirUnprobed = isWslDataDirProbePending(info?.data_dir)
+
+  /**
+   * R-U9-3：按钮必须打开**屏幕上显示的那个**数据目录（WSL 核心下是发行版内的
+   * UNC 路径）。路径原样交给后端，由后端按允许根规则校验后打开；路径是「WSL 未
+   * 探测」标记或为空时按钮禁用（后端也会直接拒绝），不会悄悄回落到 Windows 数据目录。
+   */
+  const revealDisabled = !info?.data_dir || dataDirUnprobed
   const { mutate: onRevealDataDir } = useMutation({
-    mutationFn: () => invoke('reveal_data_dir'),
+    mutationFn: () => invoke('reveal_data_dir', { path: info?.data_dir ?? '' }),
     onError: (err: unknown) => {
       console.error('[ConfigDebug] reveal data dir failed:', err)
       toast(t('messages.reveal_dir_failed'), { variant: 'danger' })
@@ -270,22 +284,32 @@ export function ConfigDebug() {
             </If>
 
           </Info>
-          <Info term={t('ui.node_version')}>{info?.node_version ? `v${info.node_version}` : '-'}</Info>
+          <Info term={t('ui.node_version')}>
+            {info?.node_version ? `v${info.node_version}` : (dataDirUnprobed ? t('ui.wsl_linux_facts_pending') : '-')}
+          </Info>
           <Info term={t('ui.platform')}>
             {info ? `${info.platform} / ${info.arch}` : '-'}
           </Info>
           <div className="flex items-center justify-between gap-2 text-xs">
             <span className="shrink-0 min-w-[30%] text-muted font-medium">{t('ui.data_dir')}</span>
             <span className="min-w-0 flex items-center gap-1">
-              <span className="truncate font-mono text-[11px] text-muted/80" title={info?.data_dir ?? '-'}>
-                {info?.data_dir ?? '-'}
-              </span>
+              <If
+                cond={dataDirUnprobed}
+                else={(
+                  <span className="truncate font-mono text-[11px] text-muted/80" title={info?.data_dir ?? '-'}>
+                    {info?.data_dir ?? '-'}
+                  </span>
+                )}
+              >
+                <span className="truncate text-[11px] text-muted/80">{t('ui.wsl_linux_facts_pending')}</span>
+              </If>
               <Button
                 size="sm"
                 variant="ghost"
                 isIconOnly
                 className="size-6 min-w-6"
                 aria-label={t('app.reveal_dir')}
+                isDisabled={revealDisabled}
                 onPress={() => onRevealDataDir()}
               >
                 <Folder className="size-3.5" />

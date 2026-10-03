@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- 对话框与它的时序契约同文件：契约要被单测直接引用，拆成两个同名模块会撞 import 解析 */
 import type { PropsWithOverlays } from '@overlastic/react'
 import type { InstallProgress } from '@/store/modules/harness/types'
 import type { WslCoreProbe } from '@/types'
@@ -8,6 +9,69 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { Panel } from '@/components/panel'
+
+/**
+ * WSL 核心安装对话框的时序契约（从组件里抽出的纯逻辑，便于单测）。
+ *
+ * 顺序要求（PLAN §U6.3 / R-U9-1）：**先完成进度订阅，再发起安装**。
+ * - 订阅失败：不发起安装，错误进入对话框展示；
+ * - 订阅成功后已被卸载：不发起安装（迟到的 unlisten 立即注销）；
+ * - 订阅成功且仍在挂载：只发起一次安装，成功回调 `onConfirm`，失败回调 `onError`。
+ */
+export interface WslCoreInstallRun {
+  /** 订阅安装进度（返回注销函数），语义同 `listen('install-progress')` */
+  subscribe: (handler: (payload: InstallProgress) => void) => Promise<() => void>
+  /** 进度事件回调（调用方在此做 `type === 'wsl-core'` 过滤与状态更新） */
+  onProgress: (payload: InstallProgress) => void
+  /** 实际安装动作 */
+  install: () => Promise<WslCoreProbe>
+  /** 是否已被卸载（组件在 cleanup 里置位） */
+  isCancelled: () => boolean
+  /** 安装成功 */
+  onConfirm: (probe: WslCoreProbe) => void
+  /** 订阅失败或安装失败 */
+  onError: (message: string) => void
+}
+
+/**
+ * 执行「订阅 → 确认未卸载 → 安装」的单一异步链。
+ * @returns cleanup：注销监听；卸载早于订阅完成时，会在订阅 resolve 后立即注销且不会安装。
+ */
+export function runWslCoreInstall(run: WslCoreInstallRun): () => void {
+  let unlisten: (() => void) | undefined
+
+  run.subscribe((payload) => {
+    run.onProgress(payload)
+  }).then(
+    (fn) => {
+      if (run.isCancelled()) {
+        // 卸载早于 listen resolve：立即注销，且不发起安装
+        fn()
+        return
+      }
+      unlisten = fn
+      return run.install().then(
+        (probe) => {
+          if (!run.isCancelled())
+            run.onConfirm(probe)
+        },
+        (err) => {
+          if (!run.isCancelled())
+            run.onError(String(err))
+        },
+      )
+    },
+    (err) => {
+      // 订阅失败：不发起安装，让用户看到失败
+      if (!run.isCancelled())
+        run.onError(String(err))
+    },
+  )
+
+  return () => {
+    unlisten?.()
+  }
+}
 
 /** WSL 核心安装 / 更新进度对话框（只消费 `type === 'wsl-core'` 的进度事件） */
 export interface WslCoreInstallDialogProps extends PropsWithOverlays {
@@ -28,45 +92,33 @@ export function WslCoreInstallDialog(props: WslCoreInstallDialogProps) {
   const error = errorMsg != null
 
   // keep:effect 订阅必须先于安装命令完成：install-progress 的首次进度不能丢，
-  // 因此保留 listen→runInstall→清理的 Promise 生命周期（不能用 useListen 后立即开装）。
-  // 卸载早于 listen resolve 时立即注销；失败详情留在对话框内展示。
+  // 因此用 runWslCoreInstall 保证「订阅 resolve → 未卸载 → 才发起安装」的单一异步链；
+  // 订阅失败不发起安装并把错误留在对话框内；卸载早于 listen resolve 时立即注销。
   useEffect(() => {
     if (!disclosure.visible)
       return
-    let unlisten: (() => void) | undefined
     let cancelled = false
-    listen<InstallProgress>('install-progress', (e) => {
-      if (cancelled)
-        return
-      const payload = e.payload
-      // 只处理 WSL 核心的事件：核心版本下载（app-*）与首装安装同用该通道，
-      // 两边各自按 type 过滤才不会互相吞掉进度（方案 W5.3）。
-      if (payload.type !== 'wsl-core')
-        return
-      setPercentage(prev => Math.max(prev, payload.percentage))
-      if (payload.log)
-        setLogs(prev => [...prev, payload.log].slice(-5))
+    const cleanup = runWslCoreInstall({
+      subscribe: handler => listen<InstallProgress>('install-progress', (e) => {
+        // 只处理 WSL 核心的事件：核心版本下载（app-*）与首装安装同用该通道，
+        // 两边各自按 type 过滤才不会互相吞掉进度（方案 W5.3）。
+        if (e.payload.type === 'wsl-core')
+          handler(e.payload)
+      }),
+      onProgress: (payload) => {
+        setPercentage(prev => Math.max(prev, payload.percentage))
+        if (payload.log)
+          setLogs(prev => [...prev, payload.log].slice(-5))
+      },
+      install: () => props.runInstall(),
+      isCancelled: () => cancelled,
+      onConfirm: probe => disclosure.confirm(probe),
+      onError: message => setErrorMsg(message),
     })
-      .then((fn) => {
-        if (cancelled)
-          fn()
-        else unlisten = fn
-      })
-      .catch(() => {})
-
-    props.runInstall()
-      .then((probe) => {
-        if (!cancelled)
-          disclosure.confirm(probe)
-      })
-      .catch((err) => {
-        if (!cancelled)
-          setErrorMsg(String(err))
-      })
 
     return () => {
       cancelled = true
-      unlisten?.()
+      cleanup()
     }
     // eslint-disable-next-line react/exhaustive-deps -- 仅打开时执行一次
   }, [disclosure.visible])

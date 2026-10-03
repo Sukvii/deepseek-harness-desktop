@@ -9,7 +9,6 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { tv } from 'tailwind-variants'
-import { useStore } from 'valtio-define'
 import { Ellipsis as TextEllipsis } from '@/components/ellipsis'
 import { Empty } from '@/components/empty'
 import { Item } from '@/components/item'
@@ -18,6 +17,7 @@ import { Panel } from '@/components/panel'
 import { queryKeys } from '@/config/query-keys'
 import { useDshPluginsManager } from '@/hooks/use-plugins-manager'
 import { store } from '@/store'
+import { useWslCoreActive } from '@/ui/config/hooks/use-active-core-source'
 import { silence } from '@/utils/silence'
 import { toast } from '@/utils/toast'
 
@@ -61,9 +61,11 @@ const searchProblemKeys: Record<PluginSearchProblem, string> = {
  */
 export function ConfigPlugin() {
   const { t } = useTranslation()
-  // WSL 核心运行中：此面板管理的是 Windows 侧核心数据（U6.6），只显示说明
-  const { active_core } = useStore(store.setting)
-  const wslActive = active_core === 'wsl'
+  // WSL 核心运行中：此面板管理的是 Windows 侧核心数据（U6.6），只显示说明。
+  // 「是否 WSL 生效」以后端判定为准（R-U9-4）：store 的 `active_core` 可能仍是
+  // 'wsl' 而发行版已被清空（`update_app_config` 只清 `wsl_distro`），此时后端按
+  // 本机来源工作，面板必须展示 Windows 内容而不是 WSL 说明。
+  const wslActive = useWslCoreActive()
   const queryClient = useQueryClient()
   const manager = useDshPluginsManager()
 

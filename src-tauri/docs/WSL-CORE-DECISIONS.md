@@ -2382,7 +2382,7 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 |---|---|---|
 | `baseline.json` | 15,405 B | 合并四元组（`mergeHead` `aff39a991fda3558c5459b54fb3fa1c6984d3227`、`mergeBase` `fe056f82e596029d1e1a110565a066ec5f64fc0a`）、`stagedEntries=1936`、`unresolvedConflicts=0`、工具链（node v24.15.0 / pnpm 11.7.0 / rustc 1.98.1 / rustfmt 1.9.0-stable / WSL 2.7.14.0 内核 6.18.33.2-2 / Ubuntu）、三推荐值、三类门禁汇总、`resourceCheck 15/15` |
 | `resource-check.json` | 15/15 通过 | manifest 三推荐值互不相等、`wsl-runtime/0.1.2-rc.1` 两文件字节与 sha256、`overrides` 六项精确版本（`@deepseek-ai/cordis` 4.0.2 / `-plugin-group` 1.0.2 / `-plugin-hmr` 1.0.17 / `-plugin-include` 1.0.7 / `-plugin-loader` 1.0.3 / `-plugin-timer` 1.1.4）、`lockfileVersion` 3、锁内 dsh `0.1.2-rc.1` 与 `bin.dsh=lib/bin.js`、Linux 平台可选依赖、`bundle.resources` glob |
-| `wsl-smoke.md` | 10,147 字符 | U8.1 实测 7 项 PASS → U8.2 车道表 → U8.3 T1–T8（全 PASS）→ U8.4 真机 17 行与 U8.5 四项**全部 `NOT_RUN`** → 5 条证据缺口 → 交付口径 |
+| `wsl-smoke.md` | 30,037 字符（R-U9-5 返修后） | U8.1 静态表（含空白/`active_dsh_binary` 两处口径纠正） → U8.2 车道表（unit 的 10 例逐项归因） → U8.3 **T1–T8 断言级拆分**（39 条 = PASS（单测）26 / PASS（静态）5 / NOT_RUN 8，逐条给测试名，见 `review-u9-fix/t8-assertions.json`） → U8.4 真机 17 行与 U8.5 四项**全部 `NOT_RUN`** → 6 条证据缺口 → 交付口径。**首版把 T1–T8 整项标 PASS，已被审核端 R-U9-5 判定超出实际覆盖，本版不再整项标 PASS** |
 | `commands.md` | 已完成 | 追加 §U9 与 #96–#113 |
 
 ### U9.3 提交与交付门禁（完成）
@@ -2392,19 +2392,19 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 | 祖先检查 | `git merge-base --is-ancestor v0.21.0 HEAD` | **exit 0**（计划硬门禁通过） |
 | 差异归属 | `git diff --name-status v0.21.0 HEAD` | 64 项：M 43 / A 21，**D 0 / R 0**（无上游模块被回退） |
 | 差异规模 | `git diff --stat v0.21.0 HEAD` | 64 files changed, 18250 insertions(+), 126 deletions(-) |
-| 空白错误 | `git diff --check v0.21.0 HEAD` vs `git diff --check fe056f82 v0.21.0` | 合并侧 0 条；上游侧 14 条（`inheritedFromUpstream=0`、`introducedByMerge=0`、`fixedByMerge=14`） |
+| 空白错误 | `git diff --check v0.21.0 HEAD` vs `git diff --check fe056f82 v0.21.0` | 合并侧 0 条；上游侧 14 条（9 个文件）。**逐处 blob 比对：`inheritedUnchanged=14`、`touchedByMerge=0`** → 正确口径「新增 0，继承上游既有 14」，见 D-U9-7 |
 | 工作区 | `git status --porcelain --untracked-files=normal` / `git rev-parse --verify MERGE_HEAD` | 条目 0；`MERGE_HEAD` 已不存在（合并状态结束） |
 
 - **提交**：merge commit `16df39aee70aa041f6ca6231b866a6afe90155cd`（分支 `sync/wsl-core-v0.21.0`），parents = `cd8af2414aa26ca0210b3421449c8c914f76be68`（合并前 fork HEAD）+ `aff39a991fda3558c5459b54fb3fa1c6984d3227`（v0.21.0），2 亲即非快进。提交正文（`validation/sync-v0.21.0-20261003/u9-merge-commit-message.txt`）列出 20 个冲突文件的逐项归属与双树验证口径。
 - **本次未推送、未生成发布包**：计划 §U9.3 要求「核对无误后按授权推送同步分支供审核」，推送需单独授权；本分支 CI（三平台）因此未运行。
 - **证据**：`validation/sync-v0.21.0-20261003/SUMMARY.md`（六项固定交付说明）、`u9-post-commit-gates.log`、`u9-whitespace.json`、`u9-diff-stat-v0.21.0-HEAD.txt`、`u9-name-status-v0.21.0-HEAD.txt`；`baseline.json` 已回填 `merge.mergeCommit` 与 `diffVsUpstreamTag`。
 
-### D-U9-5（口径）空白错误必须做归因，不能只看绝对条数
+### D-U9-5（口径，**已纠正**）空白错误必须做归因，不能只看绝对条数
 
-- **阶段**：U9.3。
-- **实际**：`git diff --cached --check`（暂存区相对合并基点）曾报 14 条空白错误，粗看像是本合并引入。按「相对路径 + 消息」对齐两侧：上游侧 `git diff --check fe056f82 v0.21.0` 同样 14 条（分布 `docs/specs/plugin.client.panel.md`、`docs/specs/plugin.host.md`、`packages/dsh-tauri-extension/skills/skill-creator/scripts/*.py`、`src-tauri/vendor/tauri-plugin-notifications/**`、`src-tauri/vendor/tauri-plugin-wdio-webdriver/**` 等，均为 v0.21.0 自身改动），合并侧 `git diff --check v0.21.0 HEAD` 为 **0** 条。
-- **决定**：定论为「本合并新增 0 条空白错误，且上游那 14 条没有进入合并结果」，不作为门禁失败项。
-- **影响**：与 D-U8-8（rustfmt）同一条方法论——**diff 类门禁一律做逐项归因，绝对条数不构成结论**。
+- **阶段**：U9.3；**R-U9-7.3 返修**。
+- **实际**：`git diff --cached --check`（暂存区相对合并基点）曾报 14 条空白错误，粗看像是本合并引入。按「相对路径 + 消息」对齐两侧：上游侧 `git diff --check fe056f82 v0.21.0` 同样 14 条（9 个文件：`docs/specs/plugin.client.panel.md`、`docs/specs/plugin.host.md`、`packages/dsh-tauri-extension/skills/skill-creator/scripts/{improve_description,quick_validate}.py`、`packages/dsh-tauri-scheduler/docs/sync-log.md`、`src-tauri/src/desktop/payload.rs`、`src-tauri/vendor/tauri-plugin-notifications/**`、`src-tauri/vendor/tauri-plugin-wdio-webdriver/**`、`src/styles/main.css`），合并侧 `git diff --check v0.21.0 HEAD` 为 **0** 条。
+- **纠正（审核端 R-U9-7.3）**：原先把「合并侧 0 条」解释成「上游那 14 条被修掉了（`fixedByMerge=14`）」是错的。逐处比对 `v0.21.0:<path>` 与 `HEAD:<path>` 的 blob hash 后确认：**14/14 两侧 blob 完全相同**（`inheritedUnchanged=14`、`touchedByMerge=0`）——这些文件在 v0.21.0 与合并结果上逐字节一致，空白错误原样保留在仓库里，只是**不在 `v0.21.0..HEAD` 的差异范围内**，所以那句 diff 看不到它们。正确口径「**相对目标标签新增 0，继承上游既有 14**」，既不记「已修复 14」，也不为消灭这些上游空白噪声扩大代码修改面。脚本 `.temp/verify-whitespace-inheritance.mjs`，证据 `review-u9-fix/whitespace-inheritance.json`、`u9-whitespace.log`。
+- **影响**：与 D-U8-8（rustfmt）同一条方法论——**diff 类门禁一律做逐项归因，绝对条数不构成结论**；且归因必须落到「同一实体是否真的变了」（blob/内容），不能只看「某条 diff 里是否出现」。
 
 ### D-U9-6（交付定性）真机未运行，只可交付迁移候选
 
@@ -2412,11 +2412,51 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 - **决定**：交付摘要固定写「目标桌面标签 v0.21.0；WSL 受控基线 0.1.2-rc.1；本地车道与双树门禁结果；WSL 真机结果未运行；尚未运行项 = U8.4 17 场景 + U8.5 四项 + 推送；发布包未生成」；定性为「静态与构建完成的迁移候选」，**不得标注「WSL 同步完成」**。
 - **影响**：`SUMMARY.md` 即该固定说明的落盘版本，供审核端直接引用。
 
-### U9 裁决
+### D-U9-7（口径纠正）T 项不得整项标 PASS，必须拆到实际执行的断言
+
+- **阶段**：U9.3 返修（审核端 M 节 R-U9-5）。
+- **问题**：`wsl-smoke.md` 首版把 T1–T8 整项标 PASS，但 T3（只引 `version.rs:992` 推荐版本比较与 `:1058` release 记录匹配，未调用完整 WSL 行构造/离线激活）、T6（只跑排序/兼容/跨界纯函数，未挂载 WSL 面板、未观察 store/invoke）、T7（只引生产代码 + `crossesWslBoundary` 布尔断言，未覆盖安装/重启副作用与真实调用顺序）、T8（`bridge/guard.rs` 旧测试只检查普通 `PathBuf` 组件前缀，未覆盖新增 WSL 允许根分支）的**实际覆盖小于该项判据**。
+- **决定**：把每项按 PLAN §U8.3 判据拆成断言级条目，逐条给「PASS（单测）/ PASS（静态）/ NOT_RUN」；**为迁移新增且可在单元/组件层验证的行为补最小回归**，OS、文件管理器与真实 WebView 动作仍归 U8.4；不得为了让表格全绿削减原验收判据。当前 39 条 = PASS（单测）26 / PASS（静态）5 / NOT_RUN 8，数据 `review-u9-fix/t8-assertions.json`（脚本 `.temp/build-t8-assertions.mjs`），文档由 `.temp/build-wsl-smoke.mjs` 生成以免再漂移。
+- **连带补测**：T6/T7 的面板与顺序回归 4 个文件（`test/core-list.test.ts`、`test/wsl-runtime-info.test.ts`、`test/active-core-source.test.ts`、`test/wsl-core-install.test.ts`、`test/wsl-core-install-dialog.test.ts`）；T8 的 UNC 允许根抽出单一来源 `patch::wsl_data_root_unc` 并加单测 `service::wsl_core::patch::tests::data_root_unc_stops_at_app_data_root`（真机核对脚本与允许根从此同源）。反例规则（面板不得再比对 `active_core`、运行时信息不得 `cached_or_probe`、允许根不得手拼 UNC）随断言集落盘，当前触发 0 条。
+
+### D-U9-8（口径纠正）空白门禁的正确结论是「新增 0 / 继承上游 14」
+
+见 D-U9-5 的纠正段：blob 逐处比对 `inheritedUnchanged=14`、`touchedByMerge=0`，**不记「已修复 14」**；`validation/.../u9-whitespace.json` 里 `inheritedFromUpstream=0 / fixedByMerge=14` 是错的，已被 `review-u9-fix/whitespace-inheritance.json` 取代。
+
+### D-U9-9（口径纠正）`active_dsh_binary` 保留，按逐调用点审计记录
+
+- **阶段**：U9.3 返修（审核端 M 节 R-U9-7.1）。
+- **问题**：U8.1 静态表把 `active_dsh_binary` 当作「应已删除的零命中符号」，`u8-1-static.log:24-37` 的 EXIT=1 被读成通过；实际该符号**有定义与调用**：定义 `src-tauri/src/service/core/source.rs:207 pub fn active_dsh_binary(app_handle: &AppHandle) -> PathBuf`，re-export `service/core/mod.rs:34`，调用 `service/plugin/install/mod.rs:356,629`、`service/plugin/install/single.rs:667`、`service/plugin/patch_entries.rs:88,108`、`service/workflow/launch.rs:150,346`（共 14 行命中）。
+- **决定**：PLAN 要求的是「逐调用点确认 WSL 分流」，不是删除该符号。结论改为**保留该符号，按「展示 / 本机执行前已 `is_wsl_active` 分流」记录审计结果**；不得据错误的零命中门禁删除合法接口。证据 `review-u9-fix/active-dsh-references.log`。
+
+### D-U9-10（口径纠正）iframe 帧身份协议确实存在，缺口在真机验证
+
+- **阶段**：U9.3 返修（审核端 M 节 R-U9-7.2）。
+- **问题**：U8.4 #7 与证据缺口清单称「frame 身份握手在仓库内零命中」，与事实不符。
+- **实际**：`src-tauri/src/desktop/plugin_boot.js.inc:98-106`（直接子 frame 出现 `#root` 后 `send('dsh://plugin-boot:frame')`）、`src-tauri/src/desktop/builder.rs:829-834`（all-frames 初始化脚本注入）、`test/plugin-boot.test.ts:29-35`（载入真实脚本并断言帧申报与生命周期，11/11 通过）。
+- **决定**：正确缺口表述为「**尚未在旧 WSL runtime 的真实 WebView 页面验证新版握手与 watchdog**」；**不得重新实现或删除上游协议**。证据 `review-u9-fix/iframe-frame-references.log`。
+
+#### R-U9 返修状态（审核端 M 节 7 项，2026-10-03 执行端）
+
+审核端 `WSL-CORE-REVIEW.md` M 节给出 **CHANGES_REQUIRED** 与 7 项返修要求；执行端逐项落实如下（不改原验收判据，不为凑绿削减覆盖面）。
+
+| 项 | 要求 | 状态 | 关键改动与证据 |
+|---|---|---|---|
+| R-U9-1 | 安装命令未等待进度监听注册 | **已修复 + 定向回归** | `src/ui/config/wsl-core-install.tsx` 导出纯契约 `runWslCoreInstall(run)`：单一异步链「订阅成功 → 确认未卸载 → 执行安装」，订阅失败只展示错误、**不发起安装**，迟到注册/卸载时注销。回归 `test/wsl-core-install.test.ts`（7 例）+ `test/wsl-core-install-dialog.test.ts`（4 例，jsdom 真实挂载）。变异验证：改回「两条互不等待的链」→ 6 条失败 |
+| R-U9-2 | WSL probe 缓存为空时诊断仍显示宿主 Node/数据根 | **已修复 + 定向回归** | `src-tauri/src/bridge/system_os.rs` 新增纯函数 `apply_wsl_runtime_info`（先清空 Linux 专属字段，`data_dir` 置 `DATA_DIR_PROBE_PENDING = "(WSL: not probed yet)"`）+ 只读 `probe::cached` 的 `wsl_cached_probe`，**不用宿主字段兜底**；前端 `src/utils/wsl-runtime-info.ts` 与 `debug.tsx` 语义化显示（`ui.wsl_linux_facts_pending`）并禁用「打开目录」。回归 `bridge::system_os` 17 例（含 6 条新增）+ `test/wsl-runtime-info.test.ts`（11 例） |
+| R-U9-3 | 数据目录显示 WSL、按钮却打开 Windows 目录 | **已修复 + 定向回归** | `reveal_data_dir(app_handle, path: Option<String>)` 走纯函数 `resolve_reveal_target`：`Custom`（经 `guard::is_allowed_path`）/`HostDefault`（仅非 WSL + 未给路径）/`None`（`REVEAL_DATA_DIR_UNPROBED`）；**缓存缺失时绝不悄悄打开 Windows 目录**，未扩大 UNC 白名单 |
+| R-U9-4 | 插件/档案面板的 WSL 判定与后端不一致 | **已修复 + 定向回归** | `RuntimeInfo` 增 `active_source`（`src-tauri/src/config/runtime.rs` + `src/types/runtime.ts`），由 bridge 用 `service::core::active_source` 填充；新增 `src/ui/config/hooks/use-active-core-source.ts`（`toActiveCoreSource` / `useActiveCoreSource` / `useWslCoreActive`）；`plugin.tsx`、`profile.tsx` 改用它，**不再自行比对 `active_core`**（面板判定因此与后端「平台支持 + 发行版非空白」的有效选择条件一致，且不引入联网 releases 查询）。回归 `test/active-core-source.test.ts`（8 例）+ `src/ui/config/plugin.test.tsx` 新增 3 例（wsl / 清除发行版 / 来源未取到） |
+| R-U9-5 | T1–T8 整项 PASS 超出实际覆盖 | **已修复（断言级重写）** | 见 D-U9-7：39 条断言 = PASS（单测）26 / PASS（静态）5 / NOT_RUN 8；T8 补 UNC 允许根单一来源与单测 |
+| R-U9-6 | 全量 unit 的 worker 异常未闭环 | **已闭环（未复现）** | 261 次文件级结果行覆盖全部 260 个测试文件，无 `Errors` 段、无 `Worker exited unexpectedly`；`10 例既有环境性失败`单独登记。证据 `review-u9-fix/unit-full-2.log`（`Test Files 1 failed \| 257 passed \| 2 skipped (260)`、`Tests 10 failed \| 2579 passed \| 4 skipped (2593)`）与干净基线对照 `baseline-unit-full.log`（同文件同 `10 failed`，含同一条权限位断言） |
+| R-U9-7 | 静态证据三项事实纠正 | **已纠正** | (1) `active_dsh_binary` 非零命中 → D-U9-9；(2) iframe 帧身份协议存在 → D-U9-10；(3) 空白门禁「新增 0 / 继承 14」→ D-U9-8 |
+
+- **收口状态**：R-U9-1—4 的实现与定向回归完成；R-U9-5—7 的断言、状态与原始证据已对齐。U8.4 真机矩阵、插件/桌面 E2E、三平台 CI、发布构建仍 **NOT_RUN**；推送待单独授权。
+
+## U9 裁决
 
 - **D-U9-1（环境限制，证据已留）真机车道不在本环境执行**：U8.4 的 17 个场景与 U8.5 的四项（插件 E2E / 桌面 E2E / 三平台 CI / `pnpm tauri build`）一律记 `NOT_RUN`，**不把静态或单测证据写成 PASS**；每项仍逐条给出代码路径作为执行指引。
 - **D-U9-2（口径）`wsl-smoke.md` 的状态三分**：`PASS`（本轮实际执行的静态/构建/单测证据）、`FAIL（既有环境性）`（有基线对照的 Windows 环境性失败）、`NOT_RUN`（需真机）。禁止把已定位的代码路径计为已验证。
 - **D-U9-3（环境隔离要求，真机执行前必读）**：Windows 侧 `DSH_E2E_HOME`/`USERPROFILE` 隔离**不改变** `wsl.exe` 内的 Linux `$HOME`；WSL debug 固定 `.dsh-desktop.dev`；失败注入必须用专用测试发行版或专用 Linux 测试用户，不得使用真实会话/凭据；不得自动导入或删除发行版、不得改默认用户、不得改 `.wslconfig`、不得执行 `wsl --shutdown`。
-- **D-U9-4（已知证据缺口，不为对齐文档而造证据）**：帧身份握手（#7）在仓库内零命中；网络模式 mirrored/NAT（#17）在 `src-tauri/src` 零命中；同一 PID 热生效（#6）无仓库内断言；凭据 `umask 077`（#14）无现成夹具；前端 WSL 配置（#8/#11）无单测（仓库无 `src-tauri/tests/`、无 `wsl*.test.ts*`）。
+- **D-U9-4（已知证据缺口，不为对齐文档而造证据）**：网络模式 mirrored/NAT（#17）在 `src-tauri/src` 零命中；同一 PID 热生效（#6）无仓库内断言；凭据 `umask 077`（#14）无现成夹具；`get_cores` 的 WSL 行字段与离线回包（T3.5/T3.6）无夹具；`wsl-core.tsx` 面板挂载观测（T6.4）无用例。**原列的两条已纠正**：帧身份握手**并非零命中**（见 D-U9-10）；前端 WSL 配置**已有单测**（`test/core-list.test.ts`、`test/wsl-runtime-info.test.ts`、`test/active-core-source.test.ts`、`test/wsl-core-install.test.ts`、`test/wsl-core-install-dialog.test.ts`，另 `src/ui/config/plugin.test.tsx` 8/8），但真实 restart 副作用仍归真机 #8/#11。
 - **交付口径**：目标桌面标签 v0.21.0；WSL 受控基线 `0.1.2-rc.1`；真机与发布包**未运行/未生成**；交付物定性为「**静态与构建完成的迁移候选**」，不得标注「WSL 同步完成」。
 - **落盘**：上述交付口径的固定说明见 `validation/sync-v0.21.0-20261003/SUMMARY.md`（§U9.3 / D-U9-6）。

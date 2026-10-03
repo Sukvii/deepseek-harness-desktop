@@ -33,29 +33,71 @@ pub async fn proxy_health_check(app_handle: AppHandle) -> Result<String, String>
 pub async fn get_runtime_info(app_handle: AppHandle) -> Result<config::RuntimeInfo, String> {
     let port = config::get_store_dat_setting(&app_handle).port;
     let mut info = config::runtime_info(&app_handle, port);
+    // 实际生效的核心来源按后端判定写入（U3.1 的 `active_source`：平台 + 显式 WSL
+    // 选择 + 非空发行版），前端据此对齐「谁在跑」——不自行拼 `active_core` 的状态
+    // 组合（R-U9-4），也不为判来源额外联网。
+    info.active_source = core::active_source(&app_handle).as_str().to_string();
     if core::is_wsl_active(&app_handle) {
-        // WSL 核心（U7.1）：诊断字段取 Linux 侧（probe 缓存），缓存空时 dsh 版本
-        // 显示为空——绝不 `.or()` 回落 Windows 宿主值，否则会把宿主的 dsh/node
-        // 冒充发行版内的安装信息。Node 版本与数据根（runtime 路径）同样只认 probe。
-        info.dsh_version = core::active_version(&app_handle);
-        if let Some(distro) = config::get_store_dat_setting(&app_handle).wsl_distro {
-            if let Some(probed) = crate::service::wsl_core::probe::cached(&distro) {
-                info.node_version = probed.node_version.unwrap_or_default();
-                info.data_dir = crate::service::wsl_core::patch::wsl_unc_path(
-                    &distro,
-                    &format!(
-                        "{}/{}",
-                        probed.home.trim_end_matches('/'),
-                        crate::service::wsl_core::dsh_home_dir_name()
-                    ),
-                );
-            }
-        }
+        // WSL 核心（U7.1 / R-U9-2）：Linux 专属字段只认匹配发行版的 probe 缓存。
+        // 缓存空时 `dsh_version` / `node_version` 为空、`data_dir` 取显式未取得
+        // 标记——绝不 `.or()` / 兜底回落 Windows 宿主值，否则会把宿主的 dsh/node/
+        // 数据根冒充发行版内的安装信息。桌面自身字段（app_version / service_url /
+        // log_path / platform / arch）保持原义。
+        let distro = config::get_store_dat_setting(&app_handle).wsl_distro;
+        apply_wsl_runtime_info(&mut info, distro.as_deref(), wsl_cached_probe(distro.as_deref()));
     } else {
         info.dsh_version = core::active_version(&app_handle).or(info.dsh_version);
     }
     Ok(info)
 }
+
+/// WSL 分支的 Linux 专属字段取值口径（纯函数，便于单测锁定「不用宿主兜底」）。
+///
+/// Node 与数据根都先置为「未取得」再按 probe 填；`dsh_version` 由调用方用
+/// `core::active_version`（WSL 来源，无缓存即 `None`）单独设置，不在此处理。
+fn apply_wsl_runtime_info(
+    info: &mut config::RuntimeInfo,
+    distro: Option<&str>,
+    probe: Option<WslProbeFacts>,
+) {
+    // 无论缓存是否命中都不保留宿主值：Node 与数据根先清空再按 probe 填。
+    info.node_version = String::new();
+    info.data_dir = DATA_DIR_PROBE_PENDING.to_string();
+    let Some(facts) = probe else {
+        return;
+    };
+    let Some(distro) = distro else {
+        return;
+    };
+    info.node_version = facts.node_version;
+    info.data_dir = crate::service::wsl_core::patch::wsl_unc_path(
+        distro,
+        &format!(
+            "{}/{}",
+            facts.home.trim_end_matches('/'),
+            crate::service::wsl_core::dsh_home_dir_name()
+        ),
+    );
+}
+
+/// probe 缓存里与本函数相关的字段（探测结果里与诊断展示无关的部分不参与，便于单测构造）。
+struct WslProbeFacts {
+    node_version: String,
+    home: String,
+}
+
+/// 读进程内 probe 缓存（只读，不触发探测/启动发行版）。
+fn wsl_cached_probe(distro: Option<&str>) -> Option<WslProbeFacts> {
+    let distro = distro?;
+    let probed = crate::service::wsl_core::probe::cached(distro)?;
+    Some(WslProbeFacts {
+        node_version: probed.node_version.unwrap_or_default(),
+        home: probed.home,
+    })
+}
+
+/// 数据目录的「尚未探测」显式标记（R-U9-2：不用宿主路径兜底）。
+const DATA_DIR_PROBE_PENDING: &str = "(WSL: not probed yet)";
 
 /// 在系统浏览器中打开 Harness 界面
 #[tauri::command]
@@ -100,14 +142,69 @@ pub fn open_dir(app_handle: AppHandle, path: String) -> Result<(), String> {
     tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("OPEN_DIR_FAILED: {e}"))
 }
 
-/// 在系统文件管理器中打开数据目录（官方 $DSH_HOME，即 ~/.dsh）
+/// 在系统文件管理器中打开数据目录（官方 `$DSH_HOME`，即 `~/.dsh`）。
+///
+/// `path` 为屏幕上显示的那个数据目录（`get_runtime_info` 的 `data_dir`），由前端
+/// 原样回传：R-U9-3 之前本命令无条件打开**Windows** `$DSH_HOME`，而 WSL 核心下
+/// 面板显示的是发行版内的 UNC 数据根，点按钮会进到另一个环境的数据目录（还会顺手
+/// 创建 Windows 目录）。现在：
+/// - 给了合法且存在的路径 → 走与 `open_dir` 同一套允许根校验后打开（WSL 数据根的
+///   UNC 白名单来自 `bridge::guard::allowed_roots` 的 U7.2 受限根，不因此扩大）；
+/// - 路径是「WSL 尚未探测」标记 → 直接拒绝，**不悄悄回落 Windows 目录**；
+/// - 其它不可用形态 → 拒绝；
+/// - 未给路径 → 仅当当前不是 WSL 核心时打开 Windows 数据目录（兼容旧调用）。
 #[tauri::command]
-pub async fn reveal_data_dir(app_handle: AppHandle) -> Result<(), String> {
-    let dsh_home = config::get_dsh_data_path(&app_handle);
-    // 目录可能尚未创建（全新安装），先建好再打开，避免资源管理器报路径不存在
-    std::fs::create_dir_all(&dsh_home).map_err(|e| e.to_string())?;
+pub async fn reveal_data_dir(app_handle: AppHandle, path: Option<String>) -> Result<(), String> {
+    match resolve_reveal_target(
+        path.as_deref(),
+        core::is_wsl_active(&app_handle),
+        DATA_DIR_PROBE_PENDING,
+    ) {
+        RevealTarget::Custom(target) => {
+            if !crate::bridge::guard::is_allowed_path(&app_handle, std::path::Path::new(&target)) {
+                return Err(format!("REVEAL_PATH_REJECTED: {target}"));
+            }
+            tauri_plugin_opener::open_path(&target, None::<&str>)
+                .map_err(|e| format!("REVEAL_FAILED: {e}"))
+        }
+        RevealTarget::HostDefault => {
+            let dsh_home = config::get_dsh_data_path(&app_handle);
+            // 目录可能尚未创建（全新安装），先建好再打开，避免资源管理器报路径不存在
+            std::fs::create_dir_all(&dsh_home).map_err(|e| e.to_string())?;
+            tauri_plugin_opener::open_path(&dsh_home, None::<&str>).map_err(|e| e.to_string())
+        }
+        RevealTarget::None(reason) => Err(reason.to_string()),
+    }
+}
 
-    tauri_plugin_opener::open_path(&dsh_home, None::<&str>).map_err(|e| e.to_string())
+/// 数据目录按钮的取值决策（纯函数，便于单测锁定「显示与打开同一目标」）。
+#[derive(Debug, PartialEq, Eq)]
+enum RevealTarget<'a> {
+    /// 打开前端回传的路径（仍需过允许根校验）
+    Custom(&'a str),
+    /// 前端未回传路径：退回宿主数据目录（仅非 WSL 核心）
+    HostDefault,
+    /// 无可用目标：带拒绝原因，绝不回落宿主目录
+    None(&'static str),
+}
+
+fn resolve_reveal_target<'a>(
+    path: Option<&'a str>,
+    wsl_active: bool,
+    probe_pending_marker: &str,
+) -> RevealTarget<'a> {
+    match path {
+        // WSL 核心 + 未探测：屏幕上没有真实数据根，不能拿 Windows 目录顶替
+        Some(pending) if pending == probe_pending_marker => {
+            RevealTarget::None("REVEAL_DATA_DIR_UNPROBED: WSL data dir is not probed yet")
+        }
+        // 空串按「未回传」处理（旧前端只 invoke 不带参数）
+        Some(target) if !target.trim().is_empty() => RevealTarget::Custom(target),
+        _ if wsl_active => {
+            RevealTarget::None("REVEAL_DATA_DIR_UNPROBED: WSL data dir is not probed yet")
+        }
+        _ => RevealTarget::HostDefault,
+    }
 }
 
 /// 前端日志透传：前端 `console.*` 劫持经此命令落盘到 `desktop.frontdesk.log`
@@ -300,6 +397,118 @@ mod tests {
     use super::format_env_info;
     use super::is_frontend_log_line;
     use super::tail_bytes;
+    use super::RevealTarget;
+    use super::WslProbeFacts;
+    use super::DATA_DIR_PROBE_PENDING;
+
+    /// R-U9-2：WSL 分支在没有 probe 缓存时，不得用宿主 Node / 数据根兜底。
+    #[test]
+    fn wsl_runtime_info_without_probe_clears_host_fields() {
+        let mut info = host_info();
+        super::apply_wsl_runtime_info(&mut info, Some("Ubuntu"), None);
+        assert_eq!(info.node_version, "");
+        assert_eq!(info.data_dir, DATA_DIR_PROBE_PENDING);
+        // 宿主字段保持原义
+        assert_eq!(info.platform, "windows");
+        assert_eq!(info.log_path, r"C:\Users\u\AppData\dsh\logs\dsh-web.log");
+        assert_eq!(info.active_source, "wsl");
+    }
+
+    /// R-U9-2：有 probe 缓存时 Node / 数据根取发行版内的值（UNC），仍不带宿主值。
+    #[test]
+    fn wsl_runtime_info_with_probe_uses_distro_values() {
+        let mut info = host_info();
+        super::apply_wsl_runtime_info(
+            &mut info,
+            Some("Ubuntu"),
+            Some(WslProbeFacts {
+                node_version: "v22.11.0".to_string(),
+                home: "/home/pixel/".to_string(),
+            }),
+        );
+        assert_eq!(info.node_version, "v22.11.0");
+        assert!(info.data_dir.starts_with("\\\\wsl.localhost\\Ubuntu\\home\\pixel\\"));
+        assert!(info.data_dir.contains(crate::service::wsl_core::dsh_home_dir_name()));
+        assert!(!info.data_dir.contains("AppData"));
+    }
+
+    /// R-U9-2：发行版缺失（缓存已清但来源判定仍为 wsl）时同样不回落宿主值。
+    #[test]
+    fn wsl_runtime_info_without_distro_does_not_fall_back() {
+        let mut info = host_info();
+        super::apply_wsl_runtime_info(
+            &mut info,
+            None,
+            Some(WslProbeFacts {
+                node_version: "v22.11.0".to_string(),
+                home: "/home/pixel".to_string(),
+            }),
+        );
+        assert_eq!(info.node_version, "");
+        assert_eq!(info.data_dir, DATA_DIR_PROBE_PENDING);
+
+        let mut info = host_info();
+        super::apply_wsl_runtime_info(&mut info, Some("   "), None);
+        assert_eq!(info.data_dir, DATA_DIR_PROBE_PENDING);
+    }
+
+    /// 构造一份「宿主（Windows）形态」的基础运行时信息作为对照。
+    fn host_info() -> crate::config::RuntimeInfo {
+        crate::config::RuntimeInfo {
+            app_version: "0.21.0".to_string(),
+            dsh_version: Some("0.2.0-rc.2".to_string()),
+            node_version: "22.22.0".to_string(),
+            service_url: "http://127.0.0.1:37321".to_string(),
+            data_dir: r"C:\Users\u\.dsh".to_string(),
+            log_path: r"C:\Users\u\AppData\dsh\logs\dsh-web.log".to_string(),
+            platform: "windows".to_string(),
+            arch: "x86_64".to_string(),
+            active_source: "wsl".to_string(),
+        }
+    }
+
+    /// R-U9-3：数据目录按钮必须与屏幕上显示的数据根指向同一目标。
+    #[test]
+    fn reveal_target_follows_displayed_data_dir() {
+        // 屏幕上显示 WSL UNC → 打开同一 UNC（不再打开 Windows 目录）
+        let unc = "\\\\wsl.localhost\\Ubuntu\\home\\pixel\\.dsh-desktop";
+        assert_eq!(
+            super::resolve_reveal_target(Some(unc), true, DATA_DIR_PROBE_PENDING),
+            RevealTarget::Custom(unc)
+        );
+        // 屏幕上显示 Windows 数据根 → 打开同一 Windows 目录
+        assert_eq!(
+            super::resolve_reveal_target(Some(r"C:\Users\u\.dsh"), false, DATA_DIR_PROBE_PENDING),
+            RevealTarget::Custom(r"C:\Users\u\.dsh")
+        );
+    }
+
+    /// R-U9-3：WSL 核心且未探测时拒绝打开，绝不悄悄回落 Windows 目录。
+    #[test]
+    fn reveal_target_refuses_host_fallback_under_wsl() {
+        let pending = super::resolve_reveal_target(Some(DATA_DIR_PROBE_PENDING), true, DATA_DIR_PROBE_PENDING);
+        assert!(matches!(pending, RevealTarget::None(reason) if reason.contains("UNPROBED")));
+        // 旧调用形态（不带 path）+ WSL 核心：同样拒绝
+        let no_path = super::resolve_reveal_target(None, true, DATA_DIR_PROBE_PENDING);
+        assert!(matches!(no_path, RevealTarget::None(_)));
+        let empty = super::resolve_reveal_target(Some(""), true, DATA_DIR_PROBE_PENDING);
+        assert!(matches!(empty, RevealTarget::None(_)));
+        let blank = super::resolve_reveal_target(Some("   "), true, DATA_DIR_PROBE_PENDING);
+        assert!(matches!(blank, RevealTarget::None(_)));
+    }
+
+    /// 非 WSL 核心保持旧行为：不带路径时打开宿主数据目录。
+    #[test]
+    fn reveal_target_defaults_to_host_when_not_wsl() {
+        assert_eq!(
+            super::resolve_reveal_target(None, false, DATA_DIR_PROBE_PENDING),
+            RevealTarget::HostDefault
+        );
+        assert_eq!(
+            super::resolve_reveal_target(Some(""), false, DATA_DIR_PROBE_PENDING),
+            RevealTarget::HostDefault
+        );
+    }
 
     #[test]
     fn log_tail_filters_frontend_before_selecting_last_lines() {

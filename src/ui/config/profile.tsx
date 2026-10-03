@@ -9,7 +9,6 @@ import { useState } from 'react'
 
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
-import { useStore } from 'valtio-define'
 import { Ellipsis } from '@/components/ellipsis'
 import { Empty } from '@/components/empty'
 import { Item } from '@/components/item'
@@ -20,6 +19,7 @@ import { useInvalidateOnSettingUpdated } from '@/hooks/use-invalidate-on-setting
 import { store } from '@/store'
 import { waitForHarnessStopped } from '@/store/modules/harness'
 import { ConfigBackup } from '@/ui/config/backup'
+import { useWslCoreActive } from '@/ui/config/hooks/use-active-core-source'
 import { normalizeProfileId } from '@/utils/profile-id'
 import { silence } from '@/utils/silence'
 import { toast } from '@/utils/toast'
@@ -43,9 +43,10 @@ export function ConfigProfile() {
    * 都以它为准。切换档案需要重启服务才生效（toast 内提供重启入口）。
    */
   const queryClient = useQueryClient()
-  // WSL 核心运行中：此面板管理的是 Windows 侧数据（U6.6），只显示说明
-  const { active_core } = useStore(store.setting)
-  const wslActive = active_core === 'wsl'
+  // WSL 核心运行中：此面板管理的是 Windows 侧数据（U6.6），只显示说明。
+  // 「是否 WSL 生效」以后端判定为准（R-U9-4）：`active_core === 'wsl'` 与已清空
+  // 的 `wsl_distro` 组合会被后端按本机来源回退，那时的面板仍应展示 Windows 内容。
+  const wslActive = useWslCoreActive()
   const { data: profileList, isLoading, error: profileError, refetch } = useQuery({
     queryKey: queryKeys.profiles,
     queryFn: () => invoke<Profile[]>('get_profiles'),

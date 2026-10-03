@@ -45,6 +45,21 @@ pub(crate) fn wsl_unc_path(distro: &str, linux_path: &str) -> String {
     format!("{}{}", wsl_unc_root(distro), linux_path.replace('/', "\\"))
 }
 
+/// 发行版内**本应用数据根**的 UNC 路径：`\\wsl.localhost\<distro>\<home>\.dsh-desktop[.dev]`。
+///
+/// 唯一来源：`bridge::guard::allowed_roots` 的 WSL 允许根与真机核对脚本都用它，
+/// 避免「代码里算一份、核对手工拼一份」导致两者悄悄分叉（R-U9-5）。
+/// 只到数据根为止——不含 `home` 本身、不含发行版共享根。
+pub(crate) fn wsl_data_root_unc(distro: &str, home: &str) -> String {
+    let linux_dir = format!(
+        "{}/{}",
+        home.trim_end_matches('/'),
+        super::dsh_home_dir_name()
+    );
+    wsl_unc_path(distro, &linux_dir)
+}
+
+
 /// 单个目标的命中判定：刚打上（`Patched`）与此前已打（`AlreadyPatched`）都算命中；
 /// 文件缺失 / 锚点缺失视为未命中。
 fn hit(outcome: Option<PatchOutcome>) -> bool {
@@ -95,7 +110,7 @@ pub fn apply(distro: &str, npm_root: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hit, wsl_unc_path, CONNECTION_INDEX_RELS, WEB_STARTUP_RELS};
+    use super::{hit, wsl_data_root_unc, wsl_unc_path, CONNECTION_INDEX_RELS, WEB_STARTUP_RELS};
     use crate::utils::PatchOutcome;
 
     #[test]
@@ -112,9 +127,35 @@ mod tests {
         assert!(wsl_unc_path("Ubuntu", "/root").starts_with("\\\\wsl.localhost\\"));
     }
 
+    /// T8 的「UNC 限定根」只落到**数据根**，不放开 home 本身、不放开发行版共享根。
+    ///
+    /// 这条替换掉「只断言普通 `PathBuf` 前缀边界」的旧覆盖：边界判据由
+    /// `bridge::guard::allowed_roots` 与这里的 UNC 构造共同决定，而构造是真机核对
+    /// 脚本与允许根的唯一共同来源（R-U9-5）。
     #[test]
-    fn hit_counts_patched_and_already_patched_only() {
-        assert!(hit(Some(PatchOutcome::AlreadyPatched)));
+    fn data_root_unc_stops_at_app_data_root() {
+        let root = wsl_data_root_unc("Ubuntu", "/home/pixel");
+        assert_eq!(
+            root,
+            format!(
+                "\\\\wsl.localhost\\Ubuntu\\home\\pixel\\{}",
+                crate::service::wsl_core::dsh_home_dir_name()
+            )
+        );
+        // 只到数据根：home 本身与发行版根都不得成为允许根
+        assert_ne!(root, "\\\\wsl.localhost\\Ubuntu\\home\\pixel");
+        assert_ne!(root, "\\\\wsl.localhost\\Ubuntu");
+        assert!(!root.ends_with("\\home\\pixel"));
+        // 尾斜杠与无尾斜杠两种 home 形态必须给出同一个根
+        assert_eq!(root, wsl_data_root_unc("Ubuntu", "/home/pixel/"));
+        // 子路径仍在根内（组件级前缀），父级与相邻用户不在
+        let inside = format!("{root}\\runtime");
+        assert!(inside.starts_with(&root));
+        assert!(!"\\\\wsl.localhost\\Ubuntu\\home\\pixel2".starts_with(&root));
+    }
+
+    #[test]
+    fn hit_counts_patched_and_already_patched_only() {        assert!(hit(Some(PatchOutcome::AlreadyPatched)));
         assert!(hit(Some(PatchOutcome::Patched("x".to_string()))));
         assert!(!hit(Some(PatchOutcome::AnchorMissing)));
         assert!(!hit(None));
