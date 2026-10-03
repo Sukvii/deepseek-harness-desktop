@@ -6,14 +6,14 @@
 //! 1. git 托管插件的 `prepare` 构建（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`）——
 //!    其允许键随 pnpm 的克隆方式变化（git+ssh#sha / codeload tar.gz），无法预先确定；
 //! 2. 传递依赖的原生构建（如 `node-pty`，`ERR_PNPM_IGNORED_BUILDS`）。
-//! 因此从 pnpm 错误输出解析它建议的允许键，写入 profile 的
-//! `pnpm-workspace.yaml` 后重试，直至成功或无可解析项。
+//!    因此从 pnpm 错误输出解析它建议的允许键，写入 profile 的
+//!    `pnpm-workspace.yaml` 后重试，直至成功或无可解析项。
 //!
 //! pnpm 10 与 11 对放行项的配置键与输出形式不同（均由各自报错提示决定，只能运行期
 //! 读取，见 [`allowlist::parse_allowlist_keys`] 与 [`allowlist::apply_allow_build_keys`]）：
 //! - pnpm 10（旧 store 复用用户版）只认 `onlyBuiltDependencies`（list 形式）；
 //! - pnpm 11（捆绑版）认 `allowBuilds`（map 形式）。
-//! 应用会把同一批包名同时写入这两个键，保证任一版本 pnpm 都能读到放行项。
+//!   应用会把同一批包名同时写入这两个键，保证任一版本 pnpm 都能读到放行项。
 //!
 //! 关键陷阱：pnpm v11 在 `allowBuilds` 阻断时可能仍以 **exit 0** 退出（假成功），
 //! 所以重试逻辑不能只看退出码（见 [`run_plugin_with_allow_build_retry`]），安装成功
@@ -21,10 +21,11 @@
 //! 并就地补构建缺失的声明入口（见 [`artifact::ensure_plugin_entry_built`]）。
 //!
 //! 模块划分（`install/`）：
-//! - [`self`]：安装编排入口（install / install_internal）与 allowBuilds 重试循环
-//! - [`single`]：单插件升级/卸载（`dsh plugin update/remove`，卸载后核验 + 离线兜底、
+//! - [`self`]：安装编排入口（install / install_specs / install_internal）与 allowBuilds 重试循环
+//! - [`single`]：批量升级/卸载（`dsh plugin update/remove`，卸载后核验 + 离线兜底、
 //!   弃用插件自动卸载）
-//! - [`spec`]：安装 spec 准备（内置插件捆绑目录、GitHub 简写规范化、Windows 引号）
+//! - [`spec`]：安装 spec 准备（内置插件捆绑目录、GitHub 简写规范化、Windows 引号、包名解析）
+//! - [`inspect`]：安装前只读兼容性检查（registry `latest` + DSH 家族 peer 判定）
 //! - [`env`]：`dsh plugin` 子进程环境（$DSH_HOME 隔离、git HTTPS 强制）
 //! - [`pnpm`]：pnpm 选版与版本探测（store 主版本感知、捆绑版补齐、有界 probe 监控）
 //! - [`allowlist`]：构建放行白名单解析与 pnpm-workspace.yaml 写回
@@ -34,8 +35,7 @@
 use crate::config;
 use crate::service::cli;
 use crate::service::core;
-use crate::service::profile::active_profile;
-use crate::service::workflow;
+use crate::service::profile::{active_profile, allow_profile_release_age};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
@@ -60,23 +60,32 @@ mod allowlist;
 mod artifact;
 mod diagnose;
 mod env;
+mod inspect;
 mod pnpm;
 mod single;
 mod spec;
 
 // 子模块对外 API：plugin 兄弟模块（verify / internal 等）与安装编排共用
 pub(crate) use env::build_plugin_envs;
+pub use inspect::inspect_specs;
 pub(crate) use pnpm::{
     bundled_pnpm_major, harness_prefer_bundled_pnpm, pnpm_major_version_at, profile_store_major,
 };
 pub(crate) use single::uninstall_deprecated_plugins;
-pub use single::{remove, update};
+pub use single::{remove_many, update_many};
+// 版本兼容性/发布时长两类拦截的解析结果都要跨到 `bridge`（前端逐项确认后授权），在此定义出口
+pub use diagnose::{IncompatibleVersion, PolicyBlockedVersion};
 
 use allowlist::{add_allow_build_keys, parse_allowlist_keys};
 use artifact::{ensure_plugin_entry_built, verify_installed_products};
-use diagnose::{diagnostic_suffix, git_transport_hint, network_error_hint, pick_error_message};
+use diagnose::{
+    diagnostic_suffix, git_transport_hint, incompatible_versions, network_error_hint,
+    pick_error_message, policy_blocked_versions, policy_verification_network_failure,
+    store_mismatch_hint,
+};
 use pnpm::ensure_pnpm;
-use spec::{bundled_dir_of, normalize_git_spec, preset_spec_for_install, shell_quote_spec};
+use single::single_plugin_args;
+use spec::{bundled_dir_of, normalize_git_spec, preset_spec_for_install, spec_argument};
 
 /// 允许构建重试的上限。每次重试解决 pnpm 报出的一个允许键（git depPath 或
 /// 传递构建包名），多个 git 插件 / 多个原生依赖各占一次，上限封顶防死循环。
@@ -94,17 +103,44 @@ const TRANSIENT_FS_RETRIES: usize = 8;
 /// 瞬时文件系统错误的首次重试延迟；后续延迟按指数增长，最多 64 秒。
 const TRANSIENT_FS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn capped_backoff(retry: usize, base_secs: u64, cap_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        base_secs
+            .checked_shl(retry.saturating_sub(1) as u32)
+            .unwrap_or(cap_secs)
+            .min(cap_secs),
+    )
+}
+
 fn transient_fs_retry_delay(retry: usize) -> std::time::Duration {
-    let seconds = TRANSIENT_FS_RETRY_DELAY
-        .as_secs()
-        .checked_shl(retry.saturating_sub(1) as u32)
-        .unwrap_or(64)
-        .min(64);
-    std::time::Duration::from_secs(seconds)
+    capped_backoff(retry, TRANSIENT_FS_RETRY_DELAY.as_secs(), 64)
+}
+
+/// lockfile supply-chain 校验因 registry 元数据拉不到而误判违规时的重试上限
+/// （见 [`policy_verification_network_failure`]）。实测 registry 短暂不可用能让
+/// 「已发布三周的 entry」连续失败数分钟：pnpm 自己重试两轮后放弃，这里再按退避
+/// 把窗口拉到约一分钟以覆盖这类抖动；不设更大上限是因为每次重试都要重跑整条
+/// `dsh plugin add`。
+const POLICY_VERIFICATION_RETRIES: usize = 4;
+/// 该重试的首次延迟；后续延迟按指数增长，最多 30 秒。
+const POLICY_VERIFICATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn policy_verification_retry_delay(retry: usize) -> std::time::Duration {
+    capped_backoff(retry, POLICY_VERIFICATION_RETRY_DELAY.as_secs(), 30)
+}
+
+/// 一次安装操作的目标：`id` 是稳定标识（错误记录 / 快照 / bundles 对账），
+/// `name` 是 `node_modules` 下的目录名（产物核验与入口补构建用，无法解析时为
+/// `None`，此时跳过这两步），`spec` 是最终交给 `dsh plugin add` 的参数。
+pub(crate) struct InstallTarget {
+    pub id: String,
+    pub name: Option<String>,
+    pub spec: String,
 }
 
 pub async fn install(app_handle: &AppHandle, ids: &[String]) -> Result<(), String> {
-    install_with_cancel(app_handle, ids, None, new_process_owner()).await
+    let targets = preset_targets(app_handle, ids)?;
+    install_with_cancel(app_handle, &targets, None, new_process_owner()).await
 }
 
 /// 内置插件启动自愈专用入口：取消信号会阻止被结束的 pnpm/dsh 进程再次进入
@@ -115,15 +151,39 @@ pub(crate) async fn install_internal(
     cancel: tokio::sync::watch::Receiver<bool>,
     owner: ProcessOwner,
 ) -> Result<(), String> {
-    install_with_cancel(app_handle, ids, Some(cancel), owner).await
+    let targets = preset_targets(app_handle, ids)?;
+    install_with_cancel(app_handle, &targets, Some(cancel), owner).await
 }
 
-async fn install_with_cancel(
-    app_handle: &AppHandle,
-    ids: &[String],
-    cancel: Option<tokio::sync::watch::Receiver<bool>>,
-    owner: ProcessOwner,
-) -> Result<(), String> {
+/// 按原始 spec 安装（插件市场 / 手动输入）：与预装路径共用同一套编排，只是目标
+/// 不再来自预设清单，因而没有捆绑目录与版本矩阵——spec 原样交给 pnpm 解析。
+pub async fn install_specs(app_handle: &AppHandle, specs: &[String]) -> Result<(), String> {
+    let targets = spec_targets(app_handle, specs);
+    if targets.is_empty() {
+        return Err("PLUGIN_SPECS_EMPTY: no plugin specs provided".to_string());
+    }
+    install_with_cancel(app_handle, &targets, None, new_process_owner()).await
+}
+
+/// 预设 id → 安装目标：解析捆绑目录与清单 spec，规范化为 `git+https://`。
+///
+/// 内置插件改为从随包分发的捆绑目录安装（`link:` 本地联接依赖，见
+/// preset::bundled_dep_spec；不用 `file:`——pnpm 对盘符冒号的绝对路径会当相对
+/// 路径解析），其余沿用清单声明的 spec；随后统一把 `github:user/repo` 规范为显式
+/// `git+https://...`，绕开 pnpm 对 GitHub 简写「HTTPS 探测失败即回退 SSH」的已知
+/// 缺陷（pnpm issue #3948 / #7243 / #13276）：公开仓库一旦落进 git+ssh，在没有
+/// SSH 配置的桌面机上必然 `Host key verification failed` / `Permission denied
+/// (publickey)`。
+///
+/// 最后按活动核心决定是否为含空格的 spec 加内嵌双引号：0.1.6-alpha.2 起 dsh CLI
+/// 改用 execa 以 argv 数组启动 pnpm，参数不再经 shell 拼接，预加引号只会让 pnpm
+/// 收到带字面引号的 spec（issue #647）；更早的核心在 win32 用 `shell:true` 把参数
+/// 拼成命令行（Node 只拼接、不转义，DEP0190），含空格的内置插件路径
+/// （`link:<应用安装目录>`）不预加引号就会被切碎成多个 spec，pnpm 报
+/// `ERR_PNPM_SPEC_NOT_SUPPORTED`、启动自愈每轮重装（死循环）。两种形态落盘
+/// `package.json` 的值都是不带引号的 `link:<路径>`，与内核对账的 `expected`
+/// （bundled_dep_spec）一致（见 [`spec_argument`]）。
+fn preset_targets(app_handle: &AppHandle, ids: &[String]) -> Result<Vec<InstallTarget>, String> {
     if ids.is_empty() {
         return Err("PREINSTALL_EMPTY: no plugins selected".to_string());
     }
@@ -132,42 +192,147 @@ async fn install_with_cancel(
     let presets = load_presets(app_handle);
     let preset_map: HashMap<&str, &PreinstallPluginInfo> =
         presets.iter().map(|p| (p.id.as_str(), p)).collect();
+    let core_version = crate::service::core::active_version(app_handle);
 
-    let mut specs = Vec::with_capacity(ids.len());
-    let mut needs_git = false;
+    let mut targets = Vec::with_capacity(ids.len());
     for id in ids {
         let preset = preset_map
             .get(id.as_str())
             .ok_or_else(|| format!("PREINSTALL_INVALID_ID: {id}"))?;
-        // 内置插件改为从随包分发的捆绑目录安装（`link:` 本地联接依赖，见
-        // preset::bundled_dep_spec；不用 `file:`——pnpm 对盘符冒号的绝对路径
-        // 会当相对路径解析），其余沿用清单声明的 spec；随后统一把
-        // `github:user/repo` 规范为显式 `git+https://...`，绕开 pnpm 对
-        // GitHub 简写「HTTPS 探测失败即回退 SSH」的已知缺陷（pnpm issue
-        // #3948 / #7243 / #13276）：公开仓库一旦落进 git+ssh，在没有 SSH 配置
-        // 的桌面机上必然 `Host key verification failed` / `Permission denied (publickey)`。
-        //
-        // 最后经 shell_quote_spec 给含空格的 spec 加内嵌双引号（**仅 Windows**）：
-        // dsh CLI 只在 win32 用 `shell:true` 启动 pnpm、把参数按空格拼接（Node
-        // 不引号转义，DEP0190），内置插件指向应用安装目录（如
-        // `G:\Deepseek Harness Desktop\...`，路径常含空格），拼进 shell 后会被
-        // 切碎成多个 spec，pnpm 报 `ERR_PNPM_SPEC_NOT_SUPPORTED`，插件装不上、
-        // 启动自愈每次重装（死循环）。引号让 cmd 把整条 spec 视为单一 token；
-        // pnpm 解析后自行剥离引号，落盘值仍是不带引号的 `link:<路径>`，与内核
-        // 对账的 `expected`（bundled_dep_spec）一致。macOS/Linux 是直接
-        // `spawnSync`（无 shell），spec 作为单个 argv 传递、空格天然保留，
-        // 引号只会被当作包名字符导致安装失败（见 [`shell_quote_spec`]）。
         let raw = normalize_git_spec(&preset_spec_for_install(
             preset,
             bundled_dir_of(app_handle, preset),
+            core_version.as_deref(),
         )?);
-        // 规范化后 `git+...` 前缀即 git 托管依赖：pnpm 安装时需要实际可用的 git
-        // （见下方预检）；npm 包名（如 `dshmarket`）与 `link:` 本地依赖无需 git。
-        if raw.starts_with("git+") {
-            needs_git = true;
-        }
-        specs.push(shell_quote_spec(&raw));
+        targets.push(InstallTarget {
+            id: preset.id.clone(),
+            name: Some(installed_name(preset).to_string()),
+            spec: spec_argument(&raw, core_version.as_deref()),
+        });
     }
+    Ok(targets)
+}
+
+/// 原始 spec → 安装目标：`link:`/`file:` 读目标包名（读不到回落目录名），npm 形态
+/// 剥离版本后缀，git / URL 形态无法静态得知包名，回落 spec 本身并放弃产物核验。
+///
+/// 命中资源清单的 spec 走 [`preset_targets`] 同一套解析：同一条目无论从预装引导页
+/// （预设 id）还是从面板 / 市场（原始 spec）进入，都必须解析出相同的安装目标——内置
+/// 插件的捆绑 `link:` 目录与清单版本矩阵只能在这一侧得到。解析失败（内置插件缺
+/// 捆绑产物，属发布缺陷）时退回裸 spec，让 pnpm 报出真实原因而不是静默跳过该条目。
+fn spec_targets(app_handle: &AppHandle, specs: &[String]) -> Vec<InstallTarget> {
+    let core_version = crate::service::core::active_version(app_handle);
+    let presets = load_presets(app_handle);
+    let mut targets = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        if let Some(preset) = presets
+            .iter()
+            .find(|preset| preset.id == spec || preset.spec == spec)
+        {
+            if let Ok(raw) = preset_spec_for_install(
+                preset,
+                bundled_dir_of(app_handle, preset),
+                core_version.as_deref(),
+            ) {
+                targets.push(InstallTarget {
+                    id: preset.id.clone(),
+                    name: Some(installed_name(preset).to_string()),
+                    spec: spec_argument(&normalize_git_spec(&raw), core_version.as_deref()),
+                });
+                continue;
+            }
+        }
+        let raw = normalize_git_spec(spec);
+        let name = spec::package_name_of_spec(&raw);
+        targets.push(InstallTarget {
+            id: name.clone().unwrap_or_else(|| raw.clone()),
+            name,
+            spec: spec_argument(&raw, core_version.as_deref()),
+        });
+    }
+    targets
+}
+
+/// 被门禁拦下的条目**全部**已在 lock 中时，返回该补写的豁免条目（精确 `包名@版本`）。
+fn locked_release_age_exemptions(
+    profile: &Path,
+    blocked: &[PolicyBlockedVersion],
+) -> Option<Vec<String>> {
+    if blocked.is_empty() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(blocked.len());
+    for item in blocked {
+        if single::locked_package_version(profile, &item.name).as_deref()
+            != Some(item.version.as_str())
+        {
+            return None;
+        }
+        entries.push(format!("{}@{}", item.name, item.version));
+    }
+    Some(entries)
+}
+
+/// 这次失败是不是「lockfile 里早就有的太新条目又被门禁拦下」：是则补齐豁免并返回 `true`。
+///
+/// pnpm 的 `minimumReleaseAgeExclude` 只被**解析**阶段采信，lockfile 校验阶段照旧按窗口
+/// 判定：一旦 lock 里存在比窗口更新的条目（用户授权后放宽窗口装上的那一次就会写入），
+/// 此后**每一次**触发状态变更的插件操作都会失败——升级第二个插件卡在第一个插件的条目上，
+/// 启动期的内置插件安装失败还会让应用起不来（`INTERNAL_PLUGIN_INSTALL_FAILED`）。
+/// 已在 lock 里的版本说明它早就装到本机，不是本次要审的新版本：补进豁免清单（幂等）并让
+/// 调用方放宽窗口重跑一次，把档案带回自洽状态。
+///
+/// 被拦下的条目里只要有一个不在 lock 中（或 lock 里是别的版本），说明那是本次新解析出来
+/// 的版本：保持默认窗口、交前端走「逐项授权」，绝不放宽。
+fn heal_locked_release_age(app_handle: &AppHandle, output: &str) -> bool {
+    let blocked = policy_blocked_versions(output);
+    let Some(entries) = locked_release_age_exemptions(&profile_dir(app_handle), &blocked) else {
+        return false;
+    };
+    match allow_profile_release_age(app_handle, &entries) {
+        Ok(()) => {
+            log::warn!(
+                "pnpm release-age policy blocked {} entries that are already locked; recorded them as exempt and retrying with the window relaxed",
+                entries.len()
+            );
+            true
+        }
+        Err(error) => {
+            log::warn!("failed to record the release-age exemptions for locked entries: {error}");
+            false
+        }
+    }
+}
+
+async fn install_with_cancel(
+    app_handle: &AppHandle,
+    targets: &[InstallTarget],
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    owner: ProcessOwner,
+) -> Result<(), String> {
+    // WSL 核心（U7.1）：guard 放在入口处，早于 `ensure_shims`（写 Windows profile）、
+    // git 预检与一切 node/dsh 执行——插件管理不适用于发行版内的核心（入口是
+    // `wsl.exe`，本机解析不到 dsh 文件），且 `active_dsh_binary` 会返回 `wsl.exe`，
+    // 继续走下去就是 `node.exe wsl.exe ...`。返回明确错误码而不是误导性的
+    // HARNESS_NOT_FOUND。
+    if core::is_wsl_active(app_handle) {
+        return Err(
+            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
+                .to_string(),
+        );
+    }
+    if targets.is_empty() {
+        return Err("PREINSTALL_EMPTY: no plugins selected".to_string());
+    }
+
+    let specs: Vec<&str> = targets.iter().map(|t| t.spec.as_str()).collect();
+    // 规范化后 `git+...` 前缀即 git 托管依赖：pnpm 安装时需要实际可用的 git
+    // （见下方预检）；npm 包名（如 `dshmarket`）与 `link:` 本地依赖无需 git。
+    let needs_git = specs.iter().any(|s| s.starts_with("git+"));
 
     // git 托管插件安装前预检（issue #369）：Linux/macOS 完全依赖系统 git（不在
     // 空白 Windows 自动配置范围，`config::git_runtime_ready` 非 Windows 恒真），
@@ -185,15 +350,6 @@ async fn install_with_cancel(
 
     // 确保 pnpm/dsh shim 存在
     cli::ensure_shims(app_handle)?;
-
-    // WSL 核心（W3.6）：插件管理不适用于发行版内的核心（入口是 `wsl.exe`，
-    // 本机解析不到 dsh 文件），返回明确错误码而不是误导性的 HARNESS_NOT_FOUND。
-    if core::is_wsl_active(app_handle) {
-        return Err(
-            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
-                .to_string(),
-        );
-    }
 
     let node = config::get_node_binary_path(app_handle);
     // 活动核心的 dsh 入口：本地核心存在时用本地 CLI，否则预打包
@@ -217,35 +373,13 @@ async fn install_with_cancel(
     // 旧档案可能由早期版本创建，没有同步 Harness 的最小发布时间例外；补齐
     // 精确的已审查 zod 版本，避免 registry 元数据瞬时失败阻断插件安装（issue #222）。
     super::ensure_profile_pnpm_policy(app_handle)?;
-    // 安装前停止运行中的服务，避免资源冲突。
-    // 记录停服结果：停服失败意味着服务可能仍在运行、插件目录可能被写入，
-    // 此时创建快照会捕获不一致状态，因此停服失败时跳过快照（不终止安装）。
-    let mut stopped = true;
-    if workflow::has_owned_process() {
-        // 停服务会让用户感到"重启"，先在日志面板讲清缘由（issue #48）
-        let _ = window.emit(
-            PREINSTALL_LOG_EVENT,
-            PreinstallLogPayload {
-                line: "[harness] 正在停止运行中的服务（安装插件需要短暂重启）…".to_string(),
-            },
-        );
-        log::info!("Stopping running harness service before installing plugins");
-        stopped = match workflow::stop(app_handle.clone()).await {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("failed to stop harness before plugin install: {e}");
-                false
-            }
-        };
-    }
-    // 安装/升级前自动快照已安装的插件（覆盖式），失败仅告警不阻断安装。
-    // 仅在服务已确认停止后执行，保证快照一致
+    // 安装/升级前自动快照已安装的插件（覆盖式），失败仅告警不阻断安装
     // （issue #303：自动快照失败不阻塞主流程，避免升级被陈旧快照问题拖垮）。
-    if stopped {
-        for id in ids {
-            if is_installed(app_handle, id) {
-                super::snapshot::create_best_effort(app_handle, id);
-            }
+    // 这里**不再**为了快照停掉运行中的服务：插件包只会被随后的 pnpm 改写，先停服对
+    // 快照一致性没有帮助，却让用户看到一次「服务被重启」；是否重启交给结算后的提示。
+    for target in targets {
+        if is_installed(app_handle, &target.id) {
+            super::snapshot::create_best_effort(app_handle, &target.id);
         }
     }
 
@@ -259,7 +393,7 @@ async fn install_with_cancel(
         OsString::from(active_profile(app_handle)),
         OsString::from("add"),
     ];
-    args.extend(specs.iter().map(|s| OsString::from(s.as_str())));
+    args.extend(specs.iter().map(OsString::from));
 
     let cwd = config::get_dsh_install_path(app_handle);
     // 日志打印实际传给 dsh 的 spec（此前打印 id 会误导排查：安装用的是 spec）
@@ -270,7 +404,7 @@ async fn install_with_cancel(
     // 失败时解析输出里印出的 `allowBuilds` 键写回 profile 的 pnpm-workspace.yaml
     // 后重试，直至成功或再无键可加（升级路径同样依赖该重试，见
     // [`run_plugin_with_allow_build_retry`]）。
-    let (exit_code, last_output) = run_plugin_install_with_transient_retry(
+    let (exit_code, last_output, last_attempt) = run_plugin_install_with_transient_retry(
         app_handle,
         &node,
         &args,
@@ -283,27 +417,90 @@ async fn install_with_cancel(
     )
     .await?;
 
+    // 门禁自愈：lockfile 里早有的太新条目会让**每一次**状态变更都失败
+    // （见 [`heal_locked_release_age`]）。补齐豁免后放宽窗口重跑一次，仍失败就照原样分类。
+    let (exit_code, last_output, last_attempt) =
+        if exit_code != 0 && heal_locked_release_age(app_handle, &last_attempt) {
+            let mut retry_args = args.clone();
+            retry_args.push(OsString::from(single::RELEASE_AGE_RELAXED_FLAG));
+            run_plugin_install_with_transient_retry(
+                app_handle,
+                &node,
+                &retry_args,
+                &cwd,
+                &envs,
+                &window,
+                "install",
+                cancel.as_ref(),
+                owner,
+            )
+            .await?
+        } else {
+            (exit_code, last_output, last_attempt)
+        };
+
     if exit_code != 0 {
         log::error!("dsh plugin install failed with exit code {exit_code}");
+        // 先无条件落一行 pnpm 原始诊断：后面的分类文案（网络 / store 指引）会丢掉细节，
+        // 而用户贴进 issue 的日志必须能看到 pnpm 究竟报了什么。
+        let detail = pick_error_message(&last_output, None);
+        if !detail.is_empty() {
+            log::error!("dsh plugin install diagnostic: {detail}");
+        }
+        // 版本兼容性拒绝：dsh 在 pnpm 之前核对声明的 DSH peer 依赖，未授权精确版本
+        // 即整批拒绝（不下载、不构建）。这不是安装故障而是待用户授权的清单，解析成
+        // 精确三元组交给前端走「勾选授权 → 重试」。必须排在网络/store 分类之前：
+        // 该拒绝几乎没有 pnpm 输出，落到通用分支只会给出一段用户无从下手的纯文本。
+        let incompatible = incompatible_versions(&last_attempt);
+        if !incompatible.is_empty() {
+            log::warn!(
+                "dsh rejected the install for incompatible plugin versions: {incompatible:?}"
+            );
+            let payload = serde_json::to_string(&incompatible)
+                .map_err(|e| format!("PREINSTALL_SERIALIZE: {e}"))?;
+            return Err(format!("PLUGIN_VERSION_INCOMPATIBLE: {payload}"));
+        }
+        // 真实的发布时长策略违规：档案已经声明/装了太新的版本，pnpm 的 lockfile 校验
+        // 不放行，于是**每一次**插件操作都会在这里失败。它不是安装故障，也不是网络问题
+        // （发布时间都拿到了），重试毫无意义——解析成精确 `包名@版本` 交给前端，由用户
+        // 明确授权后写进档案的 `minimumReleaseAgeExclude` 再重跑。同样排在网络分类之前。
+        let policy_blocked = policy_blocked_versions(&last_attempt);
+        if !policy_blocked.is_empty() {
+            log::warn!(
+                "pnpm release-age policy rejected {} profile entries: {policy_blocked:?}",
+                policy_blocked.len()
+            );
+            let payload = serde_json::to_string(&policy_blocked)
+                .map_err(|e| format!("PREINSTALL_SERIALIZE: {e}"))?;
+            return Err(format!("PLUGIN_POLICY_BLOCKED: {payload}"));
+        }
         // 区分 git 传输层失败与 allowBuilds 构建门禁：前者是 pnpm 走了 git+ssh
         // （用户环境无 SSH 配置），后者才是补充白名单可自愈的。传输层错误给出
         // 可读指引，避免用户被 dsh 那条 allowBuilds 提示误导。
-        let network_error = network_error_hint(&last_output).is_some()
-            || (exit_code == 3 && last_output.trim().is_empty());
-        let hint = git_transport_hint(&last_output);
+        //
+        // 分类一律只读**最后一次尝试**的输出：`last_output` 是历次 allowBuilds 重试的
+        // 拼接串，早先一次的网络字样（`fetch failed`/`econnreset` 等）会给最终一次的真·
+        // 发布时间违规「背书」，把失败原因整体归错。拼接串仍只用于日志与用户可见的诊断文本。
+        let network_error = network_error_hint(&last_attempt).is_some()
+            || policy_verification_network_failure(&last_attempt)
+            || (exit_code == 3 && last_attempt.trim().is_empty());
+        let hint = git_transport_hint(&last_attempt);
+        let store_hint = store_mismatch_hint(&last_attempt);
         let network_hint = network_error.then_some(
             "NETWORK_ERROR: plugin registry request failed; check network or proxy settings and retry.",
         );
         let message = if network_error {
             network_hint.unwrap_or_default().to_string()
+        } else if let Some(store_hint) = store_hint.as_deref() {
+            store_hint.to_string()
         } else {
             pick_error_message(&last_output, hint)
         };
         // 批量安装失败时给本次选中的每个插件记一条错误（前端据此展示异常标记，
         // 可针对单个插件重试更新/卸载）
-        for id in ids {
-            if let Err(e) = errors::record(app_handle, id, "install", &message) {
-                log::warn!("failed to record plugin error for {id}: {e}");
+        for target in targets {
+            if let Err(e) = errors::record(app_handle, &target.id, "install", &message) {
+                log::warn!("failed to record plugin error for {}: {e}", target.id);
             }
         }
         if let Some(network_hint) = network_hint {
@@ -329,10 +526,22 @@ async fn install_with_cancel(
                 "PREINSTALL_FAILED: dsh plugin exited with code {exit_code} ({hint})"
             ));
         }
-        let detail = pick_error_message(&last_output, None);
-        if !detail.is_empty() {
-            log::error!("dsh plugin install diagnostic: {detail}");
+        // pnpm 因档案 node_modules 与当前 pnpm 的 store 布局不匹配而拒绝安装：
+        // 报错正文里的两条 store 路径会被 pick_error_message 丢掉，这里补上可读
+        // 指引，避免用户只看到「插件安装失败」。
+        if let Some(store_hint) = store_hint {
+            log::warn!("pnpm store incompatibility detected during plugin install: {store_hint}");
+            let _ = window.emit(
+                PREINSTALL_LOG_EVENT,
+                PreinstallLogPayload {
+                    line: format!("[pnpm] {store_hint}"),
+                },
+            );
+            return Err(format!(
+                "PREINSTALL_FAILED: dsh plugin exited with code {exit_code} ({store_hint})"
+            ));
         }
+        let detail = pick_error_message(&last_output, None);
         return Err(format!(
             "PREINSTALL_FAILED: dsh plugin exited with code {exit_code}{}",
             diagnostic_suffix(&detail)
@@ -342,7 +551,7 @@ async fn install_with_cancel(
     // 真正修复：核验本次安装是否真实落盘。pnpm 可能在 allowBuilds 阻断时仍以
     // exit 0 退出（假成功），若产物缺失则记录错误并返回 Err，让前端如实展示失败、
     // 允许重试，而不是误报「已安装」。已落盘的插件在上一步被核验并清除历史错误。
-    verify_installed_products(app_handle, ids, &preset_map, &last_output)?;
+    verify_installed_products(app_handle, targets, &last_output)?;
 
     // 产物级核验：包已落盘但声明入口（如 `lib/index.js`）未构建时，本次安装
     // 同样是假成功——cordis 加载器在下一次启动必然 ERR_MODULE_NOT_FOUND 崩溃
@@ -350,18 +559,18 @@ async fn install_with_cancel(
     // 静默进入下一次启动；包目录按预设的 `installed_name` 解析（scoped 插件
     // 与 id 不同名），失败跨插件聚合后一次性返回，前端可一并重试。
     let mut entry_errors = Vec::new();
-    for id in ids {
-        let Some(preset) = preset_map.get(id.as_str()) else {
+    for target in targets {
+        let Some(name) = target.name.as_deref() else {
             continue;
         };
-        let pkg_dir = profile_dir(app_handle)
-            .join("node_modules")
-            .join(installed_name(preset));
-        if let Err(e) = ensure_plugin_entry_built(app_handle, id, &pkg_dir, &envs, &window).await {
-            if let Err(err) = errors::record(app_handle, id, "install", &e) {
-                log::warn!("failed to record plugin error for {id}: {err}");
+        let pkg_dir = profile_dir(app_handle).join("node_modules").join(name);
+        if let Err(e) =
+            ensure_plugin_entry_built(app_handle, &target.id, &pkg_dir, &envs, &window).await
+        {
+            if let Err(err) = errors::record(app_handle, &target.id, "install", &e) {
+                log::warn!("failed to record plugin error for {}: {err}", target.id);
             }
-            entry_errors.push(format!("{id}: {e}"));
+            entry_errors.push(format!("{}: {e}", target.id));
         }
     }
     if !entry_errors.is_empty() {
@@ -371,25 +580,144 @@ async fn install_with_cancel(
         ));
     }
 
-    // Windows 极简模式专项修复
-    if ids.iter().any(|id| id == "dsh-win-terminal-inspector") {
-        if let Err(e) = workflow::win_inspector::apply(app_handle) {
-            log::warn!("win inspector apply failed after install: {e}");
-        }
-    }
+    super::disable::preserve_disabled_bundles(&profile_dir(app_handle))?;
 
     // 告知用户安装阶段结束；随后的服务重启由前端 continueAfterPreinstall 负责
     let _ = window.emit(
         PREINSTALL_LOG_EVENT,
         PreinstallLogPayload {
-            line: format!("[harness] 已安装 {} 个插件", ids.len()),
+            line: format!("[harness] 已安装 {} 个插件", targets.len()),
         },
     );
 
-    log::info!("Preinstall plugins installed successfully: {ids:?}");
+    log::info!(
+        "Preinstall plugins installed successfully: {:?}",
+        targets.iter().map(|t| &t.id).collect::<Vec<_>>()
+    );
     Ok(())
 }
 
+/// 授予被核心拒绝的插件精确版本豁免：逐条执行 `dsh plugin --profile <档案>
+/// allow-version <包名@版本> --dsh-version <运行时> --accept-risk`，写 profile 的
+/// `compatibility.json`（不改依赖、bundles 与 patch 层）。
+///
+/// 授权由用户在风险提示中逐项确认后触发，`--accept-risk` 是这条命令的强制前提；
+/// 豁免只对**精确的包名@版本 + 运行时版本**生效，插件或 DSH 升级后都不继承，
+/// 因此授权后必须重跑安装由 dsh 自己复核，不能假定一定通过。
+///
+/// 不走 `ensure_pnpm`/停服：dsh 在 `allow-version` 分支里根本不进入 pnpm，
+/// 也不碰 `node_modules`，无需 pnpm 就绪或重启服务。
+pub async fn allow_version_exemptions(
+    app_handle: &AppHandle,
+    versions: &[IncompatibleVersion],
+) -> Result<(), String> {
+    // WSL 核心（U7.1）：版本豁免以 `node <dsh 入口> plugin allow-version` 执行，
+    // WSL 下 `active_dsh_binary` 是 `wsl.exe`——继续执行会形成 `node.exe wsl.exe ...`。
+    if core::is_wsl_active(app_handle) {
+        return Err(
+            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
+                .to_string(),
+        );
+    }
+    if versions.is_empty() {
+        return Err("PLUGIN_EXEMPTION_EMPTY: no plugin version exemption to grant".to_string());
+    }
+    let window = app_handle
+        .get_webview_window("main")
+        .ok_or("WINDOW_NOT_FOUND: main window missing")?;
+    let node = config::get_node_binary_path(app_handle);
+    let dsh_bin = core::active_dsh_binary(app_handle);
+    if !node.exists() {
+        return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
+    }
+    if !dsh_bin.exists() {
+        return Err("HARNESS_NOT_FOUND: dsh CLI missing".to_string());
+    }
+
+    let envs = build_plugin_envs(app_handle, harness_prefer_bundled_pnpm(app_handle));
+    let cwd = config::get_dsh_install_path(app_handle);
+    let profile = active_profile(app_handle);
+    let owner = new_process_owner();
+    let mut failures: Vec<String> = Vec::new();
+    for entry in versions {
+        let mut args = vec![dsh_bin.as_os_str().to_os_string()];
+        args.extend(single_plugin_args(
+            &profile,
+            "allow-version",
+            &[
+                format!("{}@{}", entry.name, entry.version),
+                "--dsh-version".to_string(),
+                entry.runtime_version.clone(),
+                "--accept-risk".to_string(),
+            ],
+        ));
+        log::info!(
+            "Granting plugin version exemption {}@{} for DSH {}",
+            entry.name,
+            entry.version,
+            entry.runtime_version
+        );
+        let (exit_code, output) =
+            run_plugin_process(&node, &args, &cwd, &envs, &window, owner).await?;
+        if exit_code != 0 {
+            let detail = pick_error_message(&output, None);
+            log::error!(
+                "granting plugin version exemption {}@{} failed with exit code {exit_code}: {detail}",
+                entry.name,
+                entry.version
+            );
+            failures.push(format!(
+                "{}@{}: dsh plugin exited with code {exit_code}{}",
+                entry.name,
+                entry.version,
+                diagnostic_suffix(&detail)
+            ));
+        }
+    }
+    // 逐条执行而不是遇错即停：一个条目失败（版本漂移、compatibility.json 损坏）
+    // 不该让用户已勾选的其它条目也不被授权；错误跨条目聚合后一次性返回。
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("PLUGIN_EXEMPTION_FAILED: {}", failures.join("; ")))
+    }
+}
+
+/// 记录用户明确授权的发布时长策略豁免：把精确 `包名@版本` 写进档案的
+/// `minimumReleaseAgeExclude`，pnpm 的解析随后会放行这些条目；lockfile 校验阶段
+/// 仍按默认窗口拦截，因此升级调用还会附上 `--config.minimumReleaseAge=0`
+/// （见 `single::update_many`），否则授权过的版本依旧装不上。
+///
+/// 与 [`allow_version_exemptions`] 的分工：那个针对 dsh 的**版本兼容性**（写档案的
+/// `compatibility.json`），这个针对 pnpm 的**发布时长门禁**（写 `pnpm-workspace.yaml`）。
+/// 两者都只认精确版本、都在用户确认后才调用；这里不起进程、不停服、不碰 `node_modules`，
+/// 写完由界面重跑原操作（重跑会真正改写 lockfile/依赖，必须由 pnpm 自己跑）。
+pub fn allow_policy_versions(
+    app_handle: &AppHandle,
+    versions: &[PolicyBlockedVersion],
+) -> Result<(), String> {
+    // WSL 核心（U7.1）：豁免条目写入 Windows 侧档案的 `pnpm-workspace.yaml`，
+    // WSL 核心的插件解析根在发行版内——写入既不生效也污染 Windows 档案。
+    if core::is_wsl_active(app_handle) {
+        return Err(
+            "CORE_WSL_PLUGIN_UNSUPPORTED: plugin management is not available while the WSL core is active"
+                .to_string(),
+        );
+    }
+    let entries: Vec<String> = versions
+        .iter()
+        .map(|entry| format!("{}@{}", entry.name, entry.version))
+        .collect();
+    allow_profile_release_age(app_handle, &entries)
+}
+
+/// 返回 `(exit_code, 历次尝试的输出拼接, 最后一次尝试的输出)`。
+///
+/// 两个字符串用途不同：诊断与用户文案要拼接（早期的 allowBuilds 提示也是线索），而
+/// **失败分类只能看最后一次尝试**——拼接串里早先一次的网络字样会与最终一次的真实原因
+/// 互相「佐证」，把失败归类错（如把真·供应链违规判成网络抖动，见
+/// [`policy_verification_network_failure`]）。
+#[allow(clippy::too_many_arguments)]
 async fn run_plugin_with_allow_build_retry(
     app_handle: &AppHandle,
     node: &Path,
@@ -400,10 +728,14 @@ async fn run_plugin_with_allow_build_retry(
     action: &str,
     cancel: Option<&tokio::sync::watch::Receiver<bool>>,
     owner: ProcessOwner,
-) -> Result<(i32, String), String> {
+) -> Result<(i32, String, String), String> {
     let _operation_guard = acquire_operation_lock().await;
+    // 上一次被强杀的安装（取消 / 刷新 / 退出）会在 profile 里留下 dsh 的孤儿写锁，
+    // 之后每次安装都要静默等到 deadline。dsh 侧不做恢复，这里按 PID 存活代劳。
+    super::process::clear_orphan_plugin_writer_lock(&super::installed::profile_dir(app_handle));
     let mut retries = 0usize;
     let mut all_output = String::new();
+    let mut last_attempt;
     let exit_code = loop {
         if cancel.is_some_and(|signal| *signal.borrow()) {
             return Err("PLUGIN_OPERATION_CANCELLED: plugin operation was cancelled".to_string());
@@ -414,6 +746,9 @@ async fn run_plugin_with_allow_build_retry(
         }
         append_command_output(&mut all_output, &captured);
         let new_keys = parse_allowlist_keys(&captured);
+        // 本次尝试要么即将 continue 重试、要么即将 break 收尾；两种情况都以后者为准，
+        // 所以每次都记下它，最终留在 `last_attempt` 的就是决定退出码的那一次。
+        last_attempt = captured;
         // 有可补充的 allowBuilds 键且未达上限 → 写入并重试（无论本次退出码是否为 0，
         // 见上方注释：pnpm 可能在阻断时仍以 0 退出）。
         if !new_keys.is_empty() && retries < MAX_ALLOW_LIST_RETRIES {
@@ -443,7 +778,7 @@ async fn run_plugin_with_allow_build_retry(
         }
         break code;
     };
-    Ok((exit_code, all_output))
+    Ok((exit_code, all_output, last_attempt))
 }
 
 /// 以带瞬时文件系统错误重试的方式运行 `dsh plugin <action>`（`add` 专用路径）。
@@ -456,6 +791,7 @@ async fn run_plugin_with_allow_build_retry(
 ///
 /// 识别到瞬时失败后再跑一次完整命令（有界，见 [`TRANSIENT_FS_RETRIES`]），每次重试前
 /// 短暂休眠等 reparse point 落定 / 杀软扫完；该失败是概率性的，重试即大概率越过。
+#[allow(clippy::too_many_arguments)]
 async fn run_plugin_install_with_transient_retry(
     app_handle: &AppHandle,
     node: &Path,
@@ -466,16 +802,45 @@ async fn run_plugin_install_with_transient_retry(
     action: &str,
     cancel: Option<&tokio::sync::watch::Receiver<bool>>,
     owner: ProcessOwner,
-) -> Result<(i32, String), String> {
+) -> Result<(i32, String, String), String> {
     let mut attempt = 0usize;
+    let mut policy_attempt = 0usize;
     loop {
-        let (exit_code, output) = run_plugin_with_allow_build_retry(
+        let (exit_code, output, last_attempt) = run_plugin_with_allow_build_retry(
             app_handle, node, args, cwd, envs, window, action, cancel, owner,
         )
         .await?;
+        // 先判网络类：pnpm 把「元数据拉不到」渲染成供应链违规，重跑整条命令最有效。
+        // 判定只看最后一次尝试的输出（原因见 run_plugin_with_allow_build_retry 的返回值说明）。
+        if exit_code != 0
+            && policy_attempt < POLICY_VERIFICATION_RETRIES
+            && policy_verification_network_failure(&last_attempt)
+        {
+            policy_attempt += 1;
+            let delay = policy_verification_retry_delay(policy_attempt);
+            log::warn!(
+                "dsh plugin {action} failed the lockfile supply-chain check because registry \
+                 metadata could not be fetched; retrying ({policy_attempt}/{POLICY_VERIFICATION_RETRIES}) \
+                 after {delay:?}"
+            );
+            let _ = window.emit(
+                PREINSTALL_LOG_EVENT,
+                PreinstallLogPayload {
+                    line: format!(
+                        "[harness] registry 元数据拉取失败，依赖校验未通过，正在重试（{policy_attempt}/{POLICY_VERIFICATION_RETRIES}）…"
+                    ),
+                },
+            );
+            if sleep_or_cancelled(delay, cancel).await {
+                return Err(
+                    "PLUGIN_OPERATION_CANCELLED: plugin operation was cancelled".to_string()
+                );
+            }
+            continue;
+        }
         if exit_code != 0
             && attempt < TRANSIENT_FS_RETRIES
-            && is_transient_fs_install_failure(exit_code, &output)
+            && is_transient_fs_install_failure(exit_code, &last_attempt)
         {
             attempt += 1;
             let delay = transient_fs_retry_delay(attempt);
@@ -491,11 +856,59 @@ async fn run_plugin_install_with_transient_retry(
                     ),
                 },
             );
-            tokio::time::sleep(delay).await;
+            if sleep_or_cancelled(delay, cancel).await {
+                return Err(
+                    "PLUGIN_OPERATION_CANCELLED: plugin operation was cancelled".to_string()
+                );
+            }
             continue;
         }
-        return Ok((exit_code, output));
+        return Ok((exit_code, output, last_attempt));
     }
+}
+
+/// 退避等待，且能被 `cancel` 立即打断（返回 true 表示等待期间被取消）。
+///
+/// 直接 `tokio::time::sleep` 会让取消最多等到退避结束（供应链校验 30s、瞬时文件系统
+/// 64s）：用户点了取消，安装却还在转圈。每轮尝试前另有取消检查兜底，这里只负责不让
+/// 退避本身成为最长的一段等待。
+///
+/// 只有值变成 `true` 才算取消：`watch` 的任何一次写入都会唤醒 `changed()`，包括写入
+/// `false` 与发送端被 drop（`changed()` 返回 `Err`）——那些情况必须继续等满退避，否则
+/// 一次无关的唤醒就能让重试提前发生，退避形同虚设。
+async fn sleep_or_cancelled(
+    delay: std::time::Duration,
+    cancel: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    let Some(signal) = cancel else {
+        tokio::time::sleep(delay).await;
+        return false;
+    };
+    // 两个副本分工：`signal` 只用于等待变更（`changed` 需要 &mut），`probe` 只用于读值，
+    // 免得 select 的处理分支里同时借可变与不可变。
+    let mut signal = signal.clone();
+    let probe = signal.clone();
+    if *probe.borrow() {
+        return true;
+    }
+    let timer = tokio::time::sleep(delay);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            _ = &mut timer => return false,
+            changed = signal.changed() => {
+                if *probe.borrow() {
+                    return true;
+                }
+                if changed.is_err() {
+                    // 发送端已 drop：值不可能再变 true，跳出后等满退避如实返回。
+                    break;
+                }
+            }
+        }
+    }
+    timer.await;
+    false
 }
 
 /// 判断 `dsh plugin` 失败是否为「刚重建的链接被立即回读」的瞬时文件系统错误。
@@ -527,6 +940,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn locked_release_age_exemptions_require_every_blocked_entry_to_be_locked() {
+        let dir = std::env::temp_dir().join(format!("dsh-heal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      dshmarket:\n        specifier: ^2.12.0\n        version: 2.12.0\n",
+        )
+        .unwrap();
+
+        let locked = PolicyBlockedVersion {
+            name: "dshmarket".to_string(),
+            version: "2.12.0".to_string(),
+        };
+        let newer = PolicyBlockedVersion {
+            name: "dshmarket".to_string(),
+            version: "2.13.0".to_string(),
+        };
+        let absent = PolicyBlockedVersion {
+            name: "elsewhere".to_string(),
+            version: "1.0.0".to_string(),
+        };
+
+        assert_eq!(
+            locked_release_age_exemptions(&dir, &[locked.clone()]),
+            Some(vec!["dshmarket@2.12.0".to_string()])
+        );
+        assert_eq!(locked_release_age_exemptions(&dir, &[newer]), None);
+        assert_eq!(locked_release_age_exemptions(&dir, &[absent]), None);
+        assert_eq!(locked_release_age_exemptions(&dir, &[]), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn command_output_retains_earlier_retry_diagnostics() {
         let mut output = String::new();
         append_command_output(&mut output, "ERR_PNPM_IGNORED_BUILDS");
@@ -538,7 +986,10 @@ mod tests {
     #[test]
     fn transient_fs_failure_detects_uv_unknown_exit_code() {
         assert!(is_transient_fs_install_failure(-4094, ""));
-        assert!(is_transient_fs_install_failure(-4094, "some unrelated output"));
+        assert!(is_transient_fs_install_failure(
+            -4094,
+            "some unrelated output"
+        ));
     }
 
     #[test]
@@ -548,20 +999,72 @@ mod tests {
         let output = "[UNKNOWN] unknown error, open 'C:\\Users\\x\\.dsh\\profiles\\web\\node_modules\\dsh-tauri\\package.json'";
         assert!(is_transient_fs_install_failure(1, output));
         // `[unknown]` / `unknown error` 大小写不敏感
-        assert!(is_transient_fs_install_failure(1, &output.to_ascii_lowercase()));
+        assert!(is_transient_fs_install_failure(
+            1,
+            &output.to_ascii_lowercase()
+        ));
+    }
+
+    #[test]
+    fn capped_backoff_preserves_zero_and_shift_limit_boundaries() {
+        for (retry, base, cap, seconds) in [
+            (0, 1, 64, 1),
+            (0, 5, 30, 5),
+            (3, 5, 30, 20),
+            (63, 1, 64, 64),
+            (65, 1, 64, 64),
+            (65, 5, 30, 30),
+        ] {
+            assert_eq!(
+                capped_backoff(retry, base, cap),
+                std::time::Duration::from_secs(seconds),
+                "retry={retry}, base={base}, cap={cap}"
+            );
+        }
     }
 
     #[test]
     fn transient_fs_retry_delay_uses_exponential_backoff() {
-        assert_eq!(transient_fs_retry_delay(1), std::time::Duration::from_secs(1));
-        assert_eq!(transient_fs_retry_delay(2), std::time::Duration::from_secs(2));
-        assert_eq!(transient_fs_retry_delay(8), std::time::Duration::from_secs(64));
+        assert_eq!(
+            transient_fs_retry_delay(1),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            transient_fs_retry_delay(2),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            transient_fs_retry_delay(8),
+            std::time::Duration::from_secs(64)
+        );
+    }
+
+    #[test]
+    fn policy_verification_retry_delay_uses_capped_exponential_backoff() {
+        assert_eq!(
+            policy_verification_retry_delay(1),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            policy_verification_retry_delay(2),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            policy_verification_retry_delay(4),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
     fn transient_fs_failure_rejects_ordinary_failures() {
-        assert!(!is_transient_fs_install_failure(1, "ERR_PNPM_SPEC_NOT_SUPPORTED"));
-        assert!(!is_transient_fs_install_failure(254, "ENOENT: no such file"));
+        assert!(!is_transient_fs_install_failure(
+            1,
+            "ERR_PNPM_SPEC_NOT_SUPPORTED"
+        ));
+        assert!(!is_transient_fs_install_failure(
+            254,
+            "ENOENT: no such file"
+        ));
         assert!(!is_transient_fs_install_failure(
             3,
             "ERR_PNPM_FETCH_404 registry error"
@@ -573,5 +1076,54 @@ mod tests {
         // 检测函数只看输出特征；是否为「失败」由调用方用 exit_code != 0 判定。
         // 假成功（exit 0）场景交由产物核验分支处理，不会因这里返回真而误重试。
         assert!(is_transient_fs_install_failure(0, "unknown error, open"));
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancelled_returns_immediately_when_cancelled() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let wait = sleep_or_cancelled(std::time::Duration::from_secs(30), Some(&rx));
+        // 退避远长于测试：只有被取消打断才来得及在这里断言（否则本测试会挂 30 秒）。
+        let cancel = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = tx.send(true);
+        };
+
+        let (cancelled, ()) = tokio::join!(wait, cancel);
+
+        assert!(cancelled);
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancelled_waits_out_the_delay_without_a_cancel_signal() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        // 值一直是 false（未取消）→ 等满退避后返回 false
+        assert!(!sleep_or_cancelled(std::time::Duration::from_millis(10), Some(&rx)).await);
+        // 没有取消通道（单插件路径传 None）→ 等价于普通 sleep
+        assert!(!sleep_or_cancelled(std::time::Duration::from_millis(10), None).await);
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancelled_ignores_false_updates_during_the_wait() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        // 等待期间两次写入 false：`watch` 的每次写入都会唤醒 `changed()`，若把它当成
+        // 「已取消/已结束」，退避会被缩短到 40ms 左右。
+        let wait = sleep_or_cancelled(std::time::Duration::from_millis(150), Some(&rx));
+        let noise = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = tx.send(false);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = tx.send(false);
+        };
+
+        let (cancelled, ()) = tokio::join!(wait, noise);
+
+        assert!(!cancelled);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(120),
+            "false 唤醒不得缩短退避，实际等了 {:?}",
+            started.elapsed()
+        );
     }
 }

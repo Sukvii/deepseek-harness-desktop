@@ -36,10 +36,10 @@ export function Modal(props: ModalProps) {
               {props.description}
             </AlertDialog.Body>
             <AlertDialog.Footer>
-              <Button className="rounded-md" variant="tertiary" onPress={disclosure.cancel}>
+              <Button variant="tertiary" onPress={disclosure.cancel}>
                 {props.cancelText || t('buttons.cancel')}
               </Button>
-              <Button className="rounded-md" variant={buttonVariant} onPress={disclosure.confirm}>
+              <Button variant={buttonVariant} onPress={disclosure.confirm}>
                 {props.confirmText || t('buttons.confirm')}
               </Button>
             </AlertDialog.Footer>

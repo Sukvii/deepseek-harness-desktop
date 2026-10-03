@@ -16,9 +16,9 @@
 //! 还原为三阶段 + 回滚：
 //! 1. 预检：id 校验 + 快照存在 + 归档完整性 + 操作锁 + 停止服务；
 //! 2. 暂存：同盘解压到 `.staging-*` 并校验（package.json 可解析、无逃逸、
-//!   拒绝符号链接——复用 `archive::extract_archive_gzip`）；
+//!    拒绝符号链接——复用 `archive::extract_archive_gzip`）；
 //! 3. 切换：真实目录 → `.backup-*` rename，暂存包体 → 真实目录 rename，
-//!   校验后清理备份；任一步失败则反转已做步骤（备份还原回原位）。
+//!    校验后清理备份；任一步失败则反转已做步骤（备份还原回原位）。
 //!
 //! 还原范围：仅 `is_actionable_plugin_ref`（第三方插件）；`@deepseek-ai/*`
 //! 核心/官方包拒绝还原（快照仍允许创建）。
@@ -165,8 +165,7 @@ fn resolve_real_target(node_modules: &Path, id: &str) -> Result<PathBuf, String>
             entry.display()
         ));
     }
-    let real = dunce::canonicalize(&entry)
-        .map_err(|e| format!("SNAPSHOT_RESOLVE_TARGET: {e}"))?;
+    let real = dunce::canonicalize(&entry).map_err(|e| format!("SNAPSHOT_RESOLVE_TARGET: {e}"))?;
     if !real.is_dir() {
         return Err(format!(
             "SNAPSHOT_NOT_DIR: {id} 的安装目标 {} 不是目录",
@@ -212,8 +211,7 @@ fn append_package_tree(
     for entry in fs::read_dir(dir).map_err(|e| format!("SNAPSHOT_READDIR: {e}"))? {
         let entry = entry.map_err(|e| format!("SNAPSHOT_ENTRY: {e}"))?;
         let path = entry.path();
-        let meta =
-            fs::symlink_metadata(&path).map_err(|e| format!("SNAPSHOT_METADATA: {e}"))?;
+        let meta = fs::symlink_metadata(&path).map_err(|e| format!("SNAPSHOT_METADATA: {e}"))?;
         // 跳过符号链接（含指向目录的链接）：不归档链接本身，也不递归进入
         if meta.file_type().is_symlink() {
             continue;
@@ -244,7 +242,10 @@ fn append_package_tree(
 }
 
 /// 创建快照归档：写入临时文件 → fsync → rename 到目标（同盘原子替换）。
-fn write_archive_atomic(dest: &Path, write_fn: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+fn write_archive_atomic(
+    dest: &Path,
+    write_fn: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     let tmp = dest.with_extension("tmp");
     let _ = fs::remove_file(&tmp);
     write_fn(&tmp)?;
@@ -256,7 +257,8 @@ fn write_archive_atomic(dest: &Path, write_fn: impl FnOnce(&Path) -> Result<(), 
         .write(true)
         .open(&tmp)
         .map_err(|e| format!("SNAPSHOT_OPEN_TMP: {e}"))?;
-    file.sync_all().map_err(|e| format!("SNAPSHOT_FSYNC: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("SNAPSHOT_FSYNC: {e}"))?;
     fs::rename(&tmp, dest).map_err(|e| format!("SNAPSHOT_RENAME: {e}"))?;
     Ok(())
 }
@@ -493,19 +495,70 @@ pub fn delete_best_effort(app_handle: &AppHandle, id: &str) {
 /// 解析还原目标：已安装时解析真实目录（有效链接 → `.pnpm/...` 真实目录），
 /// 断裂链接移除后按真实目录重建；未安装时以 `node_modules/<id>` 为落点。
 fn resolve_restore_target(node_modules: &Path, id: &str) -> Result<PathBuf, String> {
-    let entry = node_modules.join(id);
-    if let Ok(meta) = fs::symlink_metadata(&entry) {
-        if meta.file_type().is_symlink() {
-            if let Ok(real) = dunce::canonicalize(&entry) {
-                return Ok(real);
-            }
-            // 断裂链接：目标不可达，移除链接后按真实目录重建（其路径即 node_modules/<id>）
-            fs::remove_file(&entry).map_err(|e| format!("SNAPSHOT_REMOVE_BROKEN_LINK: {e}"))?;
-            return Ok(entry);
-        }
-        return Ok(entry);
+    if id != id.trim() || !is_actionable_plugin_ref(id) {
+        return Err(format!("SNAPSHOT_INVALID_ID: {id}"));
     }
-    Ok(entry)
+    let profile = node_modules
+        .parent()
+        .ok_or_else(|| "SNAPSHOT_NO_PARENT: node_modules 缺少父目录".to_string())?;
+    let profile_real = dunce::canonicalize(profile)
+        .map_err(|e| format!("SNAPSHOT_RESOLVE_PROFILE: {e}"))?;
+    match fs::symlink_metadata(node_modules) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(node_modules).map_err(|e| format!("SNAPSHOT_MKDIR_MODULES: {e}"))?;
+        }
+        Err(e) => return Err(format!("SNAPSHOT_RESOLVE_MODULES: {e}")),
+    }
+    let root = fs_guard::ensure_within(node_modules, &profile_real)
+        .map_err(|e| format!("SNAPSHOT_TARGET_ESCAPE: {e}"))?;
+    if root == profile_real {
+        return Err("SNAPSHOT_TARGET_ESCAPE: node_modules 指向档案根目录".to_string());
+    }
+    let entry = node_modules.join(id);
+    let parent = entry.parent().ok_or_else(|| "SNAPSHOT_NO_PARENT: 插件缺少父目录".to_string())?;
+    if fs::symlink_metadata(parent).is_ok() {
+        fs_guard::ensure_within(parent, &root)
+            .map_err(|e| format!("SNAPSHOT_TARGET_ESCAPE: {e}"))?;
+    }
+    match fs::symlink_metadata(&entry) {
+        Ok(meta) => match dunce::canonicalize(&entry) {
+            Ok(real) => {
+                // issue #848：还原会删除旧目标，仅允许 node_modules 内的严格子目录。
+                if real == root || !real.starts_with(&root) {
+                    return Err(format!("SNAPSHOT_TARGET_ESCAPE: {}", real.display()));
+                }
+                if !real.is_dir() {
+                    return Err(format!("SNAPSHOT_NOT_DIR: {}", real.display()));
+                }
+                // 目录链接还原到真实目录；普通目录返回词法路径，避免把 macOS 的
+                // `/private/var` 等链接真实前缀泄漏给调用方（旧行为即如此）。
+                if meta.file_type().is_symlink() {
+                    Ok(real)
+                } else {
+                    Ok(entry)
+                }
+            }
+            Err(e) if meta.file_type().is_symlink() && e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(windows)]
+                let removal = {
+                    use std::os::windows::fs::FileTypeExt;
+                    if meta.file_type().is_symlink_dir() {
+                        fs::remove_dir(&entry)
+                    } else {
+                        fs::remove_file(&entry)
+                    }
+                };
+                #[cfg(not(windows))]
+                let removal = fs::remove_file(&entry);
+                removal.map_err(|e| format!("SNAPSHOT_REMOVE_BROKEN_LINK: {e}"))?;
+                Ok(entry)
+            }
+            Err(e) => Err(format!("SNAPSHOT_RESOLVE_TARGET: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(entry),
+        Err(e) => Err(format!("SNAPSHOT_RESOLVE_TARGET: {e}")),
+    }
 }
 
 /// 把插件引用写回 profile 清单（还原被移除的插件时使用）：`dependencies[id]` 与
@@ -527,7 +580,10 @@ fn write_back_manifest_refs_at(manifest_path: &Path, id: &str, spec: &str) {
             .get_mut("dependencies")
             .and_then(|d| d.as_object_mut())
         {
-            deps.insert(id.to_string(), serde_json::Value::String(version.to_string()));
+            deps.insert(
+                id.to_string(),
+                serde_json::Value::String(version.to_string()),
+            );
             modified = true;
         } else {
             value["dependencies"] = serde_json::json!({ id: version });
@@ -706,14 +762,8 @@ mod tests {
 
     #[test]
     fn filename_sanitizes_scoped_and_rejects_traversal() {
-        assert_eq!(
-            snapshot_filename("dsh-market").unwrap(),
-            "dsh-market.tgz"
-        );
-        assert_eq!(
-            snapshot_filename("@scope/pkg").unwrap(),
-            "_scope_pkg.tgz"
-        );
+        assert_eq!(snapshot_filename("dsh-market").unwrap(), "dsh-market.tgz");
+        assert_eq!(snapshot_filename("@scope/pkg").unwrap(), "_scope_pkg.tgz");
         assert!(snapshot_filename("..").is_err());
         assert!(snapshot_filename("").is_err());
         assert!(snapshot_filename("../x").is_err());
@@ -763,7 +813,9 @@ mod tests {
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, MANIFEST_NAME, &bytes[..]).unwrap();
+            builder
+                .append_data(&mut header, MANIFEST_NAME, &bytes[..])
+                .unwrap();
             append_package_tree(&mut builder, &real, Path::new(PACKAGE_PREFIX)).unwrap();
             builder.finish().unwrap();
             Ok(())
@@ -805,7 +857,9 @@ mod tests {
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, MANIFEST_NAME, &bytes[..]).unwrap();
+            builder
+                .append_data(&mut header, MANIFEST_NAME, &bytes[..])
+                .unwrap();
             append_package_tree(&mut builder, &real, Path::new(PACKAGE_PREFIX)).unwrap();
             builder.finish().unwrap();
             Ok(())
@@ -839,6 +893,67 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn link_directory(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .raw_arg(format!("mklink /J \"{}\" \"{}\"", link.display(), target.display()))
+                .creation_flags(0x08000000)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    #[test]
+    fn restore_target_rejects_links_to_home_and_node_modules_root() {
+        let dir = std::env::temp_dir().join(format!("dsh-snap-escape-{}", std::process::id()));
+        fs::create_dir_all(dir.join("profiles/web/node_modules")).unwrap();
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        fs::write(dir.join("sessions/session.jsonl"), "turn 484").unwrap();
+        let node_modules = dir.join("profiles/web/node_modules");
+        link_directory(&dir, &node_modules.join("home-alias"));
+        link_directory(&node_modules, &node_modules.join("root-alias"));
+        let home_result = resolve_restore_target(&node_modules, "home-alias");
+        let root_result = resolve_restore_target(&node_modules, "root-alias");
+        assert_eq!(fs::read_to_string(dir.join("sessions/session.jsonl")).unwrap(), "turn 484");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(home_result.unwrap_err().starts_with("SNAPSHOT_TARGET_ESCAPE:"));
+        assert!(root_result.unwrap_err().starts_with("SNAPSHOT_TARGET_ESCAPE:"));
+    }
+
+    #[test]
+    fn restore_target_rejects_scoped_parent_link_escape() {
+        let dir = std::env::temp_dir().join(format!("dsh-snap-scope-{}", std::process::id()));
+        let node_modules = dir.join("profile/node_modules");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&node_modules).unwrap();
+        fs::create_dir_all(outside.join("pkg")).unwrap();
+        link_directory(&outside, &node_modules.join("@scope"));
+        let existing = resolve_restore_target(&node_modules, "@scope/pkg");
+        let missing = resolve_restore_target(&node_modules, "@scope/missing");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(existing.unwrap_err().starts_with("SNAPSHOT_TARGET_ESCAPE:"));
+        assert!(missing.unwrap_err().starts_with("SNAPSHOT_TARGET_ESCAPE:"));
+    }
+
+    #[test]
+    fn restore_target_accepts_pnpm_link_within_node_modules() {
+        let dir = std::env::temp_dir().join(format!("dsh-snap-pnpm-{}", std::process::id()));
+        let node_modules = dir.join("node_modules");
+        let package = node_modules.join(".pnpm/pkg@1.0.0/node_modules/pkg");
+        fs::create_dir_all(&package).unwrap();
+        link_directory(&package, &node_modules.join("pkg"));
+        let expected = dunce::canonicalize(&package).unwrap();
+        let result = resolve_restore_target(&node_modules, "pkg");
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.unwrap(), expected);
+    }
+
     #[test]
     fn write_back_manifest_refs_restores_deps_and_bundles() {
         let dir = std::env::temp_dir().join(format!("dsh-snap-wb-{}", std::process::id()));
@@ -863,7 +978,10 @@ mod tests {
         let content = fs::read_to_string(&manifest_path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["dependencies"].as_object().unwrap().len(), 1);
-        assert_eq!(value["dsh"]["profile"]["bundles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["dsh"]["profile"]["bundles"].as_array().unwrap().len(),
+            1
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -17,8 +17,12 @@
 //!   时回退为非透明窗口继续工作。
 //! - `always_on_top` 在 Windows 上 Tauri 原生 API 即可保持置顶（BongoCat 为
 //!   额外稳定性用 SetWindowPos 循环轮询，本项目暂不做该平台特定加固）。
+//! - 原生 Wayland 会话下 `always_on_top` 与 `set_position` 都不生效，桌宠被主窗口
+//!   遮挡（issue #649，上游 tauri-apps/tao#1134 已按「Wayland 不支持」补文档结案）。
+//!   同一后端下 `outer_position()` 恒为 `{x:0,y:0}`，几何持久化因此一并跳过。
+//!   判定见 `crate::pet_overlay_supported`，前端据此提示用户。
 
-use crate::config::{self, STORE_PET_WINDOW_STATE_KEY};
+use crate::config::{store_dat_file_name, STORE_PET_WINDOW_STATE_KEY};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -38,10 +42,11 @@ const PET_WINDOW_BOTTOM_PAD: f64 = 10.0;
 /// 顶栏 Toast 区的最小窗口宽度（逻辑像素）：桌宠较小时仍保证气泡可读，
 /// 与 pet WebView 的 PET_BUBBLE_MIN_WIDTH 保持一致。
 const PET_WINDOW_MIN_WIDTH: f64 = 420.0;
-/// 预设 WebM 画布 16:9（高/宽 = 9/16），与 dsh-pet 协议画布比例保持一致。
+/// 预设宠物默认画布 16:9（高/宽 = 9/16）：与 dsh-pet 协议画布一致
+/// （WebM 与 macOS 的 HEVC-with-Alpha MOV 共用同一画布）。
 const PET_BUILTIN_ASPECT: f64 = 9.0 / 16.0;
-/// 自定义 Codex v2 精灵图默认 8x11 的 192x208 比例；实际比例以前端加载后为准，
-/// 这里仅作为窗口初始/DPI 尺寸的近似，避免与前端内置画布比例互相打架。
+/// Codex 图集（自定义精灵图，或清单条目声明 `kind: "codex"`）的 8x11 / 192x208 比例；
+/// 实际比例以前端加载后为准，这里仅作为窗口初始/DPI 尺寸的近似，避免与前端互相打架。
 const PET_CUSTOM_ASPECT: f64 = 208.0 / 192.0;
 /// 宠物大小百分比合法区间（设置页滑条 50%–200%；bridge/pet.rs 引用同一常量）。
 pub const PET_SIZE_MIN_PERCENT: f64 = 50.0;
@@ -58,32 +63,28 @@ pub struct PetWindowPosition {
     pub y: Option<i32>,
 }
 
-fn store_dat_file_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        config::STORE_DAT_DEV_FILE
-    } else {
-        config::STORE_DAT_FILE
-    }
-}
-
 /// 读取上次保存的桌宠窗口位置；无记录时返回默认（None，位置未定）。
 pub fn get_pet_window_position<R: Runtime>(app: &AppHandle<R>) -> PetWindowPosition {
     let store = app
         .store(store_dat_file_name())
         .expect("Failed to load store for pet window position");
     let raw = store.get(STORE_PET_WINDOW_STATE_KEY);
-    let value = raw.as_ref().and_then(|v| {
-        v.as_str()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .or_else(|| Some(v.clone()))
-    });
-    value
-        .and_then(|v| serde_json::from_value(v).ok())
+    raw.as_ref()
+        .and_then(|value| {
+            serde_json::from_value(crate::config::unwrap_json_value(value).into_owned()).ok()
+        })
         .unwrap_or_default()
 }
 
 /// 保存桌宠窗口位置（用户拖动后由 Moved 事件调用）。
+///
+/// 原生 Wayland 下跳过写入：两个调用点的位置都取自 `outer_position()`，而 GDK 的
+/// Wayland 后端不向客户端报告窗口在屏幕上的坐标，该调用返回 `{x:0,y:0}` 且不报错。
+/// 照写会把上一次在 X11 会话里存下的有效位置覆盖成原点（issue #649）。
 pub fn save_pet_window_position<R: Runtime>(app: &AppHandle<R>, position: &PetWindowPosition) {
+    if !crate::pet_overlay_supported_env() {
+        return;
+    }
     let store = app
         .store(store_dat_file_name())
         .expect("Failed to load store for pet window position");
@@ -122,10 +123,10 @@ pub fn get_pet_size_percent<R: Runtime>(app: &AppHandle<R>) -> f64 {
         .clamp(PET_SIZE_MIN_PERCENT, PET_SIZE_MAX_PERCENT)
 }
 
-/// 当前激活宠物使用的画布比例（高度/宽度）：预设 WebM（未限定 id）固定 9/16，
-/// 自定义精灵图（chat:/codex: 来源限定 id）用 208/192 作为窗口初始/DPI 尺寸的近似。
-/// 真正的自定义比例由前端加载后修正，因此这里不再把 208/192 硬编码给所有宠物，
-/// 避免窗口大小的两个来源互相冲突。
+/// 当前激活宠物使用的画布比例（高度/宽度）：预设宠物（未限定 id）默认 dsh-pet 的
+/// 16:9 透明视频画布，自定义精灵图（chat:/codex: 来源限定 id）用 208/192。
+/// 真正的比例由 pet WebView 拿到清单条目/图集后实时修正，这里只是窗口创建与
+/// DPI 变化时的初始近似。
 pub fn pet_window_aspect<R: Runtime>(app: &AppHandle<R>) -> f64 {
     let setting = crate::config::get_store_dat_setting(app);
     let active = setting
@@ -155,7 +156,8 @@ pub fn apply_pet_size<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) else {
         return;
     };
-    let (width, height) = pet_window_logical_size(get_pet_size_percent(app), pet_window_aspect(app));
+    let (width, height) =
+        pet_window_logical_size(get_pet_size_percent(app), pet_window_aspect(app));
     if window
         .set_size(tauri::LogicalSize::new(width, height))
         .is_ok()
@@ -166,6 +168,7 @@ pub fn apply_pet_size<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// 将窗口左上角限制到单个显示器内；窗口大于显示器时贴齐其左上角。
+#[allow(clippy::too_many_arguments)]
 fn clamp_window_position(
     x: i32,
     y: i32,
@@ -280,14 +283,28 @@ pub fn move_pet_window<R: Runtime>(
 
 /// 确保桌宠窗口存在并恢复位置。
 ///
-/// 幂等：已注册时直接复用返回；首次调用时创建 `pet` 窗口并恢复上一次保存的
-/// 位置（无记录则默认定位在主屏右下角略偏上，避免遮挡主工作区）。
+/// 幂等：已注册时直接复用返回；不存在（首次启用，或上次收起时已被销毁）时
+/// 创建 `pet` 窗口并恢复上一次保存的位置（无记录则默认定位在主屏右下角略偏上，
+/// 避免遮挡主工作区）。
+///
+/// 创建窗口只能来自 app setup 或异步运行时的命令任务：`WebviewWindowBuilder::build()`
+/// 经 channel 等主线程事件循环回包，主线程调用会死锁；销毁窗口则**绝不能**在主线程
+/// 调用（`WindowMessage::Destroy` 在主线程直接 panic）。两条约束都由
+/// `bridge::pet::defer_pet_window_op` 统一保证。
 pub fn ensure_pet_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<WebviewWindow<R>> {
     if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
         return Ok(window);
     }
+    if !crate::pet_overlay_supported_env() {
+        log::warn!(
+            "PET_OVERLAY_UNSUPPORTED: always-on-top and absolute positioning are unavailable on \
+             a native Wayland session; the pet window is covered by other windows and does not \
+             stay where it was placed. Enable the XWayland option in pet settings to restore them."
+        );
+    }
     let app_handle = app.clone();
-    let (width, height) = pet_window_logical_size(get_pet_size_percent(app), pet_window_aspect(app));
+    let (width, height) =
+        pet_window_logical_size(get_pet_size_percent(app), pet_window_aspect(app));
     // 非 Windows 平台在此前加入注入脚本时再赋值，故需要 mut；Windows 下保持只读。
     #[allow(unused_mut)]
     let mut builder =
@@ -310,16 +327,14 @@ pub fn ensure_pet_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Webvie
     {
         builder = builder
             .initialization_script_for_all_frames(crate::desktop::compat::ABORT_SIGNAL_ANY_SHIM_JS)
+            .initialization_script_for_all_frames(crate::desktop::compat::ITERATOR_HELPERS_SHIM_JS)
             .initialization_script_for_all_frames(
                 crate::desktop::notification::NOTIFICATION_SHIM_JS,
             )
-            .initialization_script_for_all_frames(crate::desktop::nav::NAV_SHIM_JS)
-            .initialization_script_for_all_frames(crate::desktop::style::IFRAME_STYLES_JS)
             .initialization_script_for_all_frames(crate::desktop::paste::PASTE_SHIM_JS)
             .initialization_script_for_all_frames(
                 crate::desktop::plugin_boot::PLUGIN_BOOT_RELOAD_JS,
-            )
-            .initialization_script_for_all_frames(crate::desktop::zoom::ZOOM_SHORTCUT_BRIDGE_JS);
+            );
     }
 
     let window = builder.build()?;
@@ -387,13 +402,34 @@ fn place_pet_at_default<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_position(tauri::Position::Physical(PhysicalPosition::new(x, y)));
 }
 
-/// 显示或隐藏桌宠窗口；隐藏时保留窗口实例，显示时不抢占用户焦点。
+/// 显示或关闭桌宠窗口。
+///
+/// # 隐藏 = 销毁窗口实例（issue #469）
+///
+/// 这里**不做 hide**：隐藏只是把窗口从屏幕上撤下，WebView 进程与页面都还在，桌宠的
+/// 双 `<video>` 会继续解码播放——Chromium/WebView2 对「播放中（未暂停）的 video」
+/// 无条件持有 Video Wake Lock，屏幕因此永远无法息屏，还白占 CPU（用户报告：收起宠物
+/// 后仍无法黑屏）。销毁窗口才是真正「收起」：webview 进程随窗口一起消失，视频暂停、
+/// 唤醒锁释放、CPU 归零。代价是重新显示要重建 webview（页面前端挂载时用
+/// `get_pet_status` 拉取状态，不依赖创建时的事件投递）。
+///
+/// # 线程约束（务必读完再改）
+///
+/// `tauri-runtime-wry` 对主线程上的窗口生命周期消息是「创建会死锁、销毁会 panic」：
+///
+/// - **销毁**走 `WindowMessage::Destroy`，主线程调用直接
+///   `panic!("cannot handle \`WindowMessage::Destroy\` on the main thread")`
+///   （tauri-runtime-wry 2.11.4 lib.rs:3494）。command handler 在主线程执行，所以
+///   收起命令必须经 `bridge::pet::defer_pet_window_op` 丢到异步运行时再调本函数。
+/// - **创建**（`ensure_pet_window` → `WebviewWindowBuilder::build()`）经 channel 等
+///   主线程事件循环回包，仅允许 app setup 或异步运行时任务调用（app setup 在事件
+///   循环初始化前、不与回包竞争，是唯一的主线程例外）。
 pub fn set_pet_window_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) -> Result<(), String> {
     if !visible {
         if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
             window
-                .hide()
-                .map_err(|error| format!("PET_WINDOW_HIDE_FAILED: {error}"))?;
+                .destroy()
+                .map_err(|error| format!("PET_WINDOW_DESTROY_FAILED: {error}"))?;
         }
         return Ok(());
     }
@@ -405,29 +441,19 @@ pub fn set_pet_window_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) -> 
     Ok(())
 }
 
-/// 在 setup 阶段预创建两个隐藏窗口，再沿用永久启用设置显示它们。
-/// 这样设置页同步 command 只会 show/hide 已存在窗口，不会在 command handler
-/// 内调用 WebviewWindowBuilder，避免 Tauri/Windows 的消息循环死锁。
-pub fn init_pet_window<R: Runtime>(app: &AppHandle<R>) {
-    let enabled = crate::config::get_store_dat_setting(app).pet_enabled;
-    let pet = ensure_pet_window(app);
-    if let Ok(pet) = pet {
-        if enabled {
-            let _ = pet.show();
-        }
-    } else {
-        log::error!("PET_WINDOW_INIT_FAILED: failed to pre-create pet windows");
-    }
-}
-
-/// 重载桌宠窗口页面（预设宠物更新/替换后调用）。
+/// setup 阶段按「是否永久启用」决定桌宠窗口的初始状态。
 ///
-/// 桌宠窗口按 `activePet` 只拉取一次协议资源（config + webm manifest），
-/// 更新换入新文件后 URL 不变，WebView 可能继续命中缓存里的旧 webm；
-/// 显式 reload 让新资源立即生效。窗口隐藏时 reload 同样安全（页面本身常驻）。
-pub fn reload_pet_window<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window(PET_WINDOW_LABEL) {
-        let _ = window.eval("location.reload()");
+/// 启用才创建并显示；未启用**不创建**：窗口是「显示宠物」的唯一目的，没人看时连
+/// webview 都不该存在（隐藏窗口同样会加载 pet.html、播放动画）。窗口此后由
+/// [`set_pet_window_visible`] 按需创建/销毁。
+pub fn init_pet_window<R: Runtime>(app: &AppHandle<R>) {
+    if !crate::config::get_store_dat_setting(app).pet_enabled {
+        // 全新安装默认不启用桌宠：不预创建窗口（也顺带不触发 Linux 未 realize
+        // 窗口的穿透请求路径）。
+        return;
+    }
+    if let Err(error) = set_pet_window_visible(app, true) {
+        log::error!("PET_WINDOW_INIT_FAILED: failed to create pet window: {error}");
     }
 }
 
@@ -469,11 +495,17 @@ mod tests {
                 width,
                 (PET_SPRITE_BASE_WIDTH * scale + PET_WINDOW_PAD_X).max(PET_WINDOW_MIN_WIDTH)
             );
-            assert_eq!(height, PET_SPRITE_BASE_WIDTH * PET_CUSTOM_ASPECT * scale + 82.0);
+            assert_eq!(
+                height,
+                PET_SPRITE_BASE_WIDTH * PET_CUSTOM_ASPECT * scale + 82.0
+            );
         }
         // 内置鲸鱼为 16:9 画布，窗口高度远小于 8x11 图集，避免窗口过高产生大片透明区。
         let (_, builtin_height) = pet_window_logical_size(100.0, PET_BUILTIN_ASPECT);
-        assert_eq!(builtin_height, PET_SPRITE_BASE_WIDTH * PET_BUILTIN_ASPECT + 82.0);
+        assert_eq!(
+            builtin_height,
+            PET_SPRITE_BASE_WIDTH * PET_BUILTIN_ASPECT + 82.0
+        );
     }
 
     #[test]
@@ -484,7 +516,9 @@ mod tests {
         assert_eq!(PET_BUILTIN_ASPECT, 9.0 / 16.0);
         assert_eq!(PET_CUSTOM_ASPECT, 208.0 / 192.0);
         let is_builtin = |active: Option<&str>| {
-            active.map(str::trim).filter(|v| !v.is_empty())
+            active
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
                 .map(|v| !v.contains(':'))
                 .unwrap_or(true)
         };
@@ -494,6 +528,34 @@ mod tests {
         assert!(is_builtin(Some("another-preset")));
         assert!(!is_builtin(Some("codex:blue_whale")));
         assert!(!is_builtin(Some("chat:cat")));
+    }
+
+    #[test]
+    fn pet_window_width_crosses_bubble_minimum_at_large_sizes() {
+        assert_eq!(
+            pet_window_logical_size(50.0, PET_BUILTIN_ASPECT),
+            (420.0, 143.875)
+        );
+        assert_eq!(
+            pet_window_logical_size(100.0, PET_BUILTIN_ASPECT),
+            (420.0, 205.75)
+        );
+        assert_eq!(
+            pet_window_logical_size(200.0, PET_BUILTIN_ASPECT),
+            (472.0, 329.5)
+        );
+    }
+
+    #[test]
+    fn clamp_window_position_handles_extreme_coordinates_and_sizes() {
+        assert_eq!(
+            clamp_window_position(i32::MAX, i32::MIN, 20, 10, -1920, -1080, 1920, 1080),
+            (-20, -1080)
+        );
+        assert_eq!(
+            clamp_window_position(0, 0, u32::MAX, u32::MAX, i32::MIN, i32::MIN, 0, 0),
+            (i32::MIN, i32::MIN)
+        );
     }
 
     #[test]

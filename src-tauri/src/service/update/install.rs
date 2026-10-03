@@ -19,15 +19,20 @@ use super::meta::{fetch_latest_release, LatestRelease};
 use super::version::current_version;
 use super::{DOWNLOAD_TIMEOUT_SECS, UPDATES_DIR};
 
-/// 安装包存放路径（AppData/updates/<asset_name>）
-fn installer_path(app_handle: &AppHandle, asset_name: &str) -> Result<PathBuf, String> {
+/// 安装包目录（AppData/updates，不存在则创建）
+fn updates_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     let dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| format!("UPDATE_DIR: {e}"))?
         .join(UPDATES_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("UPDATE_DIR: {e}"))?;
-    Ok(dir.join(asset_name))
+    Ok(dir)
+}
+
+/// 安装包存放路径（AppData/updates/<asset_name>）
+fn installer_path(app_handle: &AppHandle, asset_name: &str) -> Result<PathBuf, String> {
+    Ok(updates_dir(app_handle)?.join(asset_name))
 }
 
 /// 检查是否有桌面端新版本。
@@ -219,6 +224,9 @@ pub async fn download(app_handle: &AppHandle) -> Result<DesktopUpdateInfo, Strin
 
     if path.exists() {
         log::info!("Installer already downloaded: {}", path.display());
+        // 已落盘的安装包同样登记为「待安装」：覆盖「上一轮下载后 store 标记丢失」
+        // （store 被手工清理/旧版本尚无此标记）的场景，保证退出时仍会自动更新。
+        super::pending::set(app_handle, Some((path.as_path(), &release.version)));
         return check(app_handle)
             .await?
             .ok_or_else(|| "UPDATE_NONE".to_string());
@@ -292,34 +300,32 @@ pub async fn download(app_handle: &AppHandle) -> Result<DesktopUpdateInfo, Strin
     #[cfg(unix)]
     ensure_installer_executable(&path)?;
 
+    // 登记「待安装」：用户若没在对话框里立刻安装，关闭桌面端时会自动打开安装器
+    // （见 pending::launch_pending_installer）；真正打开安装包后清除该标记。
+    super::pending::set(app_handle, Some((path.as_path(), &release.version)));
+
     check(app_handle)
         .await?
         .ok_or_else(|| "UPDATE_NONE".to_string())
 }
 
-/// 打开安装包：交给系统默认处理器（Windows 会触发 UAC 执行安装器）。
+/// 校验已规范化的安装包路径确实位于 updates 目录内（防 `..`、符号链接、路径穿越）。
 ///
-/// 安全边界：仅允许打开 `AppData/updates/` 目录内、且文件名与资产名一致的
-/// 安装包——任意路径、绝对/相对遍历、`..` 都会拒绝，避免被伪装的 frame 或
-/// 插件利用去执行任意文件。
-pub async fn open_installer(app_handle: &AppHandle, path: String) -> Result<(), String> {
-    let updates_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("UPDATE_DIR: {e}"))?
-        .join(UPDATES_DIR);
-    let p = std::path::Path::new(&path);
-    if !p.exists() || !p.is_file() {
-        return Err(format!("UPDATE_NOT_FOUND: {path}"));
-    }
-    // 规范化后必须仍在 updates 目录内（防 `..`、符号链接、路径穿越）。
-    // 用 `dunce::canonicalize`（std `fs::canonicalize`）——它返回的路径不带
-    // Windows `\\?\` verbatim 前缀，`starts_with` 与日志展示更一致。
-    let canonical = dunce::canonicalize(p).map_err(|e| format!("UPDATE_OPEN: {e}"))?;
-    let updates_real = dunce::canonicalize(&updates_dir).map_err(|e| format!("UPDATE_DIR: {e}"))?;
-    if !canonical.starts_with(&updates_real) {
+/// 拆成纯函数便于单测：路径判定是安全边界，必须能在不进文件系统/不起 Tauri 的
+/// 情况下断言（见 tests）。
+fn ensure_within_updates_dir(
+    canonical: &std::path::Path,
+    updates_real: &std::path::Path,
+) -> Result<(), String> {
+    // `Path::starts_with` 只按组件前缀比较、不做归一化：`updates/../evil.exe` 会被
+    // 判为位于 `updates` 下。调用方已 canonicalize（不含 `..`），这里再显式拒绝
+    // `..` 组件，避免将来有人拿未归一的路径调用它而绕过目录边界。
+    let has_parent_dir = canonical
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    if has_parent_dir || !canonical.starts_with(updates_real) {
         log::error!(
-            "Rejecting open_installer outside updates dir: {} (root {})",
+            "Rejecting installer outside updates dir: {} (root {})",
             canonical.display(),
             updates_real.display()
         );
@@ -327,7 +333,74 @@ pub async fn open_installer(app_handle: &AppHandle, path: String) -> Result<(), 
             "UPDATE_PATH_REJECTED: installer path is outside updates directory".to_string(),
         );
     }
-    log::info!("Opening desktop installer: {}", p.display());
+    Ok(())
+}
+
+/// 校验安装包路径：必须是 `AppData/updates/` 目录内的真实文件，并返回其规范化路径。
+///
+/// 安全边界：任意路径、绝对/相对遍历、`..`、指向目录外的符号链接都会拒绝，
+/// 避免被伪装的 frame 或插件利用去执行任意文件。
+fn resolve_installer_path(app_handle: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let updates_dir = updates_dir(app_handle)?;
+    let p = std::path::Path::new(path);
+    if !p.exists() || !p.is_file() {
+        return Err(format!("UPDATE_NOT_FOUND: {path}"));
+    }
+    // 规范化后必须仍在 updates 目录内。用 `dunce::canonicalize`（std
+    // `fs::canonicalize`）——它返回的路径不带 Windows `\\?\` verbatim 前缀，
+    // `starts_with` 与日志展示更一致。
+    let canonical = dunce::canonicalize(p).map_err(|e| format!("UPDATE_OPEN: {e}"))?;
+    let updates_real = dunce::canonicalize(&updates_dir).map_err(|e| format!("UPDATE_DIR: {e}"))?;
+    ensure_within_updates_dir(&canonical, &updates_real)?;
+    Ok(canonical)
+}
+
+/// 是否为 AppImage 安装包（Linux 便携格式，自带运行时可执行）。
+#[cfg(target_os = "linux")]
+fn is_appimage(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("AppImage"))
+}
+
+/// 校验安装包并交给系统默认处理器打开（不停服务、不动「待安装」标记）。
+///
+/// **调用方必须先停 Harness**（见 [`stop_for_installer`](crate::service::workflow::stop_for_installer)）：
+/// 安装器会强杀桌面端进程，桌面端先消失就没人回收 Harness 子进程，它变成孤儿继续
+/// 占用配置端口，更新后的新实例会撞上 EADDRINUSE。两条调用路径各自完成停服：
+/// 「对话框立即更新」用 async 的 `workflow::stop`（要更新状态），「退出时自动更新」
+/// 用同步的 `stop_for_installer`（退出路径没有 async 运行时可用）。停止动作不放在
+/// 这里，是为了让每条路径都能按自己的时序等待端口释放。
+pub(super) fn open_installer_now(app_handle: &AppHandle, path: &str) -> Result<(), String> {
+    let resolved = resolve_installer_path(app_handle, path)?;
+    log::info!("Opening desktop installer: {}", resolved.display());
+    // 兜底补充可执行权限：兼容老版本下载的 AppImage（0644）被打包用户留存，
+    // 直接打开仍会失败；此处幂等修复后再交给系统处理器。
+    #[cfg(unix)]
+    ensure_installer_executable(&resolved)?;
+
+    // Linux：AppImage 自带运行时，直接执行；xdg-open 依赖桌面注册的 MIME
+    // 处理器，COSMIC 等未注册的环境会静默失败（open::that_detached 只检查
+    // 进程是否 spawn 成功，看不到 xdg-open 的退出码）。.deb/.rpm 仍交给系统
+    // 默认处理器（软件中心 / 包管理器）。
+    #[cfg(target_os = "linux")]
+    if is_appimage(&resolved) {
+        std::process::Command::new(&resolved)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("UPDATE_OPEN: {e}"))?;
+        return Ok(());
+    }
+
+    app_handle
+        .opener()
+        .open_path(resolved.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("UPDATE_OPEN: {e}"))
+}
+
+/// 打开安装包：交给系统默认处理器（Windows 会触发 UAC 执行安装器）。
+pub async fn open_installer(app_handle: &AppHandle, path: String) -> Result<(), String> {
     // 更新前先停下本应用持有的 Harness 服务：安装器在安装时会强杀桌面端进程
     // （CheckIfAppIsRunning → taskkill），跳过正常退出路径的 stop_on_exit，导致
     // Harness 子进程变成孤儿继续占用配置端口。若此刻不提前停掉，更新后新实例
@@ -341,14 +414,20 @@ pub async fn open_installer(app_handle: &AppHandle, path: String) -> Result<(), 
             log::warn!("Failed to stop Harness before opening installer: {}", e);
         }
     }
-    // 兜底补充可执行权限：兼容老版本下载的 AppImage（0644）被打包用户留存，
-    // 直接打开仍会失败；此处幂等修复后再交给系统处理器。
-    #[cfg(unix)]
-    ensure_installer_executable(p)?;
-    app_handle
-        .opener()
-        .open_path(path, None::<&str>)
-        .map_err(|e| format!("UPDATE_OPEN: {e}"))
+    open_installer_now(app_handle, &path)?;
+    // 安装包已交给系统 → 清除「待安装」标记，避免退出应用时重复拉起安装器。
+    super::pending::set(app_handle, None);
+
+    // Linux AppImage 安装包就是新版本本体，且与当前实例共用单实例 D-Bus 锁：
+    // 当前实例不退出时，新进程会转发激活后立即退出（表现为「打开安装包」无效）。
+    // 释放单实例名并退出，让已拉起的新版本接管；.deb/.rpm 由包管理器处理，
+    // 无需结束当前实例。
+    #[cfg(target_os = "linux")]
+    if is_appimage(std::path::Path::new(&path)) {
+        tauri_plugin_single_instance::destroy(app_handle);
+        app_handle.exit(0);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,6 +453,24 @@ mod tests {
             "应包含所有者/组/其他可执行位，mode={mode:o}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AppImage 识别按扩展名匹配且大小写不敏感；其它安装包格式不受影响。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_detection_is_extension_based() {
+        use std::path::Path;
+        assert!(is_appimage(Path::new(
+            "/tmp/Deepseek.Harness.Desktop_0.13.0_amd64.AppImage"
+        )));
+        assert!(is_appimage(Path::new("/tmp/tool.appimage")));
+        assert!(!is_appimage(Path::new(
+            "/tmp/Deepseek.Harness.Desktop_0.13.0_amd64.deb"
+        )));
+        assert!(!is_appimage(Path::new(
+            "/tmp/Deepseek.Harness.Desktop_0.13.0_x86_64.rpm"
+        )));
+        assert!(!is_appimage(Path::new("/tmp/AppImage")));
     }
 
     /// 镜像兜底策略回归：无摘要时只有官方源；有摘要时才加入镜像。
@@ -420,7 +517,7 @@ mod tests {
         let file = dir.join("installer.part");
         let content = b"deepseek-harness-desktop installer payload";
         std::fs::write(&file, content).unwrap();
-        let real = format!("sha256:{}", format!("{:x}", sha2::Sha256::digest(content)));
+        let real = format!("sha256:{:x}", sha2::Sha256::digest(content));
         // 正确摘要通过
         assert!(verify_installer_sha256(&file, &real).is_ok());
         // 裸 64hex（无 sha256: 前缀）也接受
@@ -431,5 +528,20 @@ mod tests {
         // 非法摘要格式拒绝
         assert!(verify_installer_sha256(&file, "sha256:zz").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 安装包路径必须是 updates 目录内的文件：同前缀的兄弟目录、目录穿越都拒绝。
+    /// 退出时自动打开安装器（pending）与对话框「打开安装包」共用这条判定。
+    #[test]
+    fn ensure_within_updates_dir_rejects_outside_paths() {
+        let root = std::path::Path::new("root").join("updates");
+        // 目录内 → 通过
+        assert!(ensure_within_updates_dir(&root.join("app-setup.exe"), &root).is_ok());
+        // 目录外的兄弟路径（前缀相同也不能放过：`updates-evil` 不是 `updates` 的子路径）
+        assert!(ensure_within_updates_dir(&root.join("..").join("evil.exe"), &root).is_err());
+        let sibling = std::path::Path::new("root")
+            .join("updates-evil")
+            .join("x.exe");
+        assert!(ensure_within_updates_dir(&sibling, &root).is_err());
     }
 }

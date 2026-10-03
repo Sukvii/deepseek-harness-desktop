@@ -8,7 +8,7 @@
 //! 构造 File 并重发一次合成 `paste` 事件给当前焦点元素，让 dsh 聊天框按普通
 //! 贴图路径处理，从而与浏览器行为一致。
 //!
-//! 与 [`crate::desktop::notification::NOTIFICATION_SHIM_JS`] / [`crate::desktop::nav::NAV_SHIM_JS`]
+//! 与 [`crate::desktop::notification::NOTIFICATION_SHIM_JS`] / [`crate::desktop::compat::ABORT_SIGNAL_ANY_SHIM_JS`]
 //! 走同一套注入通道（Windows 在 FrameCreated → ContentLoading 时 ExecuteScript，
 //! 其余平台 `initialization_script_for_all_frames`）。脚本带 `__dsh_clipboard_image_bridge__`
 //! 幂等守卫，重复注入安全；只处理「直接 iframe」发来的剪贴板请求，避免多层 iframe 误转发。
@@ -17,10 +17,12 @@ pub(crate) const PASTE_SHIM_JS: &str = r#"(function () {
   if (window.__dsh_clipboard_image_bridge__) return;
   window.__dsh_clipboard_image_bridge__ = true;
 
-  // 请求方向：iframe → 宿主；响应方向：宿主 → iframe
+  // 请求方向：iframe → 宿主；响应方向：宿主 → iframe。
+  // 两个方向都按 `type` 识别：宿主 → iframe 的桥统一由 useIframePost 补
+  // `source: 'dsh-desktop'`，这里只比对 `type`，不再比对 `source`。
   var REQ_SRC = 'dsh-clipboard-image-bridge';
-  var RES_SRC = 'dsh-desktop-clipboard';
   var REQ_TYPE = 'dsh://clipboard-image:read';
+  var RES_TYPE = 'dsh://clipboard-image:reply';
 
   var reqSeq = 0;
   var pending = {}; // id -> { resolve, target }
@@ -39,10 +41,11 @@ pub(crate) const PASTE_SHIM_JS: &str = r#"(function () {
     });
   }
 
-  // 宿主回包
+  // 宿主回包：只接受直接父窗口发来、`type` 匹配的回包
   window.addEventListener('message', function (event) {
+    if (event.source !== window.parent) return;
     var data = event.data;
-    if (!data || typeof data !== 'object' || data.source !== RES_SRC) return;
+    if (!data || typeof data !== 'object' || data.type !== RES_TYPE) return;
     var item = pending[data.id];
     if (!item) return;
     delete pending[data.id];

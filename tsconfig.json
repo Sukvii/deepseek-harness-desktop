@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2022",
     "jsx": "react-jsx",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "useDefineForClassFields": true,
     "baseUrl": ".",
     "module": "ESNext",
@@ -22,6 +22,15 @@
     "isolatedModules": true,
     "skipLibCheck": true
   },
-  "references": [{ "path": "./tsconfig.node.json" }],
-  "include": ["src", "packages/*/src", "types"]
+  "include": [
+    "src",
+    "test",
+    "packages/*/src",
+    "packages/*/scripts",
+    "types",
+    "packages/.test/test-utils.ts",
+    "scripts",
+    "*.config.ts",
+    "genapi*.ts"
+  ]
 }

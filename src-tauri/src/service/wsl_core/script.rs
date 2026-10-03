@@ -35,7 +35,7 @@ pub const ENV_PREAMBLE: &str = env_preamble!();
 /// `ROOT` = 受控运行时的 `node_modules`（未安装时为空；补丁目标定位的根）；
 /// `RUNTIME` = 受控运行时目录（前端展示用）；`DSH` = 运行时内 `.bin/dsh` 的绝对路径
 /// （未安装 / 不可执行时为空）；`SKIPAUTH` 是只读的 `--skip-auth` 补丁判定（needle
-/// 与 Windows 侧 `web_startup_supports_skip_auth` 相同），供 W3 决定能否启动（R-W2-2）。
+/// 与 [`super::auth_patch`] 的补丁标记一致），供 W3 决定能否启动（R-W2-2）。
 ///
 /// 判定目标与 [`super::patch`] 按**同一候选顺序**取「第一个存在的文件」——即
 /// dsh 运行时实际会加载的那一份（Node 解析优先序：web-app 嵌套 > dsh 直属嵌套 >

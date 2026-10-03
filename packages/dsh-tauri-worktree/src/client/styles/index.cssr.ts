@@ -3,7 +3,8 @@ import { SESSION_ICON_ATTRIBUTE } from '../constants'
 
 const { c } = cssr
 
-/** 侧边栏会话行 Git 分支图标补丁样式（配合 register/session-icons.ts 的 DOM 观察器）。 */
+// 全局样式：只压官方会话树（`[role="treeitem"]`）里我们自己插入的图标座位，
+// 不涉及本插件的任何组件标记，因此保留 cssr；组件自身样式一律写在组件的 `className` 上。
 export default c([
   c(`[${SESSION_ICON_ATTRIBUTE}]`, {
     width: '16px',
@@ -16,4 +17,5 @@ export default c([
     color: 'var(--dsw-alias-label-secondary)',
   }),
   c('[role="treeitem"]', { position: 'relative' }),
+  c(`[role="treeitem"]:hover [${SESSION_ICON_ATTRIBUTE}]`, { visibility: 'hidden' }),
 ])

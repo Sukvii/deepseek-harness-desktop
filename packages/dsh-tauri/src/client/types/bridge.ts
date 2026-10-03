@@ -1,36 +1,26 @@
-/** 宿主命令所需的业务面（由插件体注入 ctx.layout）。 */
-export interface NavBridgeHandlers {
-  toggleSidebar: () => void
-}
+import type { ParentMessage } from './iframe'
+import type { InvokeArgs } from './tauri'
 
-/** 会话访问栈中的页面。 */
-export interface Page {
-  key: string | null
-  el: HTMLElement | null
-}
-
-/** 记录动作（与宿主 `PluginError.action` 语义一致）。 */
+/** 插件错误上报动作（宿主 `plugin_errors::record` 原样落库，仅作分类展示）。 */
 export type ErrorAction = 'runtime' | 'install' | 'update' | 'remove'
 
-// ── dsh-tauri invoke 桥（iframe → 宿主 → invoke()）────────────────
-/** iframe → 宿主 的 invoke 请求（postMessage）。 */
-export interface InvokeBridgeRequest {
-  source: 'dsh-tauri-invoke'
+export interface TauriEventBridgeMessage<T = unknown> extends ParentMessage {
+  event: string
+  /** Tauri 侧的事件 id；宿主未提供时为 0。 */
+  id?: number
+  payload: T
+}
+
+export interface InvokeBridgeRequest extends ParentMessage {
   type: 'dsh://tauri:invoke'
-  /** Tauri command 名。 */
   cmd: string
-  /** command 参数对象。 */
-  args?: Record<string, unknown>
-  /** 一次请求的唯一标识，宿主原样回填用于匹配。 */
+  args?: InvokeArgs
   nonce: string
 }
 
-/** 宿主 → iframe 的 invoke 应答（postMessage）。 */
-export interface InvokeBridgeReply {
-  source: 'dsh-desktop-invoke'
+export interface InvokeBridgeReply extends ParentMessage {
   type: 'dsh://tauri:reply'
   nonce: string
-  /** true=成功（value 有效）；false=失败（error 为 command 抛出的字符串）。 */
   ok: boolean
   value?: unknown
   error?: string

@@ -182,7 +182,8 @@ pub fn load(app: &AppHandle, version: &str) -> Result<RuntimeBundle, String> {
 mod tests {
     use super::{
         lock_dsh_version, lock_sha256, manifest_dsh_version, RuntimeBaseline, BACKUP_DIR_PREFIX,
-        BASELINE_FILE_NAME, CANDIDATE_DIR_NAME, RUNTIME_DIR_NAME,
+        BASELINE_FILE_NAME, CANDIDATE_DIR_NAME, LOCK_FILE_NAME, MANIFEST_FILE_NAME,
+        RESOURCE_ROOT_DIR, RUNTIME_DIR_NAME,
     };
 
     #[test]
@@ -256,5 +257,28 @@ mod tests {
         // 正式运行时的二进制必须由脚本按目录约定拼出
         assert!(START.contains(&format!("{RUNTIME_DIR_NAME}/node_modules/.bin/dsh")));
         assert!(VERIFY_CORE.contains("node_modules/.bin/dsh"));
+    }
+
+    /// U1：随包 WSL 运行时资源必须与清单推荐值配对——默认目标 0.1.2-rc.1 的
+    /// manifest / lock 在盘且都钉住该版本；锁哈希是基线记录（`.dsh-runtime.json`）
+    /// 与更新判定的输入端，重新生成锁（即使只差换行）必须显式更新此断言。
+    #[test]
+    fn shipped_wsl_runtime_resources_pin_recommended_version() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(RESOURCE_ROOT_DIR)
+            .join("0.1.2-rc.1");
+        let manifest = std::fs::read_to_string(dir.join(MANIFEST_FILE_NAME))
+            .expect("runtime manifest in tree");
+        let lock = std::fs::read_to_string(dir.join(LOCK_FILE_NAME)).expect("runtime lock in tree");
+        assert_eq!(
+            manifest_dsh_version(&manifest).as_deref(),
+            Some("0.1.2-rc.1")
+        );
+        assert_eq!(lock_dsh_version(&lock).as_deref(), Some("0.1.2-rc.1"));
+        assert_eq!(
+            lock_sha256(&lock),
+            "46d0671df390de891168284922d4ee3dd62a6e1ba4ca469dd957f37b045fbe54"
+        );
     }
 }

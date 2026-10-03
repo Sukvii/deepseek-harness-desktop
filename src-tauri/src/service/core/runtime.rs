@@ -20,10 +20,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::fs::FileTypeExt;
+
 use tauri::AppHandle;
 
 use super::source::CoreSource;
 
+/// 核心自有包所在的 scope。
+const CORE_PACKAGE_SCOPE: &str = "@deepseek-ai";
+/// 核心家族自身的包名前缀：`dsh` 与 `dsh-*`。
+///
+/// 同 scope 下的 cordis、cosmokit、schemastery 等共享框架库是插件可以合法依赖并
+/// 锁定版本的对象（如 billion-context 锁 schemastery 3.18.4），不能按整个 scope 删除。
+const CORE_PACKAGE_PREFIX: &str = "dsh";
 const NATIVE_REPAIR_TIMEOUT: Duration = Duration::from_secs(120);
 /// 原生模块重建（node-gyp 编译）可能远超安装耗时，单独放宽上限
 const NATIVE_REBUILD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -34,13 +44,28 @@ const NODE_PROBE_SCRIPT: &str = "process.stdout.write(process.platform + ':' + p
 const NATIVE_IMPORT_SCRIPT: &str = "await import('sharp'); await import('koffi')";
 /// 探测脚本的结果标记行前缀（脚本 stdout 里可能混有原生模块自身的输出）
 const NATIVE_PROBE_MARKER: &str = "__DSH_NATIVE_PROBE__";
+/// 已核验通过的原生依赖结论戳（issue #766）。
+///
+/// 探测要启动 node 子进程、把核心 `node_modules` 下每个原生包 require 一遍，前面还要
+/// 再起一个子进程探测平台/架构，健康机器上这两步是纯开销。而结论在「同一个 node
+/// 运行时 + 同一份核心 `node_modules`」下是稳定的，把结论连同输入指纹落到基础目录，
+/// 命中即直接放行。
+///
+/// 只写 Ready：失败/未知一律不落盘，绝不把一次性修复结果固化成「以后都不用查」。
+/// 指纹覆盖所有会造成结论变化的现实可变项——node 可执行文件身份（路径 + 大小 +
+/// 修改时间）、核心目录与核心版本、`node_modules` 前两层的条目（名字 + 修改时间）：
+/// 核心更新、node 升级/替换、平台包增删、`node_modules` 被重建都会失配，从而必然
+/// 重新探测。清空依赖目录或删掉这个文件即可强制回到「每次探测」。
+const NATIVE_PROBE_STAMP_FILE: &str = "core-native-probe.stamp.json";
+/// 指纹采集的条目上限：`node_modules` 异常膨胀时不至于把启动拖慢
+const NATIVE_PROBE_STAMP_MAX_ENTRIES: usize = 512;
 /// 原生模块探测脚本：列出无法被当前运行时加载的原生模块。
 ///
 /// 1. `sharp` / `koffi`：NAPI 可选依赖，缺目标平台包时动态 import 失败（原有修复路径）；
 /// 2. 原生包：带 `binding.gyp` 或自带原生产物目录（`build/Release`、`build/Debug`、
 ///    `prebuilds`、`prebuilt`）的包，逐个 require —— 与 dsh 自身的加载方式一致，
 ///    加载失败即为 dsh 启动时同样的失败（fs-ext 这类 node-gyp 包落在 build/Release）。
-/// 崩溃/异常退出时不会有标记行，Rust 侧按"结论未知"处理，不阻断启动。
+///    崩溃/异常退出时不会有标记行，Rust 侧按"结论未知"处理，不阻断启动。
 const NATIVE_PROBE_SCRIPT: &str = r#"
 const { createRequire } = await import('node:module');
 const { existsSync, readdirSync } = await import('node:fs');
@@ -48,6 +73,9 @@ const { join } = await import('node:path');
 const root = process.cwd();
 const loader = createRequire(join(root, 'dsh-native-probe.cjs'));
 const failures = [];
+// 扫描中途抛错时置位：此时 failures 可能只是「还没扫到」的空清单，绝不能当成
+// 「原生依赖都正常」报上去（见脚本末尾的标记行输出条件）。
+let incomplete = false;
 const describe = (error) => String((error && error.message) || error);
 const isAbi = (text) => text.includes('NODE_MODULE_VERSION');
 const attempt = (name, target) => {
@@ -99,8 +127,11 @@ try {
   }
 } catch (error) {
   process.stderr.write('native addon scan failed: ' + describe(error) + '\n');
+  incomplete = true;
 }
-process.stdout.write('__DSH_NATIVE_PROBE__' + JSON.stringify(failures) + '\n');
+// 扫描没做完就不输出标记行：Rust 侧据此拿到「结论未知」（进而回退到 sharp/koffi
+// 探测、不写结论戳），而不是一份「没有失败」的空清单被误判成 Ready。
+if (!incomplete) process.stdout.write('__DSH_NATIVE_PROBE__' + JSON.stringify(failures) + '\n');
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +190,9 @@ impl NativeProbe {
     }
 
     fn has_platform_import_failure(&self) -> bool {
-        self.failures().iter().any(NativeProbeFailure::is_platform_import)
+        self.failures()
+            .iter()
+            .any(NativeProbeFailure::is_platform_import)
     }
 
     /// ABI 不匹配的包名（去重，保持探测顺序）
@@ -180,7 +213,7 @@ impl NativeProbe {
 /// 缺失时只按核心清单中的 optionalDependencies 动态构造安装参数，避免把某一台
 /// 机器的版本、平台或架构写死在桌面端。失败返回诊断错误，调用方不应继续启动
 /// 一个已知无法加载的 dsh 进程。
- pub(crate) async fn prepare_active_runtime(app_handle: &AppHandle) -> Result<(), String> {
+pub(crate) async fn prepare_active_runtime(app_handle: &AppHandle) -> Result<(), String> {
     if crate::service::core::active_source(app_handle) != CoreSource::App {
         log::debug!("Skipping core runtime repair for user-owned local core");
         return Ok(());
@@ -203,6 +236,27 @@ impl NativeProbe {
 
     link_required_plugins(app_handle, &core_root)?;
 
+    // 档案里的核心包残留必须在 dsh 启动前清掉：Node 从 profile 目录向上查找裸包时
+    // 会先命中它，核心自带的正确版本反而被跳过。清理失败不影响后续原生探测。
+    if let Err(e) = prune_stale_core_packages(app_handle, &core_root) {
+        log::warn!("{e}");
+    }
+
+    // 已核验过的运行时直接放行：跳过平台/架构探测与原生模块探测两个 node 子进程
+    // （issue #766）。指纹失配、戳缺失或不可解析时一律走原探测路径；指纹本身不完整
+    // （`None`）时既不比对也不落盘。
+    let stamp_key = native_probe_stamp_key(app_handle, &node, &core_root);
+    if let Some(key) = stamp_key.as_deref() {
+        if let Some((stored, platform, arch)) = read_native_probe_stamp(app_handle) {
+            if stored == key {
+                log::debug!(
+                    "Bundled core native dependencies are ready for {platform}:{arch} (cached)"
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let target = detect_node_target(&node, &core_root).await?;
     let mut probe = probe_native_modules(&node, &core_root).await;
     if probe.is_ready() {
@@ -211,6 +265,9 @@ impl NativeProbe {
             target.platform,
             target.arch
         );
+        if let Some(key) = stamp_key.as_deref() {
+            write_native_probe_stamp(app_handle, key, &target);
+        }
         return Ok(());
     }
     if let NativeProbe::Unknown(reason) = probe.clone() {
@@ -299,7 +356,180 @@ impl NativeProbe {
 
     // 4) 仍然无法加载：给出精确诊断（模块名 + ABI 差异），而不是让 dsh 在插件树加载
     //    阶段崩溃、前端只显示 HARNESS_NOT_OWNED。
-    Err(native_failure_diagnostic(probe.failures(), &node, &core_root))
+    Err(native_failure_diagnostic(
+        probe.failures(),
+        &node,
+        &core_root,
+    ))
+}
+
+/// 清除档案里被旧版 dsh 投影进来、版本又与当前核心不一致的核心包。
+///
+/// 既有清理（上游 `removeLinkProjections` 与桌面端 `remove_legacy_profile_module_fallback`）
+/// 都只认符号链接、且要求 `.dsh-module-fallback` 源目录仍然存在；用户「无视风险切换」
+/// 升级核心时档案不重建，残留因此在 Node 的逐级查找里长期抢先命中，症状与病因脱钩。
+fn prune_stale_core_packages(app_handle: &AppHandle, core_root: &Path) -> Result<(), String> {
+    let profile = crate::service::plugin::profile_dir(app_handle);
+    let Some(declared) = crate::service::plugin::declared_packages(app_handle) else {
+        log::warn!(
+            "CORE_PLUGIN_STALE_CORE_DECLARED_UNKNOWN: {} is unreadable, skipping cleanup",
+            profile.display()
+        );
+        return Ok(());
+    };
+    prune_stale_core_entries(&profile, &core_root.join("node_modules"), &declared)
+}
+
+/// 逐个比对档案与锚点的同名核心包版本，清除版本错配且档案未声明的条目。
+fn prune_stale_core_entries(
+    profile_root: &Path,
+    anchor_node_modules: &Path,
+    declared: &HashSet<String>,
+) -> Result<(), String> {
+    let profile_node_modules = profile_root.join("node_modules");
+    let scope = profile_node_modules.join(CORE_PACKAGE_SCOPE);
+    let Some(scope_root) = containment_root(&scope, profile_root) else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(&scope) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "CORE_PLUGIN_STALE_CORE_SCAN_FAILED: {}: {e}",
+                scope.display()
+            ))
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "CORE_PLUGIN_STALE_CORE_SCAN_FAILED: {}: {e}",
+                scope.display()
+            )
+        })?;
+        let name = format!(
+            "{CORE_PACKAGE_SCOPE}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        if !is_safe_package_name(&name) || declared.contains(&name) {
+            continue;
+        }
+        if !is_core_family_package(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry_is_contained(&path, &scope_root) {
+            log::warn!(
+                "CORE_PLUGIN_STALE_CORE_OUT_OF_SCOPE: {} escapes {}, skipping",
+                path.display(),
+                scope.display()
+            );
+            continue;
+        }
+        let Some(profile_version) = read_package_version(&path.join("package.json")) else {
+            continue;
+        };
+        let Some(anchor_version) =
+            read_package_version(&anchor_node_modules.join(&name).join("package.json"))
+        else {
+            continue;
+        };
+        if profile_version == anchor_version {
+            continue;
+        }
+        if let Err(e) = remove_core_package_residue(&path) {
+            log::warn!("{e}");
+            continue;
+        }
+        log::info!(
+            "CORE_PLUGIN_STALE_CORE_PRUNED: {name} {profile_version} (profile) != {anchor_version} (anchor), removed"
+        );
+    }
+    Ok(())
+}
+
+/// 解析 scope 的真实位置，并确认它既不是重定向入口、也仍留在档案目录内。
+///
+/// 包含关系以**档案目录**（而非 `node_modules`）为锚点：`node_modules` 自身若被
+/// 重定向成一个外部目录，以它为根就等于把「档案之外」当成了内部。返回 `None` 时
+/// 整轮跳过扫描——顺着重定向递归删除会把删除目标落到档案之外，这比「这一轮没
+/// 清干净」严重得多。
+fn containment_root(scope: &Path, profile_root: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(scope).ok()?;
+    let file_type = metadata.file_type();
+    #[cfg(windows)]
+    let is_link = file_type.is_symlink() || file_type.is_symlink_dir();
+    #[cfg(not(windows))]
+    let is_link = file_type.is_symlink();
+    if is_link {
+        log::warn!(
+            "CORE_PLUGIN_STALE_CORE_SCOPE_REDIRECTED: {} is a link, skipping cleanup",
+            scope.display()
+        );
+        return None;
+    }
+
+    let root = std::fs::canonicalize(profile_root).ok()?;
+    let real = std::fs::canonicalize(scope).ok()?;
+    if !real.starts_with(&root) {
+        log::warn!(
+            "CORE_PLUGIN_STALE_CORE_SCOPE_ESCAPED: {} resolves to {}, skipping cleanup",
+            scope.display(),
+            real.display()
+        );
+        return None;
+    }
+    Some(real)
+}
+
+/// 符号链接/junction 条目只需删除入口本身，不会触及目标；真实目录必须解析后仍在 scope 内。
+fn entry_is_contained(path: &Path, scope_root: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let file_type = metadata.file_type();
+    #[cfg(windows)]
+    if file_type.is_symlink() || file_type.is_symlink_dir() {
+        return true;
+    }
+    #[cfg(not(windows))]
+    if file_type.is_symlink() {
+        return true;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => real.starts_with(scope_root),
+        Err(_) => false,
+    }
+}
+
+fn remove_core_package_residue(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "CORE_PLUGIN_STALE_CORE_REMOVE_FAILED: {}: {e}",
+            path.display()
+        )
+    })?;
+    let file_type = metadata.file_type();
+    #[cfg(windows)]
+    let is_link = file_type.is_symlink() || file_type.is_symlink_dir();
+    #[cfg(not(windows))]
+    let is_link = file_type.is_symlink();
+    if is_link {
+        return remove_link_only(path);
+    }
+    let result = if file_type.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|e| {
+        format!(
+            "CORE_PLUGIN_STALE_CORE_REMOVE_FAILED: {}: {e}",
+            path.display()
+        )
+    })
 }
 
 /// 从活动 profile 与应用内置清单收集需要在核心根下解析的包，并逐个建立入口。
@@ -313,15 +543,21 @@ fn link_required_plugins(app_handle: &AppHandle, core_root: &Path) -> Result<(),
     })?;
 
     let presets = crate::service::plugin::load_presets(app_handle);
-    let internal_ids: HashSet<String> = presets
+    // 被核心吸收的内置插件（上限已被超越）不再链接到核心根：与启动退役、自愈的
+    // 判定同源，避免为已卸载插件留下悬空入口。
+    let core_version = crate::service::core::active_version(app_handle);
+    let internal: Vec<_> = presets
         .iter()
-        .filter(|preset| preset.internal)
+        .filter(|preset| preset.internal && !preset.unsupported_on(core_version.as_deref()))
+        .collect();
+    let internal_ids: HashSet<String> = internal
+        .iter()
         .map(|preset| crate::service::plugin::installed_name(preset).to_string())
         .collect();
 
     // 内置插件必须始终从当前安装包资源（debug 时为 workspace 源码）取源，不能信任
     // profile 中旧版本遗留的 link 路径。这样应用升级后旧 link 会被精确替换。
-    for preset in presets.iter().filter(|preset| preset.internal) {
+    for preset in internal {
         let name = crate::service::plugin::installed_name(preset);
         let Some(source) = crate::service::plugin::bundled_plugin_dir(app_handle, &preset.id)
         else {
@@ -362,6 +598,14 @@ fn link_required_plugins(app_handle: &AppHandle, core_root: &Path) -> Result<(),
         }
         let source = profile.join("node_modules").join(&name);
         if !source.join("package.json").is_file() {
+            if read_package_name(&core_node_modules.join(&name).join("package.json"))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(name.as_str())
+            {
+                continue;
+            }
             log::warn!(
                 "CORE_PLUGIN_PROFILE_ENTRY_MISSING: {} is referenced by {}, source {} is unavailable",
                 name,
@@ -409,7 +653,11 @@ fn ensure_package_link(name: &str, source: &Path, node_modules: &Path) -> Result
     let existing = match std::fs::symlink_metadata(&destination) {
         Ok(metadata) => Some(metadata),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("CORE_PLUGIN_DESTINATION_STAT_FAILED: {destination:?}: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "CORE_PLUGIN_DESTINATION_STAT_FAILED: {destination:?}: {e}"
+            ))
+        }
     };
     if let Some(metadata) = existing {
         if !metadata.file_type().is_symlink() {
@@ -454,7 +702,10 @@ fn ensure_package_link(name: &str, source: &Path, node_modules: &Path) -> Result
 /// 校验并创建 scope 目录；目录本身不能是链接，防止目的地逃逸核心根。
 fn ensure_non_link_directory(path: &Path, root: &Path) -> Result<(), String> {
     if !path.starts_with(root) {
-        return Err(format!("CORE_PLUGIN_DESTINATION_ESCAPE: {}", path.display()));
+        return Err(format!(
+            "CORE_PLUGIN_DESTINATION_ESCAPE: {}",
+            path.display()
+        ));
     }
     let relative = path.strip_prefix(root).unwrap_or(Path::new("."));
     let mut current = root.to_path_buf();
@@ -468,13 +719,26 @@ fn ensure_non_link_directory(path: &Path, root: &Path) -> Result<(), String> {
                 ));
             }
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(format!("CORE_PLUGIN_DESTINATION_PARENT_INVALID: {}", current.display())),
+            Ok(_) => {
+                return Err(format!(
+                    "CORE_PLUGIN_DESTINATION_PARENT_INVALID: {}",
+                    current.display()
+                ))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir(&current).map_err(|e| {
-                    format!("CORE_PLUGIN_DESTINATION_PARENT_CREATE_FAILED: {}: {e}", current.display())
+                    format!(
+                        "CORE_PLUGIN_DESTINATION_PARENT_CREATE_FAILED: {}: {e}",
+                        current.display()
+                    )
                 })?;
             }
-            Err(e) => return Err(format!("CORE_PLUGIN_DESTINATION_PARENT_STAT_FAILED: {}: {e}", current.display())),
+            Err(e) => {
+                return Err(format!(
+                    "CORE_PLUGIN_DESTINATION_PARENT_STAT_FAILED: {}: {e}",
+                    current.display()
+                ))
+            }
         }
     }
     Ok(())
@@ -489,12 +753,12 @@ fn remove_link_only(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(source, destination)
 }
 
 #[cfg(windows)]
-fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
     // 优先创建真正的符号链接：仅在启用 Developer Mode 或具备
     // SeCreateSymbolicLinkPrivilege（管理员）时才可用；普通用户（release 版
     // 默认非管理员启动）会得到 ERROR_PRIVILEGE_NOT_HELD（os error 1314），
@@ -535,16 +799,17 @@ fn create_directory_junction(source: &Path, destination: &Path) -> std::io::Resu
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
 
     // junction 目标必须是 NT 命名空间内的绝对路径：盘符路径映射为
     // `\??\G:\...`，UNC 路径映射为 `\??\UNC\server\share\...`。
     // dunce::simplified 去掉 canonicalize 产生的 verbatim（`\\?\`）前缀，
     // 避免双重前缀导致内核解析失败。
     let simplified = dunce::simplified(source);
-    let print_name = simplified.to_string_lossy();
+    // D-U5-3：scoped 包路径的正斜杠须在写入 NT junction 名称前归一化。
+    let print_name = simplified.to_string_lossy().replace('/', "\\");
     let substitute_name = if print_name.starts_with("\\\\") {
         format!(r"\??\UNC\{}", print_name.trim_start_matches('\\'))
     } else {
@@ -662,7 +927,27 @@ fn is_safe_package_name(name: &str) -> bool {
     if parts.len() == 1 {
         return valid_package_component(parts[0]);
     }
-    parts.len() == 2 && parts[0].starts_with('@') && valid_package_component(parts[0]) && valid_package_component(parts[1])
+    parts.len() == 2
+        && parts[0].starts_with('@')
+        && valid_package_component(parts[0])
+        && valid_package_component(parts[1])
+}
+
+/// 是否属于核心家族（`@deepseek-ai/dsh` 或 `@deepseek-ai/dsh-*`）。
+///
+/// `dshmarket` 这类第三方插件虽在同一 scope 下，但既不是核心自带包也不是要清理的
+/// 残留，必须排除；共享框架库（cordis、cosmokit、schemastery 等）同理由前缀天然排除。
+fn is_core_family_package(name: &str) -> bool {
+    let Some(package) = name
+        .strip_prefix(CORE_PACKAGE_SCOPE)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    package == CORE_PACKAGE_PREFIX
+        || package
+            .strip_prefix(CORE_PACKAGE_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('-'))
 }
 
 fn valid_package_component(value: &str) -> bool {
@@ -675,19 +960,192 @@ fn valid_package_component(value: &str) -> bool {
 }
 
 fn read_package_name(path: &Path) -> Result<Option<String>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("CORE_PLUGIN_PACKAGE_MANIFEST_READ_FAILED: {}: {e}", path.display()))?;
-    let value = serde_json::from_str::<serde_json::Value>(&raw)
-        .map_err(|e| format!("CORE_PLUGIN_PACKAGE_MANIFEST_INVALID: {}: {e}", path.display()))?;
-    Ok(value.get("name").and_then(|value| value.as_str()).map(str::to_owned))
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "CORE_PLUGIN_PACKAGE_MANIFEST_READ_FAILED: {}: {e}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+        format!(
+            "CORE_PLUGIN_PACKAGE_MANIFEST_INVALID: {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(value
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned))
+}
+
+fn read_package_version(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    value
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+/// 结论戳文件路径：放在依赖根下。清空依赖目录（等价于重新装配）会一并清掉它。
+fn native_probe_stamp_path(app_handle: &AppHandle) -> PathBuf {
+    crate::config::get_base_dir(app_handle).join(NATIVE_PROBE_STAMP_FILE)
+}
+
+/// 原生依赖探测的输入指纹：node 身份 + 核心目录与版本 + `node_modules` 前两层条目
+/// （含原生包自带的产物目录）。
+///
+/// 全部是廉价的元数据读取（不启动子进程、不递归进包内部）。取「前两层」而不是只取
+/// 顶层，是为了让 scope 包（`@scope/name`）的增删也能被感知；额外记录产物目录的修改
+/// 时间，是因为原地重写 `.node` 只改 `build/Release` 这类目录、不改包目录本身。
+///
+/// 任何让指纹**不完整**的情况（目录读不到、条目数超出上限而只能截断）都返回 `None`：
+/// 截断过的指纹可能刚好和上次的完整指纹撞上，反而跳过一次本该做的探测。宁可不缓存。
+fn native_probe_stamp_key(app_handle: &AppHandle, node: &Path, core_root: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let mut key = String::new();
+    let _ = write!(key, "node={}", node.display());
+    if let Ok(meta) = std::fs::metadata(node) {
+        let _ = write!(key, ":{}", meta.len());
+        let _ = write!(key, ":{}", file_modified_nanos(&meta));
+    }
+    let _ = write!(
+        key,
+        "\ncore={}\nversion={}",
+        core_root.display(),
+        crate::service::core::active_version(app_handle).unwrap_or_default()
+    );
+
+    let mut entries: Vec<String> = Vec::new();
+    collect_probe_stamp_entries(&core_root.join("node_modules"), &mut entries)?;
+    if entries.len() > NATIVE_PROBE_STAMP_MAX_ENTRIES {
+        return None;
+    }
+    entries.sort_unstable();
+    for entry in entries {
+        key.push('\n');
+        key.push_str(&entry);
+    }
+    Some(key)
+}
+
+/// 原生包自带的产物目录，与 `NATIVE_PROBE_SCRIPT` 的候选判定同源
+const NATIVE_ARTIFACT_DIRS: [&str; 4] = ["build/Release", "build/Debug", "prebuilds", "prebuilt"];
+
+/// 采集指纹条目：`node_modules` 顶层（`.bin` 跳过，`.pnpm` 只记自身）与 scope 目录的
+/// 下一层，每项再带上其原生包产物目录。任一目录读不到即返回 `None` —— 不完整的指纹
+/// 不能用来断言「和上次一样」，少记一项就可能漏掉一次真实变化。
+fn collect_probe_stamp_entries(dir: &Path, out: &mut Vec<String>) -> Option<()> {
+    let reader = std::fs::read_dir(dir).ok()?;
+    for entry in reader {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == ".bin" {
+            continue;
+        }
+        push_probe_stamp_entry(&entry.path(), name, out);
+        if !name.starts_with('@') {
+            continue;
+        }
+        let scope = std::fs::read_dir(entry.path()).ok()?;
+        for inner in scope {
+            let inner = inner.ok()?;
+            let inner_name = inner.file_name();
+            let Some(inner_name) = inner_name.to_str() else {
+                continue;
+            };
+            push_probe_stamp_entry(&inner.path(), &format!("{name}/{inner_name}"), out);
+        }
+    }
+    Some(())
+}
+
+/// 记录一个包的目录时间与其产物目录时间。产物目录不存在时只留包目录一项，
+/// 避免为绝大多数非原生包平白拉长指纹。
+fn push_probe_stamp_entry(dir: &Path, label: &str, out: &mut Vec<String>) {
+    out.push(format!("{label}={}", path_modified_nanos(dir)));
+    for relative in NATIVE_ARTIFACT_DIRS {
+        let artifact = dir.join(relative);
+        if artifact.is_dir() {
+            out.push(format!(
+                "{label}/{relative}={}",
+                path_modified_nanos(&artifact)
+            ));
+        }
+    }
+}
+
+fn path_modified_nanos(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => file_modified_nanos(&meta),
+        Err(_) => "-".to_string(),
+    }
+}
+
+fn file_modified_nanos(meta: &std::fs::Metadata) -> String {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos().to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// 读取结论戳；文件缺失、不可解析或字段不全时返回 None（视为无戳）
+fn read_native_probe_stamp(app_handle: &AppHandle) -> Option<(String, String, String)> {
+    let raw = std::fs::read_to_string(native_probe_stamp_path(app_handle)).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    Some((
+        value.get("key")?.as_str()?.to_string(),
+        value.get("platform")?.as_str()?.to_string(),
+        value.get("arch")?.as_str()?.to_string(),
+    ))
+}
+
+/// 写结论戳：只在探测确认 Ready 后调用。写失败不影响启动，只降级为「下次仍探测」。
+fn write_native_probe_stamp(app_handle: &AppHandle, key: &str, target: &NodeTarget) {
+    let path = native_probe_stamp_path(app_handle);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            log::debug!(
+                "CORE_NATIVE_PROBE_STAMP_WRITE_FAILED: {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let value = serde_json::json!({
+        "key": key,
+        "platform": &target.platform,
+        "arch": &target.arch,
+    });
+    if let Err(error) = std::fs::write(&path, value.to_string()) {
+        log::debug!(
+            "CORE_NATIVE_PROBE_STAMP_WRITE_FAILED: {}: {error}",
+            path.display()
+        );
+    }
 }
 
 async fn detect_node_target(node: &Path, core_root: &Path) -> Result<NodeTarget, String> {
     let node = node.to_path_buf();
     let core_root = core_root.to_path_buf();
-    let output = tokio::task::spawn_blocking(move || run_command(&node, &["--input-type=module".into(), "-e".into(), NODE_PROBE_SCRIPT.into()], &core_root))
-        .await
-        .map_err(|e| format!("CORE_NODE_PLATFORM_PROBE_FAILED: {e}"))??;
+    let output = tokio::task::spawn_blocking(move || {
+        run_command(
+            &node,
+            &[
+                "--input-type=module".into(),
+                "-e".into(),
+                NODE_PROBE_SCRIPT.into(),
+            ],
+            &core_root,
+        )
+    })
+    .await
+    .map_err(|e| format!("CORE_NODE_PLATFORM_PROBE_FAILED: {e}"))??;
     if !output.status.success() {
         return Err(format!(
             "CORE_NODE_PLATFORM_PROBE_FAILED: {}",
@@ -699,11 +1157,17 @@ async fn detect_node_target(node: &Path, core_root: &Path) -> Result<NodeTarget,
         return Err(format!("CORE_NODE_PLATFORM_UNSUPPORTED: {value}"));
     };
     let supported_platform = matches!(platform, "darwin" | "linux" | "win32");
-    let supported_arch = matches!(arch, "x64" | "arm64" | "ia32" | "arm" | "ppc64" | "riscv64" | "s390x" | "loong64");
+    let supported_arch = matches!(
+        arch,
+        "x64" | "arm64" | "ia32" | "arm" | "ppc64" | "riscv64" | "s390x" | "loong64"
+    );
     if !supported_platform || !supported_arch {
         return Err(format!("CORE_NODE_PLATFORM_UNSUPPORTED: {value}"));
     }
-    Ok(NodeTarget { platform: platform.to_string(), arch: arch.to_string() })
+    Ok(NodeTarget {
+        platform: platform.to_string(),
+        arch: arch.to_string(),
+    })
 }
 
 /// 用指定运行时执行原生模块探测脚本，返回结构化结论。
@@ -717,7 +1181,13 @@ async fn probe_native_modules(node: &Path, core_root: &Path) -> NativeProbe {
             OsString::from("-e"),
             OsString::from(NATIVE_PROBE_SCRIPT),
         ];
-        run_process_with_timeout(&program, &args, &core_root, NATIVE_PROBE_TIMEOUT, "native probe")
+        run_process_with_timeout(
+            &program,
+            &args,
+            &core_root,
+            NATIVE_PROBE_TIMEOUT,
+            "native probe",
+        )
     })
     .await;
 
@@ -797,7 +1267,11 @@ fn is_bundled_runtime_node(node: &Path, app_handle: &AppHandle) -> bool {
 }
 
 /// 生成原生模块加载失败的诊断信息：ABI 不匹配单独给出可读结论，其余按原样列出。
-fn native_failure_diagnostic(failures: &[NativeProbeFailure], node: &Path, core_root: &Path) -> String {
+fn native_failure_diagnostic(
+    failures: &[NativeProbeFailure],
+    node: &Path,
+    core_root: &Path,
+) -> String {
     if failures.is_empty() {
         return format!(
             "CORE_NATIVE_DEPENDENCY_REPAIR_FAILED: native modules could not be verified in {}",
@@ -827,7 +1301,11 @@ fn native_failure_diagnostic(failures: &[NativeProbeFailure], node: &Path, core_
         core_root.display(),
         failures
             .iter()
-            .map(|failure| format!("{}: {}", failure.name, collapse_whitespace(&failure.message)))
+            .map(|failure| format!(
+                "{}: {}",
+                failure.name,
+                collapse_whitespace(&failure.message)
+            ))
             .collect::<Vec<_>>()
             .join("; ")
     )
@@ -855,7 +1333,13 @@ async fn rebuild_native_packages(
         let (program, mut args) = npm_command(&node);
         args.push(OsString::from("rebuild"));
         args.extend(packages.into_iter().map(OsString::from));
-        run_process_with_timeout(&program, &args, &core_root, NATIVE_REBUILD_TIMEOUT, "npm rebuild")
+        run_process_with_timeout(
+            &program,
+            &args,
+            &core_root,
+            NATIVE_REBUILD_TIMEOUT,
+            "npm rebuild",
+        )
     })
     .await
     .map_err(|e| format!("CORE_NATIVE_REBUILD_FAILED: {e}"))??;
@@ -889,9 +1373,21 @@ fn npm_cli_path_for(node: &Path) -> Option<PathBuf> {
     // 官方发行版：<node>/bin/node + <node>/lib/node_modules/npm/bin/npm-cli.js
     // 少数布局把 lib 放在 node 目录之外，再补一个上级 lib 候选。
     let candidates = [
-        dir.join("node_modules").join("npm").join("bin").join("npm-cli.js"),
-        dir.join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js"),
-        dir.join("..").join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js"),
+        dir.join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js"),
+        dir.join("lib")
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js"),
+        dir.join("..")
+            .join("lib")
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js"),
     ];
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
@@ -957,12 +1453,20 @@ fn read_optional_dependencies(path: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-async fn install_native_packages(core_root: &Path, target: &NodeTarget, packages: &[String]) -> Result<(), String> {
+async fn install_native_packages(
+    core_root: &Path,
+    target: &NodeTarget,
+    packages: &[String],
+) -> Result<(), String> {
     let core_root = core_root.to_path_buf();
     let target = target.clone();
     let packages = packages.to_vec();
     let result = tokio::task::spawn_blocking(move || {
-        let program = if cfg!(windows) { OsString::from("npm.cmd") } else { OsString::from("npm") };
+        let program = if cfg!(windows) {
+            OsString::from("npm.cmd")
+        } else {
+            OsString::from("npm")
+        };
         let mut args = vec![
             OsString::from("install"),
             OsString::from("--no-save"),
@@ -972,7 +1476,13 @@ async fn install_native_packages(core_root: &Path, target: &NodeTarget, packages
             OsString::from(format!("--cpu={}", target.arch)),
         ];
         args.extend(packages.into_iter().map(OsString::from));
-        run_process_with_timeout(&program, &args, &core_root, NATIVE_REPAIR_TIMEOUT, "npm install")
+        run_process_with_timeout(
+            &program,
+            &args,
+            &core_root,
+            NATIVE_REPAIR_TIMEOUT,
+            "npm install",
+        )
     })
     .await
     .map_err(|e| format!("CORE_NATIVE_DEPENDENCY_REPAIR_FAILED: {e}"))??;
@@ -986,15 +1496,25 @@ async fn install_native_packages(core_root: &Path, target: &NodeTarget, packages
     Ok(())
 }
 
-fn run_command(program: &Path, args: &[OsString], cwd: &Path) -> Result<std::process::Output, String> {
+fn run_command(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+) -> Result<std::process::Output, String> {
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    command.output().map_err(|e| format!("CORE_RUNTIME_COMMAND_FAILED: {}: {e}", program.display()))
+    command
+        .output()
+        .map_err(|e| format!("CORE_RUNTIME_COMMAND_FAILED: {}: {e}", program.display()))
 }
 
 fn run_process_with_timeout(
@@ -1005,7 +1525,11 @@ fn run_process_with_timeout(
     label: &str,
 ) -> Result<std::process::Output, String> {
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1028,14 +1552,23 @@ fn run_process_with_timeout(
     });
     let started = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("CORE_NATIVE_DEPENDENCY_REPAIR_WAIT_FAILED: {e}"))? {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("CORE_NATIVE_DEPENDENCY_REPAIR_WAIT_FAILED: {e}"))?
+        {
             let stdout = stdout_thread.join().unwrap_or_default();
             let stderr = stderr_thread.join().unwrap_or_default();
-            return Ok(std::process::Output { status, stdout, stderr });
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
-            let status = child.wait().map_err(|e| format!("CORE_NATIVE_DEPENDENCY_REPAIR_KILL_FAILED: {e}"))?;
+            let status = child
+                .wait()
+                .map_err(|e| format!("CORE_NATIVE_DEPENDENCY_REPAIR_KILL_FAILED: {e}"))?;
             // 排空管道，避免子进程因写满缓冲而挂起；输出在超时路径不作分析。
             let _ = stdout_thread.join().unwrap_or_default();
             let _ = stderr_thread.join().unwrap_or_default();
@@ -1053,7 +1586,15 @@ fn command_output_tail(output: &std::process::Output) -> String {
     if value.trim().is_empty() {
         value = String::from_utf8_lossy(&output.stdout).to_string();
     }
-    value.trim().chars().rev().take(2000).collect::<String>().chars().rev().collect()
+    value
+        .trim()
+        .chars()
+        .rev()
+        .take(2000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1089,13 +1630,19 @@ mod tests {
         .unwrap();
         let plan = native_package_plan(
             &root,
-            &NodeTarget { platform: "darwin".into(), arch: "arm64".into() },
+            &NodeTarget {
+                platform: "darwin".into(),
+                arch: "arm64".into(),
+            },
         );
-        assert_eq!(plan, vec![
-            "@img/sharp-darwin-arm64@0.9.0",
-            "@img/sharp-libvips-darwin-arm64@1.2.0",
-            "@koromix/koffi-darwin-arm64@8.7.0",
-        ]);
+        assert_eq!(
+            plan,
+            vec![
+                "@img/sharp-darwin-arm64@0.9.0",
+                "@img/sharp-libvips-darwin-arm64@1.2.0",
+                "@koromix/koffi-darwin-arm64@8.7.0",
+            ]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1117,7 +1664,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("link must be created without privileges: {e}"));
 
         let metadata = std::fs::symlink_metadata(&destination).unwrap();
-        assert!(metadata.file_type().is_symlink(), "junction must be treated as a link");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "junction must be treated as a link"
+        );
         let resolved = std::fs::read_link(&destination).unwrap();
         assert_eq!(resolved.canonicalize().unwrap(), canonical_source);
 
@@ -1161,7 +1711,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("junction must be creatable without privileges: {e}"));
 
         let metadata = std::fs::symlink_metadata(&destination).unwrap();
-        assert!(metadata.file_type().is_symlink(), "junction must be treated as a link");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "junction must be treated as a link"
+        );
         assert_eq!(
             std::fs::canonicalize(&destination).unwrap(),
             canonical_source,
@@ -1192,6 +1745,44 @@ mod tests {
         assert!(canonical_source.is_dir());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// scoped 包名（`@scope/name`）经 `PathBuf::join` 产生含正斜杠的混合路径，
+    /// junction 的 NT substitute name 必须使用反斜杠才能被内核解析（D-U5-3）。
+    #[cfg(windows)]
+    #[test]
+    fn create_directory_junction_normalizes_scoped_source_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dsh-junction-scoped-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("bundled").join("@scope/name");
+        let destination = root
+            .join("profile")
+            .join("node_modules")
+            .join("@scope/name");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let payload = r#"{"name":"@scope/name"}"#;
+        std::fs::write(source.join("package.json"), payload).unwrap();
+        let expected = source.canonicalize().unwrap();
+        assert!(source.to_string_lossy().contains("@scope/name"));
+
+        create_directory_junction(&source, &destination).unwrap();
+        let resolved = destination.canonicalize();
+        let content = std::fs::read_to_string(destination.join("package.json"));
+        remove_link_only(&destination).unwrap();
+        let source_retained = source.join("package.json").is_file();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(resolved.unwrap(), expected);
+        assert_eq!(content.unwrap(), payload);
+        assert!(source_retained);
     }
 
     /// 探测脚本必须写出 Rust 侧约定的标记行，并覆盖 ABI 敏感包与 sharp/koffi 两条路径。
@@ -1273,7 +1864,10 @@ mod tests {
         assert!(diagnostic.starts_with("CORE_NATIVE_ABI_MISMATCH:"));
         assert!(diagnostic.contains("fs-ext"));
         assert!(diagnostic.contains("NODE_MODULE_VERSION 137"));
-        assert!(!diagnostic.contains('\n'), "diagnostic must be a single line");
+        assert!(
+            !diagnostic.contains('\n'),
+            "diagnostic must be a single line"
+        );
         assert!(diagnostic.contains("install the Node.js version the core was built with"));
     }
 
@@ -1285,7 +1879,8 @@ mod tests {
             message: "Cannot find module 'sharp'".into(),
             abi: false,
         }];
-        let diagnostic = native_failure_diagnostic(&failures, Path::new("node"), Path::new("C:\\core"));
+        let diagnostic =
+            native_failure_diagnostic(&failures, Path::new("node"), Path::new("C:\\core"));
         assert!(diagnostic.starts_with("CORE_NATIVE_DEPENDENCY_REPAIR_FAILED:"));
         assert!(diagnostic.contains("sharp: Cannot find module 'sharp'"));
     }
@@ -1302,7 +1897,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let bin_dir = root.join("node-v22.22.0-win-x64");
         std::fs::create_dir_all(bin_dir.join("node_modules").join("npm").join("bin")).unwrap();
-        let npm_cli = bin_dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
+        let npm_cli = bin_dir
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js");
         std::fs::write(&npm_cli, "// npm").unwrap();
         let node = bin_dir.join("node.exe");
 
@@ -1315,7 +1914,7 @@ mod tests {
         let bare = root.join("bare").join("node.exe");
         std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
         let (program, args) = npm_command(&bare);
-        assert!(program == OsString::from("npm.cmd") || program == OsString::from("npm"));
+        assert!(program == "npm.cmd" || program == "npm");
         assert!(args.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1351,7 +1950,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         // 空核心目录：sharp/koffi 解析失败但属于非 ABI 失败，必须能结构化解析。
-        let failures = parse_native_probe_failures(&stdout).expect("probe must emit the marker line");
+        let failures =
+            parse_native_probe_failures(&stdout).expect("probe must emit the marker line");
         assert!(failures.iter().all(|failure| !failure.abi));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1369,7 +1969,11 @@ mod tests {
         let pkg = root.join("node_modules").join("fs-ext");
         std::fs::create_dir_all(pkg.join("build").join("Release")).unwrap();
         std::fs::write(pkg.join("binding.gyp"), "{}").unwrap();
-        std::fs::write(pkg.join("build").join("Release").join("fs_ext.node"), "stub").unwrap();
+        std::fs::write(
+            pkg.join("build").join("Release").join("fs_ext.node"),
+            "stub",
+        )
+        .unwrap();
         std::fs::write(
             pkg.join("package.json"),
             r#"{"name":"fs-ext","main":"index.js"}"#,
@@ -1393,10 +1997,13 @@ mod tests {
             command.creation_flags(0x08000000);
         }
         let output = command.output().expect("node must be runnable");
-        let failures =
-            parse_native_probe_failures(&String::from_utf8_lossy(&output.stdout)).expect("marker line");
+        let failures = parse_native_probe_failures(&String::from_utf8_lossy(&output.stdout))
+            .expect("marker line");
         let probe = NativeProbe::Failed(failures);
-        assert!(probe.has_abi_mismatch(), "fs-ext must be reported as an ABI mismatch");
+        assert!(
+            probe.has_abi_mismatch(),
+            "fs-ext must be reported as an ABI mismatch"
+        );
         assert_eq!(probe.abi_packages(), vec!["fs-ext".to_string()]);
         // 诊断必须点名模块，供前端直接展示（而不是让用户只看到 HARNESS_NOT_OWNED）
         let diagnostic = native_failure_diagnostic(probe.failures(), &node, &root);
@@ -1404,5 +2011,222 @@ mod tests {
         assert!(diagnostic.contains("fs-ext"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 档案里未被声明、且版本与安装锚点不一致的核心包必须被清掉——这正是
+    /// 「未能保存设置，请重试。」的成因（旧世代 dsh-settings 抢在核心之前被解析）。
+    #[test]
+    fn stale_undeclared_core_package_is_pruned() {
+        let root = std::env::temp_dir().join(format!("dsh-stale-core-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile_modules = root.join("profiles/tauri/node_modules");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+
+        write_package_version(&profile_modules, "dsh-settings", "0.1.5-rc.2");
+        write_package_version(&anchor_modules, "dsh-settings", "0.1.7-rc.2");
+
+        prune_stale_core_entries(
+            &root.join("profiles/tauri"),
+            &anchor_modules,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(
+            !profile_modules
+                .join("@deepseek-ai/dsh-settings/package.json")
+                .exists(),
+            "mismatched undeclared core package must be removed from the profile"
+        );
+        assert!(
+            anchor_modules
+                .join("@deepseek-ai/dsh-settings/package.json")
+                .is_file(),
+            "the anchor copy must never be touched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 版本与锚点一致的核心包是 pnpm hoisted 平铺的合法传递依赖，必须原样保留；
+    /// 档案自己声明过的核心包同样不能动（哪怕是版本不一致）。
+    #[test]
+    fn matching_or_declared_core_packages_are_kept() {
+        let root = std::env::temp_dir().join(format!("dsh-stale-core-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile_modules = root.join("profiles/tauri/node_modules");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+
+        write_package_version(&profile_modules, "dsh-settings", "0.1.7-rc.2");
+        write_package_version(&anchor_modules, "dsh-settings", "0.1.7-rc.2");
+        write_package_version(&profile_modules, "dsh-tools", "0.1.5-rc.2");
+        write_package_version(&anchor_modules, "dsh-tools", "0.1.7-rc.2");
+        // 非核心 scope 与无 package.json 的条目都不在判定范围内。
+        write_package_version(&root.join("other"), "dsh-settings", "0.1.5-rc.2");
+        std::fs::create_dir_all(profile_modules.join("@deepseek-ai/dsh-orphan")).unwrap();
+
+        let declared = HashSet::from(["@deepseek-ai/dsh-tools".to_string()]);
+        prune_stale_core_entries(&root.join("profiles/tauri"), &anchor_modules, &declared).unwrap();
+
+        assert!(
+            profile_modules
+                .join("@deepseek-ai/dsh-settings/package.json")
+                .is_file(),
+            "version-matching core package must be kept"
+        );
+        assert!(
+            profile_modules
+                .join("@deepseek-ai/dsh-tools/package.json")
+                .is_file(),
+            "declared core package must be kept"
+        );
+        assert!(
+            profile_modules.join("@deepseek-ai/dsh-orphan").is_dir(),
+            "entry without a readable version must be left alone"
+        );
+        assert!(
+            root.join("other/@deepseek-ai/dsh-settings/package.json")
+                .is_file(),
+            "only the @deepseek-ai scope is inspected"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 同 scope 下的共享框架库（插件可合法锁版本）与第三方插件 `dshmarket` 都不能
+    /// 按「版本错配」误删，否则会直接弄坏插件。
+    #[test]
+    fn shared_framework_libraries_and_third_party_plugins_are_kept() {
+        let root =
+            std::env::temp_dir().join(format!("dsh-stale-core-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile_modules = root.join("profiles/tauri/node_modules");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+
+        for name in ["schemastery", "cosmokit", "cordis", "dshmarket"] {
+            write_package_version(&profile_modules, name, "0.1.5-rc.2");
+            write_package_version(&anchor_modules, name, "0.1.7-rc.2");
+        }
+
+        prune_stale_core_entries(
+            &root.join("profiles/tauri"),
+            &anchor_modules,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        for name in ["schemastery", "cosmokit", "cordis", "dshmarket"] {
+            assert!(
+                profile_modules
+                    .join(format!("@deepseek-ai/{name}/package.json"))
+                    .is_file(),
+                "{name} is outside the core family and must be kept"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 符号链接形态（残留在 `.dsh-module-fallback` 已消失时正是这种）也必须能删掉，
+    /// 且只删入口、不动源目录。
+    #[cfg(unix)]
+    #[test]
+    fn stale_core_package_symlink_is_removed_without_touching_source() {
+        let root = std::env::temp_dir().join(format!("dsh-stale-core-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile_modules = root.join("profiles/tauri/node_modules");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+        let source = root.join("fallback/@deepseek-ai/dsh-settings");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("package.json"), r#"{"version":"0.1.5-rc.2"}"#).unwrap();
+        std::fs::create_dir_all(profile_modules.join("@deepseek-ai")).unwrap();
+        std::os::unix::fs::symlink(&source, profile_modules.join("@deepseek-ai/dsh-settings"))
+            .unwrap();
+        write_package_version(&anchor_modules, "dsh-settings", "0.1.7-rc.2");
+
+        prune_stale_core_entries(
+            &root.join("profiles/tauri"),
+            &anchor_modules,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(
+            !profile_modules.join("@deepseek-ai/dsh-settings").exists(),
+            "stale link must be removed"
+        );
+        assert!(
+            source.join("package.json").is_file(),
+            "the link source must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// scope 目录本身被重定向时，宁可整轮不清，也不能顺着链接删到档案之外。
+    #[cfg(unix)]
+    #[test]
+    fn redirected_scope_is_skipped_entirely() {
+        let root =
+            std::env::temp_dir().join(format!("dsh-stale-core-redirect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile_modules = root.join("profiles/tauri/node_modules");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+        let outside = root.join("outside/@deepseek-ai");
+        write_package_version(&root.join("outside"), "dsh-settings", "0.1.5-rc.2");
+        write_package_version(&anchor_modules, "dsh-settings", "0.1.7-rc.2");
+        std::fs::create_dir_all(&profile_modules).unwrap();
+        std::os::unix::fs::symlink(&outside, profile_modules.join("@deepseek-ai")).unwrap();
+
+        prune_stale_core_entries(
+            &root.join("profiles/tauri"),
+            &anchor_modules,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(
+            outside.join("dsh-settings/package.json").is_file(),
+            "a redirected scope must never be pruned through"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `node_modules` 自身被重定向成一个外部目录时，包含锚点必须是档案目录，
+    /// 否则外部目录会被当成「档案内部」而遭删除。
+    #[cfg(unix)]
+    #[test]
+    fn redirected_node_modules_is_skipped_entirely() {
+        let root = std::env::temp_dir().join(format!("dsh-stale-core-nm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("profiles/tauri");
+        let anchor_modules = root.join("dependencies/dsh/node_modules");
+        let outside_modules = root.join("outside/node_modules");
+        write_package_version(&outside_modules, "dsh-settings", "0.1.5-rc.2");
+        write_package_version(&anchor_modules, "dsh-settings", "0.1.7-rc.2");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::os::unix::fs::symlink(&outside_modules, profile.join("node_modules")).unwrap();
+
+        prune_stale_core_entries(&profile, &anchor_modules, &HashSet::new()).unwrap();
+
+        assert!(
+            outside_modules
+                .join("@deepseek-ai/dsh-settings/package.json")
+                .is_file(),
+            "an external node_modules must never be pruned through"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_package_version(modules: &Path, name: &str, version: &str) {
+        let dir = modules.join("@deepseek-ai").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"@deepseek-ai/{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
     }
 }

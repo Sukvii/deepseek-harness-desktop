@@ -1,121 +1,138 @@
-/* eslint-disable react/dom-no-unsafe-iframe-sandbox */
-import { CircleExclamation } from '@gravity-ui/icons'
-import { useRef } from 'react'
-import { useTranslation } from 'react-i18next'
+import type { DshShortcutRow, DshViewCommand } from '@/hooks/use-dsh-shortcuts'
+import { useWatch } from '@reause/core'
+import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import { type } from '@tauri-apps/plugin-os'
+import { useRef, useState } from 'react'
 import { If } from 'react-if-lite'
 import { useStore } from 'valtio-define'
-import { PluginRecovery } from '@/components/plugin-recovery'
-import { useDesktopZoom } from '@/hooks/use-desktop-zoom'
-import { useIframeInvoke } from '@/hooks/use-iframe-invoke'
-import { useIframeShim } from '@/hooks/use-iframe-shim'
+import { DSH_VIEW_COMMANDS, shortcutHint, useDshShortcuts } from '@/hooks/use-dsh-shortcuts'
+import { useDshStyle } from '@/hooks/use-dsh-style'
+import { useIframeMessage } from '@/hooks/use-iframe-message'
+import { useIframePost } from '@/hooks/use-iframe-post'
+import { useListen } from '@/hooks/use-listen'
 import { store } from '@/store'
-import { Loadable } from './loadable'
+import { Recovery } from '@/ui/plugin/recovery'
+import { Iframe } from './iframe'
 import { Navbar } from './navbar'
-import { PreinstallSetup } from './preinstall-setup'
 import { Setup } from './setup'
+import { PreinstallSetup } from './setup-preinstall'
 
-const STARTUP_STATUS_KEYS = {
-  'plugin-install': 'status.loading_internal',
-  'process-boot': 'status.loading_process',
-  'client-modules': 'status.loading_client_modules',
-} as const
+interface NavBridgeMessage {
+  type?: string
+  collapsed?: boolean
+  rows?: unknown
+}
 
-/**
- * 主区域视图：壳层导航栏（Navbar）常驻顶部，
- * 安装/错误态渲染 Setup，就绪态渲染 iframe
- * （挂载后加载职责交给 dsh 应用内官方 boot 页，避免两套 loading 叠加）。
- * 状态与方法全部来自 harness store，不再接收 props。
- */
 export function Webview() {
-  const { t } = useTranslation()
-  const {
-    status,
-    serviceHealthy,
-    startupPhase,
-    iframeError,
-    iframeKey,
-    iframeSrc,
-    serviceUrl,
-    recovery,
-  } = useStore(store.harness)
-
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const post = useIframePost(iframeRef)
 
-  useDesktopZoom(iframeRef)
-  useIframeShim(iframeRef)
-  useIframeInvoke(iframeRef)
+  const [dshStyle] = useDshStyle()
+  const [{ rows: shortcutRows }, setDshShortcuts] = useDshShortcuts()
 
-  if (status === 'error') {
-    return (
-      <main className="relative flex min-h-0 flex-1 flex-col bg-canvas">
-        <Navbar />
-        <div className="min-h-0 flex-1">
-          {/* 能定位到问题插件时展示全屏恢复页（卸除此插件并继续检测）；否则普通错误页 */}
+  const { status, serviceHealthy } = useStore(store.harness)
+  const { recovery } = useStore(store.recovery)
+  const [remoteView, setRemoteView] = useState({ url: '', tint: null as string | null })
+  const { url: activeTunnelUrl, tint: borderTint } = remoteView
+  const remoteMode = activeTunnelUrl !== ''
+  const live = status === 'ready' && (remoteMode || serviceHealthy)
+
+  function syncViewMenu() {
+    if (type() !== 'macos')
+      return
+    void invoke('sync_view_menu', {
+      entries: DSH_VIEW_COMMANDS.map(item => ({
+        id: item.action,
+        enabled: live && shortcutRows.some(row => row.id === item.command && row.available === true),
+        shortcut: shortcutHint(shortcutRows, item.command) ?? null,
+      })),
+    }).catch(error => console.error('[Webview] failed to sync View menu:', error))
+  }
+
+  useWatch([shortcutRows, live], syncViewMenu, { immediate: true })
+  useWatch(activeTunnelUrl, () => setDshShortcuts({ rows: [] }))
+  useWatch(live, (ready) => {
+    if (!ready)
+      setDshShortcuts({ rows: [] })
+  })
+  useListen('tauri://focus', syncViewMenu, { target: getCurrentWindow().label })
+  useListen('macos-menu-rebuilt', syncViewMenu, { target: getCurrentWindow().label })
+
+  function handleRemoteChange(url: string, tint: string | null) {
+    setRemoteView({ url, tint })
+  }
+
+  useIframeMessage<NavBridgeMessage>(iframeRef, (data) => {
+    if (data.type === 'dsh://sidebar:collapsed') {
+      setSidebarCollapsed(Boolean(data.collapsed))
+    }
+    else if (data.type === 'dsh://shortcuts') {
+      setDshShortcuts({ rows: parseShortcutRows(data.rows) })
+    }
+  })
+
+  const renderContent = () => {
+    switch (status) {
+      case 'error':
+        return (
           <If cond={recovery.required} else={<Setup />}>
-            <PluginRecovery fullScreen />
+            <Recovery fullScreen />
           </If>
-        </div>
-      </main>
-    )
+        )
+      case 'preinstall':
+        return <PreinstallSetup />
+      case 'ready':
+        return (
+          <Iframe
+            iframeRef={iframeRef}
+            srcOverride={remoteMode ? activeTunnelUrl : null}
+            borderTint={borderTint}
+          />
+        )
+      default:
+        return <Setup />
+    }
   }
 
-  // 预装插件引导：独立于安装/加载界面，渲染推荐插件列表与安装控制台
-  if (status === 'preinstall') {
-    return (
-      <main className="relative flex min-h-0 w-full flex-col bg-canvas">
-        <Navbar />
-        <div className="min-h-0 flex-1">
-          <PreinstallSetup />
-        </div>
-      </main>
-    )
-  }
-
-  if (status !== 'ready') {
-    return (
-      <main className="relative flex min-h-0 w-full flex-col bg-canvas">
-        <Navbar />
-        <div className="min-h-0 flex-1">
-          <Setup />
-        </div>
-      </main>
-    )
-  }
+  const bridge = live
+    ? {
+        onToggleSidebar: () => post({ type: 'dsh://sidebar:toggle' }),
+        onNewChat: () => post({ type: 'dsh://session:new' }),
+        onOpenFolder: () => post({ type: 'dsh://workspace:add' }),
+        onOpenShortcuts: () => post({ type: 'dsh://shortcuts:open' }),
+        onViewCommand: (command: DshViewCommand) => post({ type: 'dsh://view:command', command }),
+      }
+    : {}
 
   return (
-    <main className="relative flex min-h-0 flex-1 flex-col bg-canvas">
-      <Navbar iframeRef={iframeRef} />
-
-      {/* iframe 区域：加载失败时用覆盖层展示重试（iframe 保持挂载，重试复用） */}
-      <div className="relative min-h-0 flex-1">
-        <If
-          cond={serviceHealthy}
-          else={<Loadable subtitle={t(STARTUP_STATUS_KEYS[startupPhase])} />}
-        >
-          <iframe
-            key={iframeKey}
-            ref={iframeRef}
-            className="block h-full w-full border-none bg-load-bg"
-            src={iframeSrc}
-            allow="accelerometer; ambient-light-sensor; autoplay; battery; camera; clipboard-read; clipboard-write; display-capture; document-domain; encrypted-media; fullscreen; gamepad; geolocation; gyroscope; hid; idle-detection; keyboard-map; magnetometer; microphone; midi; payment; picture-in-picture; publickey-credentials-get; screen-wake-lock; serial; speaker-selection; usb; web-share; xr-spatial-tracking"
-            sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-downloads allow-storage-access-by-user-activation"
-            onLoad={store.harness.markIframeLoaded}
-            onError={store.harness.markIframeError}
-            title={t('app.open_editor')}
-          />
-        </If>
-
-        <If cond={serviceHealthy && iframeError}>
-          <div className="absolute inset-0 z-[1]">
-            <Loadable
-              icon={CircleExclamation}
-              title={t('ui.iframe_error')}
-              errorMsg={t('ui.ensure_running', { url: serviceUrl })}
-              onRetry={store.harness.refreshIframe}
-            />
-          </div>
-        </If>
+    <main className="relative flex flex-col min-h-0 flex-1" style={dshStyle.frame || {}}>
+      <Navbar onRemoteChange={handleRemoteChange} sidebarCollapsed={sidebarCollapsed} {...bridge} />
+      <div className="flex min-h-0 flex-1">
+        {renderContent()}
       </div>
     </main>
   )
+}
+
+function parseShortcutRows(rows: unknown): DshShortcutRow[] {
+  if (!Array.isArray(rows))
+    return []
+  const out: DshShortcutRow[] = []
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null)
+      continue
+    const entry = row as { id?: unknown, label?: unknown, keys?: unknown, aria?: unknown, available?: unknown }
+    if (typeof entry.id !== 'string' || typeof entry.label !== 'string')
+      continue
+    out.push({
+      id: entry.id,
+      label: entry.label,
+      keys: Array.isArray(entry.keys) ? entry.keys.filter((key): key is string => typeof key === 'string') : [],
+      ...typeof entry.aria === 'string' ? { aria: entry.aria } : {},
+      available: entry.available === true,
+    })
+  }
+  return out
 }

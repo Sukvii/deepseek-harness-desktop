@@ -2,12 +2,66 @@
 //! 盘符绝对路径会按相对解析）、GitHub 简写规范化（绕开 pnpm 的 HTTPS→SSH 回退
 //! 缺陷）与 Windows 下含空格 spec 的引号化（dsh CLI 只在 win32 用 shell 拼接参数）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
 use super::bundled_dep_spec;
 use super::bundled_plugin_dir;
 use super::PreinstallPluginInfo;
+
+/// 从安装 spec 解析包名，供「产物核验」与「入口补构建」定位
+/// `node_modules/<name>`。
+///
+/// - `link:` / `file:` 本地依赖：读目标目录的 `package.json` 的 `name`（最准确），
+///   读不到时回落目录名（pnpm 落盘的目录名通常是包名，但 `link:` 目标目录名未必
+///   与包名一致，故以清单为准）；
+/// - npm 形态（含 scoped）：剥离末尾 `@版本/区间`，`@scope/name` 里的 `@` 不算分隔符；
+/// - git / URL / 其他含 `:` 或空白的形态：install 后的目录名无法静态得知，返回 `None`
+///   ——调用方跳过产物核验而不是把 `node_modules/<整条 spec>` 当成必然缺失。
+pub(super) fn package_name_of_spec(spec: &str) -> Option<String> {
+    for prefix in ["link:", "file:"] {
+        if let Some(path) = spec.strip_prefix(prefix) {
+            return local_package_name(Path::new(path.trim()));
+        }
+    }
+    if spec.contains(':') || spec.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = package_name_of_npm_spec(spec);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// `link:` / `file:` 目标目录的包名：优先读其 `package.json`，回落目录名。
+fn local_package_name(path: &Path) -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string(path.join("package.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    path.file_name().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// 剥离 `name@range` 的版本后缀：scoped 包只在 `@scope/` 的斜杠之后寻找 `@`，
+/// 否则 `@scope/name` 会被从首个 `@` 切开得到空包名。
+fn package_name_of_npm_spec(spec: &str) -> &str {
+    let search_from = if spec.starts_with('@') {
+        spec.find('/').map_or(spec.len(), |i| i + 1)
+    } else {
+        0
+    };
+    match spec[search_from..].find('@') {
+        Some(offset) => spec[..search_from + offset].trim_end_matches('@'),
+        None => spec,
+    }
+}
 
 /// 内置插件才需要解析捆绑目录（普通插件无此概念），避免无谓的资源探测
 pub(super) fn bundled_dir_of(
@@ -30,9 +84,10 @@ pub(super) fn bundled_dir_of(
 pub(super) fn preset_spec_for_install(
     preset: &PreinstallPluginInfo,
     bundled_dir: Option<PathBuf>,
+    core_version: Option<&str>,
 ) -> Result<String, String> {
     if !preset.internal {
-        return Ok(preset.spec.clone());
+        return Ok(pinned_spec(preset, core_version));
     }
     let dir = bundled_dir.ok_or_else(|| {
         format!(
@@ -41,6 +96,38 @@ pub(super) fn preset_spec_for_install(
         )
     })?;
     Ok(bundled_dep_spec(&dir))
+}
+
+/// 非内置插件按「当前核心那一代」的推荐区间钉版本。
+///
+/// 清单矩阵里的 `version` 是发布侧给出的该代推荐插件版本区间，而裸包名会让 pnpm 装
+/// `latest`（未必属于这一代：核心 `^0.1.7-rc.1` 该装 `dsh-better-sidebar@^0.21.1`，
+/// 但 registry 的 `latest` 仍解析到 0.19.x）。没有命中区间（字符串声明、核心超出全部
+/// 区间、版本不可解析）时退回裸 spec，交由 pnpm 自行解析。
+fn pinned_spec(preset: &PreinstallPluginInfo, core_version: Option<&str>) -> String {
+    let Some(req) = preset
+        .version
+        .as_ref()
+        .and_then(|version| version.plugin_req_for_core(core_version))
+    else {
+        return preset.spec.clone();
+    };
+    if !is_bare_package_spec(&preset.spec) {
+        return preset.spec.clone();
+    }
+    format!("{}@{req}", preset.spec)
+}
+
+/// 是否为可直接追加 `@区间` 的裸 npm 包名（含 scope）。
+///
+/// `git+https://…` / `github:owner/repo` / `link:<路径>` 自带来源，`pkg@1.2.3` 已带
+/// 版本，追加都会破坏 spec。
+fn is_bare_package_spec(spec: &str) -> bool {
+    if spec.contains(':') || spec.contains(char::is_whitespace) {
+        return false;
+    }
+    let body = spec.strip_prefix('@').unwrap_or(spec);
+    !body.is_empty() && !body.contains('@')
 }
 
 /// 把 `github:owner/repo[#ref]` 与裸 `git+ssh://git@github.com/...` 一类的
@@ -82,25 +169,45 @@ pub(super) fn normalize_git_spec(spec: &str) -> String {
     url
 }
 
+/// `dsh plugin` 仍把 pnpm 参数拼进 shell 的最后一个核心版本（开区间上界）。
+///
+/// 该版本起 `dsh plugin` 改经 `@deepseek-ai/dsh-plugin-manager`、用 execa 以
+/// **argv 数组**启动 pnpm，并在 Windows 上自行按 cmd 规则转义参数
+/// （`arguments/command-file.js`），spec 因此必须原样透传。
+const SHELL_JOINED_PNPM_CLI_BELOW: &str = "0.1.6-alpha.2";
+
+/// 活动核心的 `dsh plugin` 是否把 pnpm 参数拼成命令行交给 shell。
+///
+/// - `< 0.1.6-alpha.2`（0.1.5-rc.2 / 0.1.6-alpha.1 等）：JS 里
+///   `spawnSync("pnpm", args, { shell: process.platform === "win32" })`，Node 对
+///   `shell:true` 只按空格拼接、不做引号转义（DEP0190），含空格的 spec 不预加引号
+///   就会被切碎成多个 spec。
+/// - `>= 0.1.6-alpha.2`：参数作为单个 argv 直达 pnpm，spec 里的字面 `"` 会被当成
+///   包名的一部分 → `ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER`（issue #647）。
+///
+/// 版本读不到 / 解析失败时按新核心处理：预加引号对新核心是**必然失败**，不预加
+/// 引号只在「老核心 + 含空格安装路径」这一组合下失败。
+pub(super) fn joins_pnpm_args_in_shell(core_version: Option<&str>) -> bool {
+    let Ok(threshold) = semver::Version::parse(SHELL_JOINED_PNPM_CLI_BELOW) else {
+        return false;
+    };
+    core_version
+        .and_then(|version| semver::Version::parse(version).ok())
+        .is_some_and(|actual| actual < threshold)
+}
+
 /// 给含空白字符的依赖 spec 加内嵌双引号，使其在 shell 拼接后仍保持单一 token。
 ///
-/// **仅 Windows 需要引号。** `dsh plugin add` 在 JS 里用
-/// `spawnSync("pnpm", args, { shell: process.platform === "win32" })` 启动 pnpm：
-/// - Windows：`shell:true` 时 Node 只把参数按空格拼接、不做引号转义（官方文档
-///   DEP0190：arguments are not escaped, only concatenated）。内置插件的依赖是
-///   `link:<应用安装目录>`，而 Windows 安装目录常含空格（如
-///   `G:\Deepseek Harness Desktop\resources\node_modules\dsh-tauri`），拼进
-///   shell 后会被切碎成多个 spec，pnpm 报 `ERR_PNPM_SPEC_NOT_SUPPORTED` / 装成
-///   错误依赖，导致启动自愈每轮都重装（死循环）。包一层双引号让 cmd 把整条
-///   spec 视为一个参数；pnpm 解析后自行剥离引号，落盘 `package.json` 的值仍是
-///   不带引号的规范 `link:<路径>`（与 [`bundled_dep_spec`] 的内核对账一致）。
-/// - macOS / Linux：`shell:false`，pnpm 以 argv 数组直接启动、空格天然保留，
-///   **加引号反而把字面 `"` 当成包名的一部分传给 pnpm → 非法 spec → exit 1**。
-///   这是 issue #104 的根因：内置插件指向 `/Applications/Deepseek Harness
-///   Desktop.app/...`（含空格），每次启动自愈重装都失败、服务永远缺该插件。
+/// 只对「把参数拼进 shell 的老核心」且「Windows」成立：老核心在 win32 用
+/// `shell:true` 启动 pnpm，内置插件的 `link:<应用安装目录>` 一旦含空格就会被切碎
+/// （pnpm 报 `ERR_PNPM_SPEC_NOT_SUPPORTED`），包一层双引号让 cmd 把整条 spec 视为
+/// 单一 token；pnpm 解析后自行剥离引号，落盘 `package.json` 的值仍是不带引号的
+/// `link:<路径>`（与 [`bundled_dep_spec`] 的内核对账一致）。
 ///
-/// 因此只在 `cfg!(windows)` 且 spec 含空白时才包引号——普通 npm 包名 /
-/// `git+https://...` 无空格，原样透传，避免无谓改动。
+/// 新核心与 macOS / Linux（老核心在 mac 上也是 `shell:false`）都是 argv 数组直达
+/// pnpm、空格天然保留，加引号反而把字面 `"` 当成包名的一部分传给 pnpm → 非法
+/// spec → exit 1，这是 issue #104 的根因（内置插件指向 `/Applications/Deepseek
+/// Harness Desktop.app/...`）。因此调用方必须经 [`spec_argument`] 按核心版本决定。
 pub(super) fn shell_quote_spec(spec: &str) -> String {
     #[cfg(windows)]
     {
@@ -111,9 +218,20 @@ pub(super) fn shell_quote_spec(spec: &str) -> String {
     spec.to_string()
 }
 
+/// 传给 `dsh plugin add` 的最终参数：只有把参数拼进 shell 的老核心才预加引号
+/// （见 [`joins_pnpm_args_in_shell`] 与 [`shell_quote_spec`]）。
+pub(super) fn spec_argument(spec: &str, core_version: Option<&str>) -> String {
+    if joins_pnpm_args_in_shell(core_version) {
+        shell_quote_spec(spec)
+    } else {
+        spec.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::manifest::{PluginVersion, VersionPair};
     use std::path::PathBuf;
 
     /// 构造预设条目的测试助手（internal 由各用例显式指定）
@@ -128,6 +246,8 @@ mod tests {
             recommended: false,
             fix: false,
             default_checked: false,
+            default_unchecked: false,
+            version: None,
             win_only: false,
             internal,
         }
@@ -137,10 +257,104 @@ mod tests {
     fn install_spec_passthrough_for_regular_preset() {
         // 普通插件：spec 原样返回，与捆绑目录无关
         let p = preset("dshmarket", "dshmarket", false);
-        assert_eq!(preset_spec_for_install(&p, None).unwrap(), "dshmarket");
+        assert_eq!(preset_spec_for_install(&p, None, None).unwrap(), "dshmarket");
         assert_eq!(
-            preset_spec_for_install(&p, Some(PathBuf::from("/ignored"))).unwrap(),
+            preset_spec_for_install(&p, Some(PathBuf::from("/ignored")), None).unwrap(),
             "dshmarket"
+        );
+    }
+
+    #[test]
+    fn install_spec_pins_recommended_range_for_current_core() {
+        // 清单矩阵声明的该代推荐区间必须钉进 spec：裸包名会让 pnpm 装 latest
+        // （核心 0.1.7-rc.1 该装 ^0.21.1，registry 的 latest 却还是 0.19.x）
+        let mut p = preset("dsh-better-sidebar", "dsh-better-sidebar", false);
+        p.version = Some(PluginVersion::Matrix(vec![
+            VersionPair {
+                version: "^0.19.1".into(),
+                dsh: "^0.1.5-rc.1".into(),
+            },
+            VersionPair {
+                version: "^0.21.1".into(),
+                dsh: "^0.1.7-rc.1".into(),
+            },
+        ]));
+        assert_eq!(
+            preset_spec_for_install(&p, None, Some("0.1.5-rc.3")).unwrap(),
+            "dsh-better-sidebar@^0.19.1"
+        );
+        assert_eq!(
+            preset_spec_for_install(&p, None, Some("0.1.7-rc.1")).unwrap(),
+            "dsh-better-sidebar@^0.21.1"
+        );
+        // scope 包名同样支持；核心没有任何命中区间时退回裸 spec
+        let mut scoped = preset("@xmanrui/dsh-im", "@xmanrui/dsh-im", false);
+        scoped.version = p.version.clone();
+        assert_eq!(
+            preset_spec_for_install(&scoped, None, Some("0.1.7-rc.2")).unwrap(),
+            "@xmanrui/dsh-im@^0.21.1"
+        );
+        assert_eq!(
+            preset_spec_for_install(&p, None, Some("0.2.0")).unwrap(),
+            "dsh-better-sidebar"
+        );
+        assert_eq!(
+            preset_spec_for_install(&p, None, None).unwrap(),
+            "dsh-better-sidebar"
+        );
+
+        // issue #715：清单区间本身就带 `^`，拼接只能再加一个 `@`——出现 `^^` 会让 pnpm
+        // 报 ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER，而预设插件共用同一条 `add`
+        // 调用，一个坏 spec 就让整批预设都装不上（应用卡在加载中，见 issue #716）。
+        for core in ["0.1.5-rc.3", "0.1.7-rc.1", "0.1.7-rc.2", "0.2.0"] {
+            let spec = preset_spec_for_install(&p, None, Some(core)).unwrap();
+            assert!(!spec.contains("^^"), "core={core}: {spec}");
+        }
+    }
+
+    #[test]
+    fn install_spec_never_pins_non_package_specs() {
+        // 自带来源 / 已带版本的 spec 不能再追加 `@区间`
+        let mut git = preset("probe", "git+https://github.com/o/r.git", false);
+        git.version = Some(PluginVersion::Matrix(vec![VersionPair {
+            version: "^1.2.0".into(),
+            dsh: "^0.1.5-rc.1".into(),
+        }]));
+        assert_eq!(
+            preset_spec_for_install(&git, None, Some("0.1.6")).unwrap(),
+            "git+https://github.com/o/r.git"
+        );
+
+        let mut versioned = preset("probe", "probe@1.0.0", false);
+        versioned.version = git.version.clone();
+        assert_eq!(
+            preset_spec_for_install(&versioned, None, Some("0.1.6")).unwrap(),
+            "probe@1.0.0"
+        );
+
+        let mut link = preset("probe", "link:C:/deps/probe", false);
+        link.version = git.version.clone();
+        assert_eq!(
+            preset_spec_for_install(&link, None, Some("0.1.6")).unwrap(),
+            "link:C:/deps/probe"
+        );
+    }
+
+    #[test]
+    fn install_spec_supports_npm_style_whitespace_ranges() {
+        // 清单按 npm 习惯书写空格分隔的多比较符区间
+        let mut p = preset("probe", "probe", false);
+        p.version = Some(PluginVersion::Matrix(vec![VersionPair {
+            version: "^1.2.0".into(),
+            dsh: ">=0.1.7-rc.1 <0.1.7-rc.5".into(),
+        }]));
+        assert_eq!(
+            preset_spec_for_install(&p, None, Some("0.1.7-rc.3")).unwrap(),
+            "probe@^1.2.0"
+        );
+        assert_eq!(
+            preset_spec_for_install(&p, None, Some("0.1.7-rc.5")).unwrap(),
+            "probe"
         );
     }
 
@@ -151,7 +365,7 @@ mod tests {
         let p = preset("dsh-tauri", "dsh-tauri@0.2.0", true);
         let dir = PathBuf::from("C:\\Apps\\dsh\\resources\\internal-plugins\\dsh-tauri");
         assert_eq!(
-            preset_spec_for_install(&p, Some(dir)).unwrap(),
+            preset_spec_for_install(&p, Some(dir), None).unwrap(),
             "link:C:/Apps/dsh/resources/internal-plugins/dsh-tauri"
         );
     }
@@ -160,7 +374,7 @@ mod tests {
     fn install_spec_errors_when_internal_bundle_missing() {
         // 内置插件捆绑目录缺失：发布缺陷，显式报错而非静默走 npm/git spec
         let p = preset("dsh-tauri", "dsh-tauri@0.2.0", true);
-        let err = preset_spec_for_install(&p, None).unwrap_err();
+        let err = preset_spec_for_install(&p, None, None).unwrap_err();
         assert!(err.starts_with("BUNDLED_PLUGIN_MISSING"));
         assert!(err.contains("dsh-tauri"));
     }
@@ -222,7 +436,7 @@ mod tests {
         );
     }
 
-    // ---- spec 引号化（仅 Windows：dsh CLI 只在 win32 用 shell 拼接参数）----
+    // ---- spec 引号化（仅老核心 + Windows：dsh CLI 只在 win32 用 shell 拼接参数）----
 
     #[cfg(windows)]
     #[test]
@@ -281,5 +495,59 @@ mod tests {
         assert!(quoted.starts_with('"'));
         assert!(quoted.ends_with('"'));
         assert!(quoted.contains("Deepseek Harness Desktop"));
+    }
+
+    // ---- 引号化随核心版本（issue #647：0.1.6-alpha.2 起 pnpm 由 argv 数组启动）----
+
+    #[test]
+    fn shell_join_gate_boundary_versions() {
+        // 0.1.6-alpha.1 仍是 spawnSync + shell:true（首个 argv 数组版是 alpha.2）
+        assert!(joins_pnpm_args_in_shell(Some("0.1.5-rc.2")));
+        assert!(joins_pnpm_args_in_shell(Some("0.1.6-alpha.1")));
+        assert!(!joins_pnpm_args_in_shell(Some("0.1.6-alpha.2")));
+        assert!(!joins_pnpm_args_in_shell(Some("0.1.6")));
+        assert!(!joins_pnpm_args_in_shell(Some("0.1.7")));
+        assert!(!joins_pnpm_args_in_shell(Some("1.0.0")));
+        // 版本未知 / 非法：按新核心处理（预加引号对新核心必然失败）
+        assert!(!joins_pnpm_args_in_shell(None));
+        assert!(!joins_pnpm_args_in_shell(Some("")));
+        assert!(!joins_pnpm_args_in_shell(Some("not-a-version")));
+    }
+
+    #[test]
+    fn spec_argument_keeps_space_spec_bare_for_argv_cores() {
+        // issue #647：0.1.6-alpha.2 起 spec 作为单个 argv 直达 pnpm，Windows 上的
+        // cmd 转义由 CLI 自己完成，预加引号会让 pnpm 收到带字面引号的 spec
+        let spec = "link:D:/Deepseek Harness Desktop/resources/node_modules/dsh-tauri";
+        assert_eq!(spec_argument(spec, Some("0.1.6-alpha.2")), spec);
+        assert_eq!(spec_argument(spec, None), spec);
+        assert_eq!(spec_argument(spec, Some("not-a-version")), spec);
+        // 无空格 spec 与版本无关，始终原样透传
+        assert_eq!(spec_argument("dshmarket", Some("0.1.5-rc.2")), "dshmarket");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spec_argument_quotes_space_spec_for_shell_joining_cores() {
+        // 回归：老核心把参数拼进 cmd，含空格的安装路径必须预加引号才不被切碎
+        let spec = "link:G:/Deepseek Harness Desktop/resources/internal-plugins/dsh-tauri";
+        assert_eq!(
+            spec_argument(spec, Some("0.1.5-rc.2")),
+            format!("\"{spec}\"")
+        );
+        assert_eq!(
+            spec_argument(spec, Some("0.1.6-alpha.1")),
+            format!("\"{spec}\"")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spec_argument_never_quotes_on_non_windows() {
+        // issue #104：macOS/Linux 上 dsh 直接 spawnSync（shell:false），spec 作为
+        // 单个 argv 传递、空格天然保留，老核心也不得加引号
+        let spec = "link:/Users/me/my plugins/dsh-tauri";
+        assert_eq!(spec_argument(spec, Some("0.1.5-rc.2")), spec);
+        assert_eq!(spec_argument(spec, Some("0.1.6-alpha.2")), spec);
     }
 }

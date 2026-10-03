@@ -16,6 +16,7 @@ use tauri::{AppHandle, Manager};
 use super::shim::SHIM_CMD_NAME;
 #[cfg(unix)]
 use super::shim::SHIM_SH_NAME;
+#[cfg(windows)]
 use crate::config::CLI_ROOT_DEV_DIR_NAME;
 
 #[cfg(not(windows))]
@@ -36,6 +37,7 @@ pub(crate) use pnpm::find_user_pnpm_executable;
 pub use pnpm::{find_user_pnpm, pnpm_env_value};
 
 /// Windows 下 shim 根目录名（`%LOCALAPPDATA%\<此目录>\bin`）
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 bin 目录计算使用
 const CLI_ROOT_DIR_NAME: &str = "deepseek-harness";
 
 /// Unix 下 shim 所在目录（XDG 约定）

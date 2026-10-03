@@ -2,6 +2,12 @@ import type { Event } from '@tauri-apps/api/event'
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+/** 资源清单是 JSONC（允许行注释）：解析前先剥掉行注释。 */
+function readManifest(): { plugins: { preset: Array<{ id: string, recommended?: boolean, checked?: boolean }> } } {
+  const raw = readFileSync(new URL('../src-tauri/resources/manifest.jsonc', import.meta.url), 'utf8')
+  return JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ''))
+}
+
 // ── Suite A — i18n keys exist (source assertion on JSON) ─────────────────────
 describe('preinstall can-uncheck hint i18n keys', () => {
   it('provides preinstall.can_uncheck_hint in en-US', () => {
@@ -22,7 +28,7 @@ describe('preinstall can-uncheck hint i18n keys', () => {
 // ── Suite B — component references the hint key (source assertion) ───────────
 describe('preinstallSetup hint text', () => {
   it('renders the can_uncheck_hint key', () => {
-    const source = readFileSync(new URL('../src/layout/components/preinstall-setup.tsx', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../src/layout/components/setup-preinstall.tsx', import.meta.url), 'utf8')
     expect(source).toContain('preinstall.can_uncheck_hint')
   })
 })
@@ -30,13 +36,46 @@ describe('preinstallSetup hint text', () => {
 // ── Suite C — component has dynamic button label (source assertion) ──────────
 describe('preinstallSetup primary button morph', () => {
   it('guards the label switch on hasChanges', () => {
-    const source = readFileSync(new URL('../src/layout/components/preinstall-setup.tsx', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../src/layout/components/setup-preinstall.tsx', import.meta.url), 'utf8')
     expect(source).toContain('hasChanges')
   })
 
   it('can render the Skip label', () => {
-    const source = readFileSync(new URL('../src/layout/components/preinstall-setup.tsx', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../src/layout/components/setup-preinstall.tsx', import.meta.url), 'utf8')
     expect(source).toContain('preinstall.skip')
+  })
+})
+
+// ── Suite B2 — 未预选声明抑制首次预选（behavior） ──────────────────────────────
+// 推荐项仍显示「推荐」chip，但清单声明 `checked: false` 时首次引导不预选。
+describe('unchecked preset suppresses first-run preselection', () => {
+  it('is honored by initialCheckedSet and keeps the recommended chip independent', () => {
+    const source = readFileSync(new URL('../src/layout/components/setup-preinstall.tsx', import.meta.url), 'utf8')
+    expect(source).toContain('p.defaultUnchecked')
+    // 预选判定必须先于 recommended，否则 defaultUnchecked 永远不会生效
+    expect(source.indexOf('p.defaultUnchecked')).toBeLessThan(source.indexOf('p.recommended || p.fix'))
+  })
+
+  it('declares DSH Bridge and DSH IM as recommended but not pre-checked', () => {
+    const preset = readManifest().plugins.preset
+    for (const id of ['@wenbin_wb/dsh-bridge', '@xmanrui/dsh-im']) {
+      const entry = preset.find(p => p.id === id)
+      expect(entry, id).toBeDefined()
+      expect(entry?.recommended, id).toBe(true)
+      // 资源清单是唯一真值：Rust 侧据此派生 defaultUnchecked（checked === false）
+      expect(entry?.checked, id).toBe(false)
+    }
+  })
+})
+
+// ── Suite B3 — 非推荐预设既不标推荐也不预选（behavior） ────────────────────────
+// 缺省语义：recommended / checked 未声明即为 false，故断言按 `?? false` 取值。
+describe('non-recommended preset stays fully opt-in', () => {
+  it('declares Billion Context without the recommended chip and without preselecting it', () => {
+    const entry = readManifest().plugins.preset.find(p => p.id === 'billion-context')
+    expect(entry).toBeDefined()
+    expect(entry?.recommended ?? false).toBe(false)
+    expect(entry?.checked ?? false).toBe(false)
   })
 })
 
@@ -55,13 +94,12 @@ vi.mock('@tauri-apps/api/event', () => ({
     return vi.fn()
   }),
 }))
-vi.mock('@hairy/react-lib', () => ({ emitter: { emit: vi.fn() } }))
 vi.mock('@/config/client', () => ({ queryClient: { invalidateQueries: vi.fn() } }))
 vi.mock('../src/store/modules/harness-updater', () => ({
   harnessUpdater: { checkForUpdate: vi.fn() },
 }))
 
-const { harness } = await import('../src/store/modules/harness/store')
+const { preinstall } = await import('../src/store/modules/preinstall')
 
 beforeEach(() => {
   eventListeners.clear()
@@ -70,7 +108,7 @@ beforeEach(() => {
 
 describe('confirmPreinstall empty-selection guard', () => {
   it('does not invoke the backend when ids is empty', async () => {
-    await harness.confirmPreinstall([])
+    await preinstall.confirm([])
     expect(invoke).not.toHaveBeenCalled()
   })
 })

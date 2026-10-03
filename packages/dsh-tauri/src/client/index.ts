@@ -1,36 +1,38 @@
-/**
- * dsh-tauri 客户端 barrel（browser half）：插件入口 + 全 workspace 客户端共享工具。
- *
- * 共享工具（供各插件 client 导入 `dsh-tauri/client`）：
- *   - compat / resolveStartSession：Alpha ↔ rc.2 服务布局适配；
- *   - store：框架无关 SnapshotStore（uSES 安全）；
- *   - fetch：ofetch 统一 JSON 客户端（错误解析内置，唯一导出）；
- *   - storage：unstorage createStorage / localStorageDriver；
- *   - controller：hookable 生命周期控制器（observer/timer/listener 收敛）；
- *   - CssRender：css-render 样式树（各插件 mount*Styles 使用）。
- */
-import { PLUGIN_ID, PLUGIN_INJECT } from './constants'
+import { PLUGIN_ID } from './constants'
 
-/** 插件显示名（诊断元数据）。 */
+export { apply } from './apply'
+
+export * from './controller'
+
+export * from './hooks/use-invoke'
+export * from './hooks/use-listen'
+export * from './hooks/use-listen-parent'
+
+export * from './locale'
+
+export * from './modules/css-render'
+export * from './modules/date-fns'
+export * from './modules/hookable'
+export * from './modules/lodash-es'
+export * from './modules/reause'
+export * from './modules/tailwind-variants'
+export * from './modules/valtio-define'
+
+export * from './panel'
+export * from './register'
+export * from './request'
+
+export * from './service/invoke'
+export * from './service/invoke-parent'
+export * from './service/listen'
+export * from './service/listen-parent'
+
+export type * from './types/adapter'
+export type * from './types/bridge'
+export type * from './types/harness'
+export type * from './types/iframe'
+export type * from './types/tauri'
+
 export const name = PLUGIN_ID
 
-/** 需要的客户端服务：layout（侧边栏切换）。 */
-export const inject = PLUGIN_INJECT
-
-export * from './apis'
-export { apply } from './apply'
-export * from './controller'
-export { invokeBridgedTauri } from './service/invoke'
-export * from './storage'
-export * from './store'
-
-export type * from './types'
-
-export type { ClientContext } from './types'
-export { compat, resolveStartSession } from './utils/compat'
-export { CssRender } from 'css-render'
-
-/** 仅构建期 tree-shake 内联所用导出；date-fns 不进入 release production 资源闭包。 */
-export { differenceInDays, differenceInHours, differenceInMinutes, format } from 'date-fns'
-
-export { createHooks } from 'hookable'
+export const inject = ['layout', 'theme']

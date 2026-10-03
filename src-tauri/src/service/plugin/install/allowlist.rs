@@ -10,6 +10,7 @@ use tauri::AppHandle;
 use serde_yaml::{Mapping, Value};
 
 use super::profile_dir;
+use crate::service::profile::parse_workspace_document;
 
 /// 从 pnpm 失败输出中解析需写入构建放行白名单的包名/键集合。
 ///
@@ -215,17 +216,19 @@ pub(super) fn add_allow_build_keys(app_handle: &AppHandle, keys: &[String]) -> R
 fn apply_allow_build_keys(content: &str, keys: &[String]) -> Result<String, String> {
     // 先尝试严格解析。旧的损坏文件（重复映射键）严格解析会失败：
     // 把 `allowBuilds` 内同名键去重（保留最后写入的值）后再解析，自愈损坏状态。
-    let mut repaired = false;
-    let mut doc: Value = match serde_yaml::from_str(content) {
-        Ok(v) => v,
+    // 「多文档」（`---` 分隔，issue #526）同样让 serde_yaml 与 pnpm 都拒绝——交给
+    // `parse_workspace_document` 归一化成单文档并标记需要回写。
+    let (mut doc, repaired): (Value, bool) = match parse_workspace_document(content) {
+        Ok((value, normalized)) => (value, normalized),
         Err(first_err) => {
             let normalized = collapse_allow_builds_duplicates(content);
             if normalized == content {
                 return Err(format!("PREINSTALL_WORKSPACE_INVALID_YAML: {first_err}"));
             }
-            repaired = true;
-            serde_yaml::from_str(&normalized)
-                .map_err(|e| format!("PREINSTALL_WORKSPACE_INVALID_YAML: {e}"))?
+            let value = parse_workspace_document(&normalized)
+                .map(|(value, _)| value)
+                .map_err(|e| format!("PREINSTALL_WORKSPACE_INVALID_YAML: {e}"))?;
+            (value, true)
         }
     };
 
@@ -277,7 +280,7 @@ fn apply_allow_build_keys(content: &str, keys: &[String]) -> Result<String, Stri
         keys.iter()
             .map(|k| dep_path_to_name(k))
             .filter(|name| {
-                existing_only.map_or(true, |seq| !seq.contains(&Value::String(name.clone())))
+                existing_only.is_none_or(|seq| !seq.contains(&Value::String(name.clone())))
             })
             .map(Value::String)
             .collect()
@@ -579,7 +582,7 @@ onlyBuiltDependencies:
         let dep =
             "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89"
                 .to_string();
-        let out = apply_allow_build_keys(base, &[dep.clone()]).unwrap();
+        let out = apply_allow_build_keys(base, std::slice::from_ref(&dep)).unwrap();
         let doc: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         // pnpm 11：allowBuilds 保留完整 depPath
         assert_eq!(
@@ -617,10 +620,10 @@ onlyBuiltDependencies:
             "dsh-better-sidebar@git+ssh://git@github.com/omdsh-dev/DSH-better-sidebar.git#6c89"
                 .to_string();
         // 空内容也能生成合法配置
-        let out = apply_allow_build_keys("", &[dep.clone()]).unwrap();
+        let out = apply_allow_build_keys("", std::slice::from_ref(&dep)).unwrap();
         let map = allow_builds_map(&out);
         assert_eq!(
-            map.get(&serde_yaml::Value::String(dep)),
+            map.get(serde_yaml::Value::String(dep)),
             Some(&serde_yaml::Value::Bool(true))
         );
         // 库负责正确加引号，键原样（含 @ / : / #）可回读
@@ -675,5 +678,38 @@ onlyBuiltDependencies:
             allow_builds_map(&out).get("node-pty"),
             Some(&serde_yaml::Value::Bool(true))
         );
+    }
+
+    /// issue #526：`---` 分隔的多文档 `pnpm-workspace.yaml` 在写回时归一化成单文档，
+    /// 否则 pnpm（js-yaml `load`）仍然读不了这个文件。
+    #[test]
+    fn apply_normalizes_multi_document_workspace() {
+        let multi = "packages:\n  - .\nnodeLinker: hoisted\n---\nautoInstallPeers: false\n";
+        let out = apply_allow_build_keys(multi, &["node-pty".to_string()]).unwrap();
+
+        // 输出必须是单文档：pnpm 与 serde_yaml 都只接受单文档流。
+        assert_eq!(out.matches("\n---").count(), 0, "{out}");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&out).expect("output must be single-doc");
+        assert!(doc.get("packages").is_some());
+        assert!(doc.get("nodeLinker").is_some());
+        assert_eq!(
+            doc.get("autoInstallPeers")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            allow_builds_map(&out).get("node-pty"),
+            Some(&serde_yaml::Value::Bool(true))
+        );
+    }
+
+    /// 多文档归一化后原样返回也必须是单文档（没有任何新键时走 `!dirty && !repaired`
+    /// 的早返回分支，`repaired` 必须为真，否则损坏文本会被原样写回）。
+    #[test]
+    fn multi_document_workspace_is_rewritten_even_without_new_keys() {
+        let multi = "packages:\n  - .\n---\nnodeLinker: hoisted\n";
+        let out = apply_allow_build_keys(multi, &[]).unwrap();
+        assert_eq!(out.matches("\n---").count(), 0, "{out}");
+        assert!(serde_yaml::from_str::<serde_yaml::Value>(&out).is_ok());
     }
 }

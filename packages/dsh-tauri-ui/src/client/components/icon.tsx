@@ -1,6 +1,6 @@
+// 引用源 本仓自建（无上游对应；渲染 @gravity-ui/icons 转发字形）· 版本 不适用 · hash 不适用
 import type { ComponentType, ReactElement, SVGProps } from 'react'
 
-/** Common props for a Gravity or primitives SVG component. */
 export type IconComponent = ComponentType<SVGProps<SVGSVGElement>>
 
 export interface IconProps extends Omit<SVGProps<SVGSVGElement>, 'as'> {
@@ -10,10 +10,6 @@ export interface IconProps extends Omit<SVGProps<SVGSVGElement>, 'as'> {
 
 export type SharedIconProps = Omit<SVGProps<SVGSVGElement>, 'as'> & { size?: number }
 
-/**
- * Normalizes icon sizing without wrapping individual upstream icons.
- * The `as` component remains the source of the SVG path and metadata.
- */
 export function Icon({ as: Component, size = 16, ...props }: IconProps): ReactElement {
   return <Component {...props} width={size} height={size} />
 }

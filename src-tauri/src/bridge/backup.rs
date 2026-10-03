@@ -8,7 +8,26 @@ use tauri::AppHandle;
 
 use crate::service::backup;
 
-/// 创建备份（`$DSH_HOME` → `$DSH_HOME/.backups/<timestamp>.tar.zst`）。
+#[tauri::command]
+pub async fn export_recovery_backup(
+    app_handle: AppHandle,
+    include_credentials: bool,
+) -> Result<backup::BackupInfo, String> {
+    let transition = crate::service::workflow::acquire_core_transition().await?;
+    let operation = crate::service::plugin::acquire_operation_lock().await;
+    crate::service::workflow::stop(app_handle.clone()).await?;
+    let source = crate::config::get_dsh_data_path(&app_handle);
+    let app_data = crate::config::get_base_dir(&app_handle);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _transition = transition;
+        let _operation = operation;
+        backup::recovery::export(&source, &app_data, include_credentials)
+    })
+    .await
+    .map_err(|e| format!("RECOVERY_TASK: {e}"))?
+}
+
+/// 创建当前 profile 的备份（不包含共享会话与工作区数据）。
 ///
 /// 异步命令：zstd 多线程压缩 + 目录遍历在 `spawn_blocking` 线程池执行。
 #[tauri::command]
@@ -34,7 +53,7 @@ pub async fn backup_profile(
 
 /// 从指定备份还原。
 ///
-/// `as_new` = true 时创建新档案目录；false 时覆盖当前 `$DSH_HOME`。
+/// `as_new` = true 时创建新档案目录；false 时覆盖当前激活的 profile。
 /// 异步命令：zstd 解压在 `spawn_blocking` 线程池执行。
 #[tauri::command]
 pub async fn restore_profile(

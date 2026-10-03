@@ -38,6 +38,13 @@ pub(crate) fn build_plugin_envs(
         ),
         ("DSH_TELEMETRY_DISABLED".to_string(), "1".to_string()),
         ("NO_COLOR".to_string(), "1".to_string()),
+        // pnpm 在非 TTY 子进程里拒绝「清空 node_modules 重建」，直接
+        // `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` 退出 1；pnpm 11 起也不再读
+        // profile `.npmrc` 的 `confirmModulesPurge`，于是 `dsh plugin install` 每次
+        // 都失败 → `dsh.profile.bundles` 永远登记不上 → 内置插件不挂载（宿主插件
+        // 的 apply 不运行，索引恒 401、健康检查永远 boot page 401）。
+        // pnpm 自己给出的开关就是 `CI=true`。
+        ("CI".to_string(), "true".to_string()),
         // 把预检解析出的 node 路径显式交给 pnpm/dsh shim（DSH_NODE 优先）：
         // shim 自身经 PATH 解析 node 可能与应用预检不一致（PATH 上的相对条目、
         // junction/符号链接、或子进程 PATH 布局差异），导致 pnpm shim 报
@@ -58,6 +65,43 @@ pub(crate) fn build_plugin_envs(
         if let Some(pnpm_value) = cli::pnpm_env_value(&pnpm, &bin_dir) {
             envs.insert("DSH_PNPM".to_string(), pnpm_value);
         }
+    }
+
+    // 捆绑 pnpm 的绝对路径也显式下传（shim 优先采用 `DSH_PNPM_BIN`）：shim 内
+    // 烘焙的字面量要经 cmd.exe/PowerShell 的代码页解析，用户名含非 ASCII（如
+    // `C:\Users\小蔡\...`）时会被读成乱码，`if exist "%PNPM_BIN%"` 判定落空 →
+    // shim 走 `:no_pnpm` 以退出码 1 结束，安装只报 `PREINSTALL_FAILED`。
+    // 环境变量块是 UTF-16，不受代码页影响。
+    let bundled_pnpm = config::get_pnpm_binary_path(app_handle);
+    if bundled_pnpm.exists() {
+        envs.insert(
+            "DSH_PNPM_BIN".to_string(),
+            bundled_pnpm.to_string_lossy().into_owned(),
+        );
+    }
+
+    // 档案 node_modules 是用哪份 store 装的，是既有事实：pnpm 只在「自己解析出的 store」
+    // 与 `node_modules/.modules.yaml` 记录的一致时才继续，否则直接
+    // `ERR_PNPM_UNEXPECTED_STORE` 退出（该错误与插件本身无关，用户看到的是「插件安装失败」）。
+    // 用户的 pnpm 用户级/全局配置（如 `store-dir`）或环境变量可能把 store 指到别处
+    // （典型场景：用户在另一个分区的工程里跑过 pnpm，pnpm 就把那份 store 写进了全局配置），
+    // 此时档案安装必然失败且无法自愈。这里显式下传档案记录的 store：
+    // pnpm 的优先级是 CLI > 环境变量 > 项目 .npmrc > 用户/全局配置，
+    // 因此该值压过用户配置；传的是去掉版本段的基目录，由 pnpm 追加自身主版本的
+    // 版本段（主版本与档案一致时即等于 `.modules.yaml` 里的记录，见
+    // [`super::pnpm::profile_store_base_dir`]）。
+    // 全新档案（没有 node_modules）不注入：让 pnpm 按用户配置自行决定并写回记录。
+    if let Some(store_dir) = super::pnpm::profile_store_base_dir(app_handle) {
+        log::info!("pinning plugin install pnpm store to the profile record: {store_dir}");
+        // pnpm 11 起不再读取 `npm_config_*`：`config/reader` 的 `parseEnvVars` 只认
+        // `pnpm_config_` / `PNPM_CONFIG_` 前缀，其余按键静默 `continue`（见
+        // pnpm 11.0.0 release notes：`npm_config_registry` → `pnpm_config_registry`）。
+        // 只设 `npm_config_store_dir` 对捆绑版 pnpm 11 是空操作 —— 档案记录的 store
+        // 根本没下传，pnpm 用自己解析出的 store 与 `.modules.yaml` 比对失败，仍报
+        // `ERR_PNPM_UNEXPECTED_STORE`。两个前缀同设：pnpm 10 认 `npm_config_*`，
+        // pnpm 11 认 `pnpm_config_*`，值相同因此不冲突。
+        envs.insert("npm_config_store_dir".to_string(), store_dir.clone());
+        envs.insert("pnpm_config_store_dir".to_string(), store_dir);
     }
 
     let mut paths = vec![bin_dir];

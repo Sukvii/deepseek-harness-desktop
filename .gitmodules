@@ -10,3 +10,30 @@
 [submodule "source/dsh-dafeiyu"]
 	path = source/dsh-dafeiyu
 	url = https://github.com/QCYTSN/dsh-dafeiyu
+[submodule "source/dsh-automation"]
+	path = source/dsh-automation
+	url = https://github.com/MichengAI/dsh-automation
+[submodule "source/dsh-plugin-capabilities"]
+	path = source/dsh-plugin-capabilities
+	url = https://github.com/qinyre/dsh-plugin-capabilities
+[submodule "source/dsh-market"]
+	path = source/dsh-market
+	url = https://github.com/dsh-market/dsh-market.git
+[submodule "source/deepseek-harness"]
+	path = source/deepseek-harness
+	url = https://github.com/deepseek-ai/deepseek-harness
+[submodule "source/zcode"]
+	path = source/zcode
+	url = https://github.com/zai-org/ZCode.git
+[submodule "source/dsh-session-notification"]
+	path = source/dsh-session-notification
+	url = https://github.com/dingyi222666/dsh-session-notification
+[submodule "source/dsh-notifications"]
+	path = source/dsh-notifications
+	url = https://github.com/AlonDan/dsh-notifications
+[submodule "source/dsh-notification"]
+	path = source/dsh-notification
+	url = https://github.com/omdsh-dev/dsh-notification
+[submodule "source/tauri-plugin-notifications"]
+	path = source/tauri-plugin-notifications
+	url = https://github.com/Choochmeque/tauri-plugin-notifications

@@ -1,8 +1,3 @@
-//! Minimal backend i18n for user-facing errors.
-//!
-//! The frontend owns the rich UI language state; the backend only needs a few
-//! translated strings for errors that may surface in logs or returned messages.
-
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,57 +26,46 @@ fn lang() -> Lang {
     }
 }
 
-/// Look up a translation key. Keys are grouped by domain with `_` separators.
 pub fn t(key: &str) -> String {
     let (zh, en): (&str, &str) = match key {
-        "runtime.unsupported_platform" => {
-            ("不支持当前平台/架构", "Unsupported platform/architecture")
-        }
-        "runtime.title" => ("Node.js 运行时", "Node.js runtime"),
-        "runtime.not_found" => (
-            "Node.js 运行时不存在，请先完成安装",
-            "Node.js runtime not found, run setup first",
-        ),
-        "runtime.incompatible" => (
-            "Node.js 运行时不兼容，需要 Node 22.19+（仅 22.x）或 Node 24+",
-            "Node.js runtime is incompatible; need Node 22.19+ (22.x only) or Node 24+",
-        ),
-        "harness.title" => ("DeepSeek Harness 核心", "DeepSeek Harness core"),
-        "harness.core_not_found" => (
-            "未找到 DeepSeek Harness 核心包，请先完成安装",
-            "DeepSeek Harness core package not found, run setup first",
-        ),
-        "harness.manifest_invalid" => ("Harness 包清单无效", "Invalid harness package manifest"),
-        "harness.asset_not_found" => (
-            "发布资源中未找到匹配的平台包",
-            "No matching platform asset found in the release",
-        ),
-        "harness.hash_mismatch" => (
-            "下载文件哈希校验失败",
-            "Downloaded file hash verification failed",
-        ),
-        "harness.start_failed" => (
-            "启动 DeepSeek Harness 服务失败",
-            "Failed to start DeepSeek Harness service",
-        ),
-        "harness.health_unhealthy" => (
-            "DeepSeek Harness 服务未就绪",
-            "DeepSeek Harness service is not ready",
-        ),
-        "process.manager_poisoned" => ("进程管理器状态异常", "Process manager state is corrupted"),
-        "config.load_failed" => ("读取配置失败", "Failed to load configuration"),
-        "config.save_failed" => ("保存配置失败", "Failed to save configuration"),
-        "download.failed" => ("下载失败", "Download failed"),
         "install.downloading" => ("正在下载", "Downloading"),
         "install.extracting" => ("正在解压", "Extracting"),
-        "install.downloaded" => ("已下载", "Downloaded"),
         "install.done" => ("依赖已安装完毕", "Dependencies installed"),
+        "menu.run" => ("运行", "Run"),
         "menu.application" => ("应用", "Application"),
+        "menu.profiles" => ("档案", "Profiles"),
+        "menu.plugins" => ("插件", "Plugins"),
+        "menu.harness" => ("核心", "Core"),
         "menu.help" => ("帮助", "Help"),
+        "menu.file" => ("文件", "File"),
+        "menu.new_window" => ("新建窗口", "New Window"),
+        "menu.new_chat" => ("新聊天", "New Chat"),
+        "menu.open_folder" => ("打开文件夹", "Open Folder"),
+        "menu.close" => ("关闭", "Close"),
+        "menu.quit" => ("退出", "Quit"),
+        "menu.documentation" => ("文档", "Documentation"),
         "menu.settings" => ("设置…", "Settings…"),
+        "menu.services" => ("服务", "Services"),
+        "menu.hide" => ("隐藏", "Hide"),
+        "menu.hide_others" => ("隐藏其他", "Hide Others"),
+        "menu.show_all" => ("显示全部", "Show All"),
+        "menu.view" => ("视图", "View"),
+        "menu.toggle_sidebar" => ("显示/隐藏侧边栏", "Toggle Sidebar"),
+        "menu.toggle_right_panel" => ("显示/隐藏右侧面板", "Toggle Right Panel"),
+        "menu.open_terminal" => ("打开终端", "Open Terminal"),
+        "menu.search_chats" => ("查找聊天", "Search Chats"),
+        "menu.zoom_in" => ("放大", "Zoom In"),
+        "menu.zoom_out" => ("缩小", "Zoom Out"),
+        "menu.actual_size" => ("实际大小", "Actual Size"),
+        "menu.window" => ("窗口", "Window"),
+        "menu.minimize" => ("最小化", "Minimize"),
+        "menu.zoom" => ("缩放", "Zoom"),
+        "menu.bring_all_to_front" => ("全部置于顶层", "Bring All to Front"),
+        "menu.keyboard_shortcuts" => ("显示键盘快捷键", "Show Keyboard Shortcuts"),
         "menu.enter_fullscreen" => ("进入全屏幕", "Enter Full Screen"),
         "menu.exit_fullscreen" => ("退出全屏幕", "Exit Full Screen"),
         "menu.about" => ("关于 Desktop", "About Desktop"),
+        "menu.task_manager" => ("任务管理器", "Task Manager"),
         "menu.run_logs" => ("运行日志", "Run Logs"),
         "menu.check_update" => ("检查更新", "Check for Updates"),
         "menu.restart" => ("重启", "Restart"),

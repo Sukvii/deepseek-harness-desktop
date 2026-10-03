@@ -200,6 +200,62 @@ pub(super) fn is_local_link_dep(spec: &str) -> bool {
     spec.starts_with("link:") || spec.starts_with("file:")
 }
 
+/// 收集「本地链接目标已不存在、且不再是当前内置预设」的依赖名（排序后返回）。
+///
+/// 已删除的内置包不会出现在 `load_presets` 的预设清单里，孤儿分支永远碰不到它，
+/// 其 `link:` 悬空依赖与 `dsh.profile.bundles` 引用会永久留在 profile，令 dsh 每次
+/// 启动都报 `cannot resolve profile bundle <name>`。`keep`（当前预设的包名）必须
+/// 排除：预设的链接目标可能因应用升级/切分支而移动，那条路径要重装而不是卸载。
+/// 只认 `link:`/`file:` 本地链接；registry/git 引用缺产物属安装问题，绝不在此清理。
+pub(super) fn collect_dangling_local_link_deps(
+    manifest: &serde_json::Value,
+    keep: &HashSet<&str>,
+    profile: &Path,
+) -> Vec<String> {
+    let Some(dependencies) = manifest
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let mut dangling: Vec<String> = dependencies
+        .iter()
+        .filter(|(name, spec)| {
+            !keep.contains(name.as_str())
+                && spec.as_str().is_some_and(|spec| {
+                    is_local_link_dep(spec) && !local_link_target_exists(spec, profile)
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    dangling.sort();
+    dangling
+}
+
+/// 本地链接依赖的目标目录是否存在（相对值按 profile 目录解析，容忍 verbatim 前缀）。
+fn local_link_target_exists(spec: &str, profile: &Path) -> bool {
+    let Some(raw) = spec
+        .strip_prefix("link:")
+        .or_else(|| spec.strip_prefix("file:"))
+    else {
+        return true;
+    };
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return false;
+    }
+    // pnpm 在 Windows 上可能写入 `\\?\` / `//?/` verbatim 前缀，先经 dunce 归一化，
+    // 否则对同一目录的判存会因前缀不同而假阴性。
+    let normalized = trimmed.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let path = dunce::simplified(Path::new(&normalized)).to_path_buf();
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        profile.join(path)
+    };
+    resolved.is_dir()
+}
+
 /// 判断 pnpm 写入 profile 的依赖值与期望的 `link:` 捆绑路径是否一致。
 ///
 /// 容忍：`link:`/`file:` 前缀缺失或两者混写（历史遗留 `file:` 安装值）；Windows
@@ -210,14 +266,15 @@ pub(super) fn dep_matches_spec(actual: &str, expected: &str) -> bool {
             .strip_prefix("link:")
             .or_else(|| spec.strip_prefix("file:"))
             .unwrap_or(spec);
-        // 统一用 dunce 归一化 Windows 扩展长度路径前缀（`\\?\`）：
-        // 期望值已经由 bundled_dep_spec 归一化掉前缀；若历史命中的实值仍带
-        // `//?/` / `\\?\` 前缀，先归一再比对，保证幂等（避免旧值一次次触发
-        // 不必要的重装）。先把手写正斜杠的 verbatim 形式（`//?/`）换算成反斜杠
-        // （dunce 依赖 `\\?\` 识别 verbatim），再交给 dunce::simplified，最后
-        // 统一回正斜杠，与 bundled_dep_spec 的产出可比。
-        let backslash = stripped.replace('/', "\\");
-        dunce::simplified(Path::new(&backslash))
+        let normalized = stripped.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR);
+        let path = Path::new(&normalized);
+        let resolved = if path.is_absolute() {
+            dunce::canonicalize(path).ok()
+        } else {
+            None
+        };
+        resolved
+            .unwrap_or_else(|| dunce::simplified(path).to_path_buf())
             .to_string_lossy()
             .replace('\\', "/")
             .trim_end_matches('/')
@@ -399,6 +456,48 @@ mod tests {
     }
 
     #[test]
+    fn dangling_local_link_deps_exclude_presets_and_registry_specs() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-dangling-link-deps-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("profile");
+        let alive = root.join("packages/dsh-tauri-ui");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&alive).unwrap();
+        let alive_spec = format!("link:{}", alive.to_string_lossy());
+
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "dsh-tauri-panel": "link:D:/gone/packages/dsh-tauri-panel",
+                "dsh-tauri-ui": alive_spec,
+                "dsh-tauri": "link:D:/gone/packages/dsh-tauri",
+                "dshmarket": "github:dsh-market/dshmarket",
+                "dsh-better-sidebar": "1.0.0",
+                "dsh-tauri-pet": "link:missing-sibling-package"
+            }
+        });
+        let keep = HashSet::from(["dsh-tauri"]);
+
+        let dangling = collect_dangling_local_link_deps(&manifest, &keep, &profile);
+
+        assert_eq!(
+            dangling,
+            vec!["dsh-tauri-panel".to_string(), "dsh-tauri-pet".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dangling_local_link_deps_ignore_manifests_without_dependencies() {
+        let profile = std::env::temp_dir();
+        let manifest = serde_json::json!({ "name": "dsh-profile-web", "private": true });
+
+        assert!(collect_dangling_local_link_deps(&manifest, &HashSet::new(), &profile).is_empty());
+    }
+
+    #[test]
     fn dep_spec_matches_itself() {
         let expected = "link:C:/Apps/dsh/resources/internal-plugins/dsh-tauri";
         // 与自身一致
@@ -426,10 +525,39 @@ mod tests {
     }
 
     #[test]
+    fn dep_spec_does_not_reinstall_healthy_workspace_path_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-dep-path-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(root.join("packages/dsh-tauri")).unwrap();
+        let actual =
+            crate::service::plugin::preset::bundled_dep_spec(&root.join("packages/dsh-tauri"));
+        let expected = crate::service::plugin::preset::bundled_dep_spec(
+            &root.join("src-tauri/../packages/dsh-tauri"),
+        );
+        let matches = dep_matches_spec(&actual, &expected);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches,
+            "healthy plugin must not reinstall: actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
     fn dep_spec_rejects_wrong_path_or_source() {
         let expected = "link:C:/Apps/dsh/resources/internal-plugins/dsh-tauri";
         // 仍指向 npm 版本（用户手动从 npm 安装，非捆绑 link: 源）
         assert!(!dep_matches_spec("dsh-tauri@0.2.0", expected));
+        assert!(!dep_matches_spec("^0.2.0", expected));
+        let cwd_spec =
+            crate::service::plugin::preset::bundled_dep_spec(&std::env::current_dir().unwrap());
+        assert!(!dep_matches_spec(".", &cwd_spec));
         // 指向其它位置（旧版本安装目录等）
         assert!(!dep_matches_spec("link:D:/elsewhere/dsh-tauri", expected));
         // 同名不同宿主盘符

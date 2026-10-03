@@ -1808,3 +1808,587 @@ REVIEW §H 两项返修完成并逐项复跑：**R-V8-1B-1**（健康结果绑�
 
 核对方法：`gh run view <id> --log` 日志含 ANSI 色码（`warning` 与 `:` 之间），先剥 `\x1b\[[0-9;]*m` 与时间戳前缀再按行提取比较；脚本与原始日志见证据目录。
 
+---
+
+## U1. 推荐版本与受控资源分离（2026-10-03，执行端；合并挂起树）
+
+### U1.1 代码落点与调用方
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/resources/manifest.jsonc` | `engines.dsh` 追加 `"wslRecommend": "0.1.2-rc.1"`（`recommend` / `minimum` 保持上游 0.2.0-rc.2 / 0.1.5-rc.1） |
+| `src-tauri/src/config/manifest.rs` | `DshEngine.wsl_recommend`（`#[serde(rename = "wslRecommend")]`）+ `recommended_wsl_dsh_version()`；校验口径拆为私有 `validated_recommendation()`（见 D-U1-1） |
+| `src-tauri/src/service/wsl_core/install.rs` | `default_version_spec` 改读 `recommended_wsl_dsh_version`；错误文本改为 `WSL_DSH_VERSION_UNCONFIGURED: WSL recommended dsh version is missing or invalid` |
+| `src-tauri/src/bridge/wsl_core.rs` | 新增只读命令 `get_wsl_recommended_version`（未选发行版时也能读默认目标）；`install_wsl_core` 注释同步 |
+| `src-tauri/src/bridge/lifecycle.rs` | WSL 分支注释同步（默认目标 = WSL 独立基线） |
+| `src-tauri/src/desktop/builder.rs` | `generate_handler!` 注册 `get_wsl_recommended_version` |
+| `src/config/query-keys.ts` | 新增 `wslRecommendedVersion: ['wsl_recommended_version']` |
+
+调用方不变：`install_wsl_core` 与 `install_dependencies` 都经 `default_version_spec` 解析默认目标——WSL 各入口选择同一已打包基线（U0.4 表中 U1 完成条件）。
+
+### D-U1-1（已实施）推荐值校验拆分为可测私有函数（轻微偏离 U1.1 代码骨架）
+
+- **阶段**：U1
+- **假定**：按 U1.1 的内联写法，`recommended_wsl_dsh_version` 的 trim / 空串 / semver 判定无法进入单测——仓库无 AppHandle 测试设施（无 tauri `test` feature、无 mock 助手），W 系列对 AppHandle 路径一律用应用级验收（如 S 节「改/隐藏配置再启动」法）。
+- **实际**：把同一表达式原样拆为 `fn validated_recommendation(raw: &str) -> Option<String>`（行为逐字一致：trim → 非空 → `semver::Version::parse`）供读取器调用。仓库先例：`install.rs::needs_runtime_update`（单消费者纯函数 + 专属单测）。
+- **决定**：保留拆分；读取器其余结构（`with_manifest` 闭包 + `?`）与 U1.1 骨架一致。
+- **影响**：U1.3「缺字段 / 空串 / 无效 semver」由单测覆盖（见 U1.2）；审核如要求还原内联写法，可再合并。
+
+### U1.2 验收与资源记录
+
+| 项 | 结果 |
+|---|---|
+| 资源保留 | `resources/wsl-runtime/0.1.2-rc.1/` 未因合并改动：Git blob 与 `cd8af24` 相同（`package.json` `859ecc46…`、`package-lock.json` `14fd0d99…`）；锁 SHA-256 `46d0671d…fbe54`（与 W6 记录一致），manifest SHA-256 `1a74891b…8398` |
+| 打包声明 | `tauri.conf.json` `"resources": ["resources/**/*", …]`（上游原文）已覆盖该目录，未新增 glob |
+| 单测 | 新增：`shipped_manifest_declares_independent_wsl_recommendation`（两推荐值独立且正确）、`wsl_recommend_field_defaults_and_validation_gate`（缺字段回落空串；空串 / `latest` / 非法 semver → 未配置）、`shipped_wsl_runtime_resources_pin_recommended_version`（默认目标 0.1.2-rc.1 资源在盘、manifest / lock 钉住该版本、锁哈希固定）。保留：`needs_runtime_update_covers_version_and_baseline_cases`（锁变化触发更新 / 锁相同不重装） |
+| 待 U8 实测 | 「无对应资源时报错」（目标无 `wsl-runtime/<version>/` 时的 `WSL_RUNTIME_RESOURCE_MISSING`，安装停止、无回退）与「缺 / 坏 WSL 配置的应用级报错路径」——沿用 S 节验收办法（改 / 隐藏清单字段），纳入 U8 回归矩阵 |
+
+> 说明：本阶段处于合并挂起树（U0.3 起），全量 `cargo test` 与 fmt / clippy 按方案在 U8 统一执行；本阶段以 rustfmt 解析、`git diff --check` 与静态核对覆盖改动文件。
+
+---
+
+## U2. WSL 认证补丁局部化（2026-10-03，执行端；合并挂起树）
+
+### U2.1 代码落点
+
+| 文件 | 改动 |
+|---|---|
+| `src-tauri/src/service/wsl_core/auth_patch.rs` | **新增**：自 `service/patch/alpha_auth.rs` 迁入 `patch_startup` / `patch_connection` 纯函数与锚点常量（`pub(super)`）；纯函数测试全量随迁，并新增「缺任一认证锚点」四面用例（U2.3） |
+| `src-tauri/src/service/wsl_core/mod.rs` | 增 `mod auth_patch;`（模块划分注释同步） |
+| `src-tauri/src/service/wsl_core/patch.rs` | 导入改为 `super::auth_patch`；相对路径说明注释去旧路径 |
+| `src-tauri/src/service/wsl_core/script.rs` | `SKIPAUTH` 注释对齐 `auth_patch`（去已删函数引用） |
+| `src-tauri/src/service/patch/alpha_auth.rs` | **删除**（modify/delete 冲突按方案解除：`git rm`，模块声明保持上游的删除状态） |
+| `src-tauri/src/utils/mod.rs` | 解决内容冲突（U2.2 骨架）：`patch_dsh` = `Option<PathBuf>` 判空 + `patch_core_file`；保留上游 `patch_core_file` 与 WSL 侧 `patch_file_at`（三态）；`dsh_rel_contains` 删除 |
+
+未迁移（按 U2.1 限定）：`apply()` 调度入口、`web_startup_supports_skip_auth()`、`WEB_STARTUP_REL` / `CONNECTION_INDEX_JS` 路径常量——桌面 v0.21.0 已改用 `DSH_TAURI_EMBEDDED=1` + 内置 `dsh-tauri` gate（`launch.rs` 保留），合并后 launch.rs 对其无引用；WSL 的 `START` / `VERIFY_CORE` 继续固定 `--skip-auth`，不注入新版桌面插件。
+
+### U2.2 验证
+
+| 项 | 结果 |
+|---|---|
+| 冲突收敛 | `--diff-filter=U` 从 20 → **18**（`utils/mod.rs` 与 `alpha_auth.rs` 已解决并暂存） |
+| 残留引用 | `alpha_auth` 仅剩 2 处**说明性**注释（auth_patch.rs 模块头、patch.rs 相对路径说明）；`dsh_rel_contains` / `web_startup_supports_skip_auth` 零引用 |
+| rustfmt | 新文件 `auth_patch.rs` 经 rustfmt 规范后 **0 diff**（U8「新文件基线 0」要求）；`wsl_core/{patch,mod,script}.rs` = 0；`utils/mod.rs` = 1 处，与上游 v0.21.0 基线**同一位置同一内容**（encode_multibyte 测试，非本改动引入） |
+| 补丁语义 | 随迁断言保留：Patched / AlreadyPatched / AnchorMissing 三态、重复应用幂等、npm/pkg 两种布局、真实单行链式样本、Host/Origin fence 保留；新增四面「缺一锚点 → AnchorMissing」（不产生半层补丁） |
+| 与 PROBE 一致 | `patch_targets_match_probe_candidates_exactly` 保留——补丁与 `PROBE` 检查同一组实际加载文件（U2.3）；`skipAuthReady` 仍需两层文件都就绪 |
+| 待 U8 | 全量 `cargo test`（当前树含 18 个冲突文件，无法整体编译）；真机补丁 / 启动 / 双层判定在 U8 矩阵执行 |
+
+> 说明：`dsh_rel_contains` 删除依据 U2.2 口径——fork 侧唯一调用者是 `alpha_auth::web_startup_supports_skip_auth`，随模块删除后无调用方；上游 v0.21.0 亦无。
+
+---
+
+## U3. 来源、配置、列表与激活（2026-10-03，执行端；合并挂起树）
+
+### U3.1 代码落点与冲突处置
+
+| 文件 | 处置 |
+|---|---|
+| `service/core/source.rs` | 3 处内容冲突解决：① 上游最低版本门禁（`meets_baseline` / `core_supports_bundled_plugins` / 单次告警）与 fork 来源判定合并——`active_source` **先做显式且有效的 WSL 早退**（U3.1 片段，先于本地核心判定），其余走上游规则；判定拆为 `explicit_wsl_selection` + `resolve_local_or_app` 两个纯函数（D-U1-1 测试口径）② `active_version` 采用上游随包核心分支（`active_is_bundled` 提前返回）+ 保留 WSL 缓存分支（无缓存返回 None，不回落 Windows 版本）③ 旧 `resolve_active_source` 及两个旧测试删除，替换为两个新纯函数的测试 |
+| `service/core/version.rs` | 5 处冲突解决：① 采用上游 `fetch_release_catalog` 重构（`list()` 调它），删除 fork 旧 `list()` 片段 ② **WSL 行加入共同构造器 `rows_with_release_catalog`**（U3.2：`cfg!(windows)` + 发行版非空门控；`recommended_version` 读 `wslRecommend`；`above_recommended` 用新纯函数 `wsl_above_recommended`；removable / bundled / preview / orphaned 恒 false）——`list()` 与 `list_local()` 都经它，切换回包不再 `CORE_NOT_FOUND` ③ `set_active` 增 `id == "wsl"` 早分流 → 新 `set_active_wsl`：**探测在转换锁之外**、锁内重读发行版、`stop_harness_for_core_switch` 后精确写 `active_core`，不动机器 `dependencies` 映射与 pkg tag ④ `switch_app_version` 同 tag 分支合并为上游形态（`is_file()` 守卫 + 停服），保留 WSL 场景注释 ⑤ 保留 `wsl_data_dir_unc`（含测试），删除已死的 `active_app_version`（上游由 `trusted_release_version` 取代） |
+| `bridge/config.rs` | 尾部测试模块冲突解决：保留 `normalize_wsl_distro` 两个测试；**上游已删除 `adjust_webview_zoom` / `ZoomAction` / `next_zoom_factor`**（改由菜单事件 `desktop-zoom-in/out/reset` 处理），fork 的 zoom 步骤测试随功能删除；顺带移除 `update_app_config` 上合并产生的重复 `#[allow(clippy::too_many_arguments)]` 并对齐上游属性顺序 |
+| `bridge/core.rs` | 自动合并正确（与上游仅测试注释差异）；id 注释补 `app-bundled` |
+| `config/setting.rs` | 自动合并已完整：`wsl_distro` 字段 / `Default` / 旧配置反序列化与往返测试均在，无需改动 |
+| `service/core/mod.rs` | 自动合并正确：`is_wsl_active` / `wsl_exe_path` 导出保留 |
+
+**新选择（方案未覆盖，`CORE_` / `WSL_` 错误码）**：
+- 非 Windows 调 `set_active("wsl")` → `CORE_WSL_UNSUPPORTED: the WSL core is only available on Windows`（U3.3「Windows 门控」的落点）。
+- 锁内重读发现发行版在探测期间被改/清空 → `WSL_DISTRO_CHANGED: distro changed during probe, retry`（沿用 W3 同名错误串前缀）。
+
+### U3.2 验证
+
+| 项 | 结果 |
+|---|---|
+| 冲突收敛 | `--diff-filter=U` 18 → **15**（source.rs / version.rs / bridge/config.rs 已解决并暂存） |
+| rustfmt | source.rs 0；bridge/config.rs 0；version.rs 1（**上游 v0.21.0 基线同一行同一内容**：bundled 行 `present:` 折行，非本改动引入） |
+| 测试 | 新增 `explicit_wsl_selection_requires_platform_flag_and_distro`（未配置 / 空串 / 非 Windows 不激活）、`resolve_local_or_app_follows_upstream_rules`（含「本地过低仍回退 App」与残余 wsl 走自动）、`wsl_above_recommended_requires_both_versions_parse`；保留 `wsl_data_dir_unc_maps_linux_home_to_unc` 与上游全部 source / version 测试 |
+| 引用清理 | `resolve_active_source` / `active_app_version` / `next_zoom_factor` / `ZoomAction` 零残留；`CoreSource` 全仓 6 个引用文件核对——full match 均含 Wsl 臂，其余为等值判定（`runtime.rs` 的 `!= App` 在 WSL 下跳过本机修复，语义正确） |
+| 待 U8 | 全量编译与 `cargo test`；「离线激活回包成功」「app-bundled 仍保留离线目录」「WSL→App 同 tag 停原服务并切回」「WSL 低于本机 minimum 不被误拒」的应用级用例按回归矩阵执行 |
+
+---
+
+## U4. 生命周期、退出与安装器交接（2026-10-03，执行端；合并挂起树）
+
+### U4.1 代码落点与冲突处置
+
+| 文件 | 处置 |
+|---|---|
+| `service/workflow/process.rs` | 3 处内容冲突解决：① `owned_process_pid`（上游，任务管理器用）与 `owned_wsl_target`（fork，R-V8-1B）**并存**（mod.rs 均导出）② `terminate_owned_process` 采用上游签名 `-> Result<bool, ()>`，文档合并两侧（WSL 登记目标 + 返回语义）③ `terminate_stale_harness_processes` 保留 fork 的 WSL STOP 前置段（`is_wsl_active` → `stop_wsl_harness`，先于平台分支、debug 也执行），删掉 fork 的无条件 `cfg!(debug_assertions)` 捷径（见 D-U4-2）④ 上游失败恢复分支 `*guard = Some(owned)` 之后改用先取的 `let pid = owned.pid;`（去 Copy 后的 use-after-move 修复，U4.1 骨架） |
+| `service/workflow/launch.rs` | 2 处内容冲突解决：① 采纳上游删除 `resolve_port` 包装与 `--no-open` 判定三函数（见 D-U4-1）② WSL 分流按 U4.4 补「preflight 前 `has_owned_process` 廉价早退」与「锁内重读来源 + 发行版」（见 D-U4-5）③ 引用同步：更新 WSL 分流注释与 `wsl_launch::resolve_port_wsl` 文档链接（原链接指向已删函数） |
+| `service/workflow/mod.rs` | 2 处冲突解决：模块文档合并（保留 wsl_launch 段，去掉 `--no-open` 版本判定表述）；导出取**并集**——`owned_process_pid` / `owned_wsl_target` / `stop_for_installer` / `stop_on_exit`（上游单参签名）等全部保留 |
+| `service/workflow/sweep.rs` | 内容冲突解决：保留 WSL 选择下**不进发行版**清扫（R-W4-1，`!wsl_active` 时才调 `terminate_stale_harness_processes`）；采纳上游 `if cfg!(windows) { return; }`（Windows 不走共享 PID 标记逻辑）；注释合并两侧依据 |
+| `service/workflow/wsl_launch.rs` | 无冲突。核对 U4.4 通过：退出线程用 `on_owned_process_exit`（只清匹配 PID、关闭取出的句柄、保留 `harness-process-exited` 事件）；`spawn` 顺序 = 登记 `WslTarget` → `note_launch_started`。未改代码，仅更新文档链接 |
+| `src/lib.rs` | 退出处理合并：上游 `terminate_active_installs_blocking()`（插件安装子进程先回收）+ fork 条件 `installed \|\| has_owned_process()`（仅装过 WSL 的用户也进停服）+ 上游 `stop_on_exit(app_handle)` 单参签名 |
+| `service/download/mod.rs` | **提前消解（U7 项，见 D-U4-3）**：并集导出——保留 `record_mappings` / `tasks` / `ProgressPayload`（各有调用方）；删 fork 的 `Git` 导出（全仓零使用） |
+| `service/core/version.rs` | 修复 U3 遗留笔误（见 D-U4-4）：`config.get_store_dat_setting` → `config::get_store_dat_setting` |
+
+### U4.2 验证
+
+| 项 | 结果 |
+|---|---|
+| 冲突收敛 | `--diff-filter=U` 15 → **9**（lib.rs / launch.rs / workflow mod·process·sweep.rs / download/mod.rs 已解决并暂存；剩余 README×3、hooks×2、i18n×2、ui×2 归 U6/U7/U9） |
+| 编译（首次全树） | `cargo check` **0 error**；2 个 warning——`recovery.rs:78` unused mut、`builder.rs:571` `ViewMenuEntry` 字段未读，均**上游 v0.21.0 基线**（Windows 平台既有）；期间暴露并修复 U3 笔误（D-U4-4）与 `Git` 导出（D-U4-3） |
+| rustfmt | lib.rs / workflow mod·sweep·wsl_launch.rs / download/mod.rs = 0；process.rs 13 行、launch.rs 30 行、version.rs 1 处——均与上游 v0.21.0 基线**逐一相同**（非本改动引入） |
+| 测试（现存） | `owned_process_take_if_only_matches_pid`（退出线程只清匹配 PID）、`wsl_target_survives_take`（WslTarget 随取随存）、`harness_process_exit_payload_serializes_exit_code`；launch 端口自愈 / `wait_for_port_release` / duplicate-loader 测试随上游保留并全量在盘 |
+| 待 U8 | 「无登记 no-op」「改设置后仍停登记旧发行版」「Linux STOP 先于 relay 回收」「失败恢复不丢 WslTarget」「installed=false 且有 owned 时退出仍回收」——真实句柄 / 发行版行为按 U4.5 集成矩阵验证，本轮不以静态检查冒充 |
+
+### D-U4-1（已实施）删除 fork 的端口自愈包装与 `--no-open` 版本判定（跟随上游）
+
+- **阶段**：U4
+- **假定**：方案 U4.4 未逐项列删除；fork 的 `resolve_port`（W3 提取的 async 包装）与 `--no-open` 判定三函数是 W 系列为兼容旧核心引入。
+- **实际**：上游 v0.21.0 已把端口自愈内联进 `launch()`（保留 `resolve_heal_port` 纯函数）、参数构造收敛到 `build_harness_args` 并硬编码 `--no-open`（注释明示「全部受支持核心 ≥ 0.1.5-rc.1 均已具备」）；fork 的 WSL 侧不消费 `resolve_port`（自用 `resolve_port_wsl` + `resolve_heal_port`），`web_supports_no_open_flag` 合并后无调用点。
+- **决定**：删除这四个 fork 函数/包装，采纳上游内联与硬编码；`resolve_heal_port` 保持 `pub(super)`（wsl_launch 消费）与 WSL 文档补充。
+- **影响**：launch.rs 与上游结构差异进一步收敛；WSL 行为不变（`wsl_start_args` 独立构造）。`semver` 依赖仍被 manifest / lifecycle 使用，未受影响。
+
+### D-U4-2（已实施）`terminate_stale_harness_processes` 删除 fork 的 Windows debug 捷径
+
+- **阶段**：U4
+- **假定**：方案 U4.4 要求「保留 fork WSL 清扫入口后继续上游本机清扫，**不早退掉后半段**」；fork 的无条件 `if cfg!(debug_assertions) { return; }` 在 Windows 上正是「早退掉后半段」。
+- **实际**：上游 Windows 清扫已升级为「入口路径 + 父进程已退出」孤儿判定（PowerShell 枚举 + 创建时间校验），不会误杀另一个在跑的桌面实例——fork 该捷径的动因已被上游原生覆盖；Unix 分支上游仍保留 debug 捷径。
+- **决定**：删除 fork 捷径，Windows debug 下也执行孤儿枚举（每次 launch 多 ~1 s，位于 `spawn_blocking` 内）；注释同步改写。
+- **影响**：dev 构建启动稍慢属预期；判定安全性由上游实现保证。
+
+### D-U4-3（已实施）download/mod.rs 冲突提前消解（U7 项提前）
+
+- **阶段**：U4（偏离阶段划分）
+- **假定**：该文件 export 冲突属 U7「download module exports」；但它是全树编译的**唯一解析错误**（diff marker），挡住 U4 编译验证与后续阶段一切 `cargo check`。
+- **实际**：以调用方为准取并集——`record_mappings`（bridge/lifecycle.rs）、`tasks()`（workflow/install.rs）、`Dsh` / `InstallKind` / `Installable` / `Nodejs` / `Pnpm`（多文件）、`ProgressPayload`（wsl_core::install 复用）必留；fork 的 `Git` 导出全仓零使用，且上游不导出（保留触发 unused_imports 警告），删除。
+- **决定**：U4 提前消解并暂存；U7 复核导出集合与调用方（U7 若另有 download 改动再调整）。
+- **影响**：全树编译解锁（U4.2 首次跑通 `cargo check`）。
+
+### D-U4-4（已实施）修复 U3 遗留 `version.rs` 笔误
+
+- **阶段**：U4（修复 U3 缺陷）
+- **假定/实际**：U3 的 WSL 行插入把 `config::get_store_dat_setting(app_handle)` 写成 `config` 换行 `.get_store_dat_setting(...)`（模块名当值用），产生 E0423 / E0277 两个编译错误；U3 阶段无 `cargo check`（合并挂起树被 download 冲突挡住），未暴露。
+- **决定**：改为 `config::get_store_dat_setting(app_handle)` 链式写法；rustfmt 复核与上游基线同位置。
+- **影响**：无行为变化；U8 全量编译为最终把关，后续阶段结束即跑 `cargo check` 以尽早暴露同类问题。
+
+### D-U4-5（已实施）launch() WSL 分流补「廉价早退 + 来源重读 + 双次 distro 核对」
+
+- **阶段**：U4
+- **假定**：方案 U4.4 流程图要求「读取 WSL 目标 → `has_owned_process` 廉价早退 → preflight（锁外）→ … → 重读来源和 distro → clear_stale → 再核对 distro」；fork 现状只有 clear_stale 后一次 distro 核对、无锁外早退、无来源重读。
+- **实际**：preflight 最长 30 s（含发行版冷启动），前端 boot 与 auto_start 并发时无早退会重复探测；期间用户可切回本机核心，而 `WSL_DISTRO_LOCKED`（以 `has_owned_process()` 为条件）不拦。
+- **决定**：按流程图补齐——① 分流入口 `has_owned_process` 早退（锁内二次检查仍在）② 锁内重读「来源 + distro」，clear_stale 后保留终检；来源变化沿用 `WSL_DISTRO_CHANGED` 前缀（消息区分 `active core changed` / `distro changed`）。
+- **影响**：失败路径提前返回，不产生无效 STOP / 端口扫描；错误语义与 U3 记录一致（新增变体消息即本条记录）。
+
+> 说明：本阶段仍处合并挂起树；全量 `cargo test` 与 fmt / clippy 按方案在 U8 统一执行（本轮已额外跑通 `cargo check`——首次全树类型检查，见 U4.2）。
+
+---
+
+## U5. 受控安装、正式就绪确认及回滚闭环（2026-10-03，执行端；合并挂起树）
+
+### U5.1 调用闭环核对（方案 U5.2 全表）
+
+`wsl_core/*` 无 git 冲突（仅 U1/U2 自身改动）；唯一跨文件落点 `bridge/system_os.rs` 与上游的 diff **仅** `proxy_health_check` 的 fork 包装（doc + `claim_health_target` → 请求 → `note_health` 三行，claim 先于请求；opener / 剪贴板 / 日志改进逐字保留）。
+
+| 环节 | 核对（证据） |
+|---|---|
+| `bridge::proxy_health_check` | system_os.rs:23-29：claim（发起前固定上下文）→ `workflow::proxy_health_check`（v0.21.0 实现）→ `note_health` |
+| `install::ensure` | install.rs：`WSL_INSTALL_LOCK` + `try_lock`（353）；运行中 `WSL_INSTALL_BUSY`（669-676）；0a 先解决上次 pending（同发行版先回滚、异发行版 / rollbackFailed 拒绝，434-468）；候选 VERIFY_OK（VERIFY_CORE）→ SWITCH_RUNTIME 整树切换 → `switch::arm`（679-755），arm 失败 `rollback_unarmed` |
+| `launch` WSL 失败 | launch.rs:329 → `on_launch_failure`（U4 已核对） |
+| `wsl_launch::spawn` | wsl_launch.rs:313 `note_launch_started` → 更新 started_at + `spawn(deadline_task)`（switch.rs:507-528） |
+| 正式健康成功 | `try_confirm`：started_at 已尝试 + `health_target_matches` + `runtime_baseline_matches` 齐备才确认（switch.rs:644-675）；`note_health` 经 `resolve_claim` 三方核对（claim ↔ 世界 ↔ 标记） |
+| 失败 / 截止 | `rollback_now`：停目标服务（pid 三重确认 + 进程组 kill）→ ROLLBACK_RUNTIME 移出失败树、恢复备份 → 刷新 probe；成功清标记；失败置 `rollbackFailed` 写回（789-870）；`deadline_task` 自测健康按同一规则处置（537-591） |
+| 切回 Windows | `resolve_claim` / `rebind_exited_target` 均以**当前** `is_wsl_active` 为准，非 WSL 直接 None（304-342，REVIEW §J.1） |
+
+其余核对：`runtime_ready` async + spawn_blocking + `cached_or_probe`（lifecycle.rs:508-522）；`install_dependencies` WSL 分支先于 Windows Node/pnpm/Git 检查与依赖映射写入（90-128 vs 132+）；`check_dsh_update` WSL→`Ok(None)`（329-332）；`credentials.rs` 保留（`.credentials.yaml.lock` 独占锁自清、`umask 077; mktemp` 0600 同目录临时文件、rename 原子提交、密钥不入 argv / 脚本 / 日志；5 单测在盘）；SWITCH_RUNTIME 仅动 `runtime` / `runtime-candidate` / `runtime-backup-<stamp>` 三槽（script.rs:207-216），不覆盖 profiles / 会话 / credentials；前端超时 `STARTUP_INACTIVITY_TIMEOUT`=180 s / `STARTUP_ABSOLUTE_TIMEOUT`=300 s（`harness/constants.ts`）与 `PENDING_GRACE`=360 s 的关系断言在测试中通过。
+
+U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（frame / ready / stalled / failed 四消息）、builder.rs 全帧注入（832）、前端状态机（`harness/store.ts`、`layout/components/iframe.tsx`、`hooks/use-appearance.ts`）均为上游新代码、无冲突，保持原样；真机验证归 U8。
+
+### U5.2 修复与验证
+
+| 项 | 结果 |
+|---|---|
+| 过时引用（D-U5-1） | switch.rs 模块注释引用的 `src/utils/readiness.ts` 上游已删——更新为 `harness/constants.ts` + `utils.ts` / `store.ts`（仅注释） |
+| U2 遗留缺陷（D-U5-2） | `utils/mod.rs` 双 `mod tests`（E0428）——`cargo check` 不编译 `#[cfg(test)]` 故未暴露，`cargo test` 编译即失败；合并为一个模块，rustfmt 5 行 = 上游基线 |
+| 测试 | `cargo test --lib wsl_core`：**65 passed; 0 failed**（含 `claim_binds_probe_to_request_time_identity`、`exit_rebind_only_covers_own_instance_exit_under_pending_identity`、`rollback_reason_requires_launch_attempt_and_respects_grace`、`target_matches_binds_to_store_distro_and_owned_process`、`runtime_window_scripts_guard_scope_and_rollback` 等）；全量 `cargo test --lib` 结果见 commands.md #41 |
+| 暂存补齐 | U1/U2 遗留未暂存文件：`auth_patch.rs`（未跟踪 → A）+ `wsl_core/{install,mod,patch,runtime,script}.rs` + `bridge/{core,wsl_core}.rs` 全部暂存 |
+
+### D-U5-1（已实施）switch.rs 注释对已删前端文件的引用更新
+
+- **阶段**：U5
+- **假定/实际**：上游 v0.21.0 删除 `src/utils/readiness.ts`（readiness 逻辑重构进 `src/store/modules/harness/*`）；WSL 的 switch.rs 模块注释仍引用旧路径，会误导后续同步。
+- **决定**：更新为 `harness/constants.ts`（`STARTUP_INACTIVITY_TIMEOUT` / `STARTUP_ABSOLUTE_TIMEOUT`）+ `utils.ts` / `store.ts` 消费；断言（`PENDING_GRACE > 300`）不变。
+- **影响**：仅注释；超时分层语义不变（U5.1 核对）。
+
+### D-U5-2（已实施）修复 U2 遗留的 utils/mod.rs 双 `mod tests`
+
+- **阶段**：U5（修复 U2 缺陷）
+- **假定/实际**：U2 解决 utils/mod.rs 冲突时两个测试模块（fork 基线 + `patch_file_at`）并存为两个 `#[cfg(test)] mod tests`；`cargo check` 不编译测试配置，U3/U4 的验证未暴露；U5 首次 `cargo test` 编译即 E0428。
+- **决定**：合并为一个模块（use 并入并按 rustfmt 排序）；验证口径升级——后续阶段收尾至少跑一次 `cargo test --lib`（编译测试配置）而不止 `cargo check`。
+- **影响**：测试恢复可编译；`patch_file_at` 三态测试与 GBK / 短名测试同模块运行。
+
+### D-U5-3（已实施，基本复验通过；U8 应用级验收待完成）：Windows junction 混合分隔符修复
+
+- **审核条目**：U0–U5 REVIEW 的 D1。
+- **用户裁决**：2026-10-03 明确同意该项限定修复；本轮要求提供代码级执行方案，未要求审核端直接实施源码修改。
+- **决定**：允许修复 `service/core/runtime.rs::create_directory_junction` 的目标路径分隔符，并添加直接覆盖 junction 分支的混合路径回归用例；原 scoped 插件失败用例保留。
+- **范围**：该函数的局部改动及同模块测试。保持 symlink 优先、权限错误回退 junction 的现有策略，不改内置插件装配策略，不以提高权限或开启开发者模式替代修复。
+- **验收原则**：直接 junction 回归先红后绿，原失败用例恢复，全量库测试无失败；链接删除不影响源目录。批准不等于已通过。
+- **实施状态（2026-10-03）**：已实施。直接回归先红（`Os { code: 123, InvalidFilename }`）后绿，原 scoped 用例与现有直接 junction 用例均通过；应用全量库测试 906/0（短隔离 TEMP，`u5rtmp`；MAX_PATH 夹具交互说明见证据目录 README）。链接删除不影响源目录断言保留。证据：[u5-r/20261003-170541-562](E:/DSH-WSL/validation/sync-v0.21.0-20261003/u5-r/20261003-170541-562/README.md)（红/绿原始日志、修复前后哈希）。真实应用级验收保留 U8。
+- **事实依据**：[WSL-CORE-REVIEW.md §L](E:/DSH-WSL/WSL-CORE-REVIEW.md) D1；不以未经证实的 CI 权限推测作为决策依据。
+- **执行入口**：[DSH-WSL-CORE-PLAN.md](E:/DSH-WSL/DSH-WSL-CORE-PLAN.md) §U5-R.2。
+
+### D-U5-4（已实施，基本复验通过；U8 应用级验收待完成）：发行版配置写入加入核心转换互斥
+
+- **审核条目**：U0–U5 REVIEW 的 D2。
+- **用户裁决**：2026-10-03 明确同意该项限定修复；与 D-U5-3 一并交执行端实施。
+- **决定**：携带 `wslDistro` 的 `update_app_config` 调用复用已有核心转换锁；持锁后重读发行版及运行状态，直到精确写入完成才释放。未携带该字段的普通设置更新不取此锁。
+- **范围**：`bridge/config.rs::update_app_config` 的取锁位置和 guard 生命周期，配套针对实际命令主体的组件回归。保持锁外预探测、既有运行中拒绝策略、15 秒转换锁超时及错误码；不新增互斥锁，不改变公开命令签名，不为测试泛型化生产调用链。
+- **验收原则**：写入不能插入转换临界区；等待期间状态变化必须在取锁后重新判断；缺省字段不写发行版也不被此锁阻塞；清空与同值请求保持既有语义。组件证据与真实 Tauri/WSL 验收分别记录。
+- **实施状态（2026-10-03）**：已实施。组件回归（真实命令主体 + 真实转换锁，`source-map` 绑源文件哈希）修复前 1 passed / 3 failed（红），修复后 4 passed，连跑 5 次稳定；覆盖正向等待写入、等待后状态变更拒绝、普通设置不等待、同值请求；应用 cargo check 0、全量库测试 906/0。证据：[u5-r/20261003-170541-562](E:/DSH-WSL/validation/sync-v0.21.0-20261003/u5-r/20261003-170541-562/README.md)（d2-harness、source-map、红/绿日志）。真实应用两条交错与 Tauri/WSL 验收保留 U8（§U5-R.6）。
+- **事实依据**：[WSL-CORE-REVIEW.md §L](E:/DSH-WSL/WSL-CORE-REVIEW.md) D2。
+- **执行入口**：[DSH-WSL-CORE-PLAN.md](E:/DSH-WSL/DSH-WSL-CORE-PLAN.md) §U5-R.3—U5-R.4。
+
+### U5 修复阶段的文档职责与状态
+
+- **REVIEW**：只记录问题、证据、审核判断和后续复核结果。
+- **DECISIONS（本文件）**：记录用户批准内容、作用范围和当前状态；本轮 D-U5-3 / D-U5-4 状态为**已实施、基本复验通过；U8 应用级验收待完成**（2026-10-03）。
+- **PLAN**：保存代码写法、测试设计、执行命令、顺序及门禁，不在 REVIEW 或 DECISIONS 重复维护实施代码。
+- 修复实施与基本复验按 PLAN §U5-R 完成后继续 U6；真实应用并发和 WSL 集成验收保留在 U8。原始测试日志留在 validation 目录；修复前的失败证据（review-u0-u5）保留不改写。
+
+---
+
+## U6. 设置 UI 迁移到上游结构（2026-10-03，执行端；合并挂起树）
+
+### U6.1 代码落点与冲突处置
+
+| 文件 | 处置 |
+|---|---|
+| `src/components/config-wsl-core.tsx` | **删除**：面板重写为 `src/ui/config/wsl-core.tsx`（U6.1），安装对话框拆到 `src/ui/dialog/wsl-core-install.tsx`（U6.3）；`PanelHeader` / `PanelProgress` → `Panel.Header` / `Panel.Progress`（`@/components/panel`） |
+| `src/hooks/use-app-config.ts`、`src/hooks/use-dsh-cores.ts` | **按上游删除**（modify/delete 冲突取删除）：消费者只有旧组件（随之迁移）；配置读取改 `store.setting`，核心列表改 `queryKeys.cores`（Q6.2 骨架） |
+| `src/types/core.ts` | `CoreSource` 增 `'wsl'`；`id` 注释含 `local \| wsl \| app \| app-<tag>`；上游全部字段（`removable` / `bundled`）原样保留 |
+| `src/types/wsl-core.ts` | 新增 `WslDistro` / `WslCoreProbe`，逐字段对照 Rust `#[serde(rename_all = "camelCase")]`（exec.rs / probe.rs）；`src/types/index.ts` 导出 |
+| `src/config/query-keys.ts` | 追加 `wslDistros` / `wslProbe(distro)`（`wslRecommendedVersion` 为 U1 既有） |
+| `src/store/modules/setting/store.ts` / `types/index.ts` | state 增 `wsl_distro`（方案要求）与 `active_core`（U6.6 提示所需，见 D-U6-1）；`AppSettingUpdate` 增 `wslDistro?: string`；`update()` 保持 invoke→refresh，不另建 useAppConfig / settings query |
+| `src/ui/config/wsl-core.tsx` | 新增：声明式查询（cores / distros / probe(distro) / 推荐版本）+ `useWatch(probe)` 失效 cores；候选派生**不写设置**；持久化统一 `store.setting.update({ wslDistro })` 且只用当次捕获 target；手动检测已确认目标走 `refetch()`、新目标先持久化；安装回传 probe 写 `wslProbe(target)` 再刷 cores；保留空列表/查询失败两种 UI（错误不伪装「未安装」）；运行中锁定只针对 WSL 来源 |
+| `src/ui/dialog/wsl-core-install.tsx` | 新增：`listen→runInstall→清理` 资源生命周期（`keep:effect`，卸载早于 resolve 即注销；不改成 useListen 后立即开装）；成功 `disclosure.confirm(probe)` 回传、失败留对话框展示；`Panel.Progress`；只消费 `type === 'wsl-core'` |
+| `src/ui/config/core.tsx` | 3 处冲突解决（imports 并集 + `ChevronRight`；排序注释合并；chips 保留 WSL、不保留 fork 的 app chip——见 D-U6-3）+ U6.5 三语义：`isUnsupportedCore` 豁免 wsl（不改全局 `MIN_SUPPORTED_CORE_VERSION`）、`displayVersion(core)`、`onActivate` `crossesWsl` 跳过升级档案守卫（`CoreUpgradeGuard` **type-only** 导入自 use-core-profile-switch） |
+| `src/ui/dialog/config.tsx` | 冲突解决：imports = 上游 + `type`（`@tauri-apps/plugin-os`）+ `ConfigWslCore`；`ConfigTab` 增 `'wsl'`；Windows 才加 nav / 渲染；`props.tab === 'wsl'` 非 Windows 回落 `application`；appearance / props.tab / 插件角标 / `config.dialog.hidden` 全部保留 |
+| `src/i18n/locales/en-US.json`、`zh-CN.json` | 两个冲突区**并集**：`core.wsl` / `core.wsl_not_installed` + 上游 `core.local_unsupported*` / `core.breaking_*`；文件尾 backup/remote/appearance/task_manager 块 + `wsl_core.*` 块，去重重复的 `backup.size_unit`；新增 `config.wsl` 与 `plugins` / `profiles.wsl_active_notice`（D-U6-2） |
+| `src/ui/config/plugin.tsx`、`profile.tsx` | U6.6：`active_core === 'wsl'` 时早返回「头部 + 说明」，不挂载编辑内容（含 plugin 头部动作位）；`plugin.test.tsx` mock 随改动增补（D-U6-5） |
+
+### U6.2 验证
+
+| 项 | 结果 |
+|---|---|
+| 冲突收敛 | `--diff-filter=U` 9 → **3**（仅 README×3，U9 文档范围） |
+| 引用清理 | `config-wsl-core` / `use-app-config` / `use-dsh-cores` / `PanelHeader` / `PanelProgress` 零残留（`panel.tsx` 自身的 `PanelHeaderProps` 类型名除外） |
+| 冲突标记扫描 | `src`（ts/tsx/json）与 `src-tauri/src`（rs）**0 残留**（README×3 属 U9） |
+| i18n 校验（node） | 两文件 JSON 解析 OK；各 **582 键、0 重复**；中英键集合一致（仅个别相邻插入位置不同） |
+| ESLint（13 个改动文件） | 首轮：1 error（`perfectionist/sort-imports` 顺序）+ 2 warning（disable 注释位置 → 改动报点）；修复后复跑 **0 error 0 warning**（日志 `u6/eslint-u6-files.log`） |
+| 单测 | `src/store/modules/setting/store.test.ts` 独立跑 **13 passed / 0 failed**（覆盖本阶段 store 变更，与 W 系列既有断言同套）；日志 `u6/vitest-setting-store.log` |
+| 类型检查（受限） | `tsc -p tsconfig.typecheck.json`：全量 587 条**全部为「缺失依赖」类**（TS2307 及其 `any` 级联），未改动文件（ellipsis.tsx / use-zoom-factor.ts / webview.tsx 等）同型；U6 改动文件合计 8 条，**逐一核对均为同型缺失依赖错误，无实义类型错误**（本地模块与已安装的 HeroUI 类型均过检）；日志 `u6/tsc-typecheck-u6.log`（见 D-U6-4） |
+| 待 U8 | 依赖修复（pnpm install）后重跑 typecheck / unit / `build:debug` / desktop E2E；WSL 面板真实交互（探测、安装、导入、切换与重启）按 U8 矩阵 |
+
+### D-U6-1（已实施）setting store 增 `active_core` 状态字段（超出 U6.1 字面列举）
+
+- **阶段**：U6
+- **假定**：U6.1 只要求 store state 增 `wsl_distro`。
+- **实际**：U6.6 要求插件/档案面板在 WSL active 时显示说明并不挂载编辑内容；若用 `queryKeys.cores` 判定，会触发 `get_cores` 的 GitHub releases 联网拉取（`version.rs::list` 无进程内缓存；`use-core-profile-switch` 注释明确避免该调用），打开面板需白等数秒。
+- **决定**：后端 `Setting.active_core` 本就在 `get_app_config` 序列化内、随 `setting_updated` 事件刷新；将其补进前端 store 声明（初始 `null`），两面板以 `active_core === 'wsl'` 本地判定，不引入新查询、不改后端。
+- **影响**：数据源与真实持久化一致（切核心 → 事件 → refresh 即更新）；无网络开销；后续若需更细来源态再评估轻量命令（U7 入口审计不含此项）。
+
+### D-U6-2（已实施）i18n 新增 `config.wsl` 与两个面板提示键（方案未列举键名）
+
+- **阶段**：U6
+- **假定**：U6.4 要求 Windows 才加 WSL nav（需导航标签）；U6.6 要求两面板显示说明（需提示文案）。
+- **实际**：既有键只有 `wsl_core.title` 等面板内文案，无导航标签、无面板提示键。
+- **决定**：新增 `config.wsl`（"WSL"，置于 `config.harness` 相邻）与 `plugins.wsl_active_notice` / `profiles.wsl_active_notice`；中英同步、键集合一致。
+- **影响**：无重复键；后续 U9 文档不引用这两个键名即可。
+
+### D-U6-3（已实施）core.tsx chips 冲突取舍：保留 WSL Chip、不保留 fork 的 app Chip
+
+- **阶段**：U6
+- **假定**：U6.5②「补 WSL Chip、未安装文案；WSL 不出现 app 下载/卸载按钮」，未提 app Chip。
+- **实际**：上游 v0.21.0 的 core.tsx 已移除 `core.app` chip（bundled/local 统一「本地」chip）；fork 的 app chip 是 W 系列区分来源的增量。
+- **决定**：采纳上游结构 + 仅补 WSL chip；`core.app` i18n 键保留不删（上游键集不动）。
+- **影响**：列表与上游的视觉收敛；WSL 行仍可辨识（chip + `wsl_not_installed` 文案 + 无下载/卸载按钮）。
+
+### D-U6-4（环境限制，证据已留，完整门禁留 U8）本地 node_modules 与 v0.21.0 锁文件不同步
+
+- **阶段**：U6（验证口径说明）
+- **实际**：本地 `node_modules` 由 **pnpm@10.28.2**（v10 store）安装于 2026-09-11，而仓库现钉 `packageManager: pnpm@11.7.0`；缺失 `@reause/core`、`@tauri-apps/plugin-os`、`jsdom` 等（均为合并后锁文件中的依赖）。`pnpm typecheck`（经 corepack pnpm 11）因依赖状态检查触发重装并因无 TTY 中止（`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`）；沿用 U5-R 先例**本阶段不执行前端安装**。
+- **决定**：U6 验证采用受限口径——TS 错误**全量归类**（逐条核对「仅缺失依赖型」）、ESLint 全绿、可运行单测（node 环境）实跑；jsdom 用例（plugin/appearance/backup）与完整 typecheck 随 `pnpm install`（U8 流水线）复跑。
+- **影响**：U6 的类型安全结论为「缺失依赖噪声下的无实义错误」，不是完整通过；U8 必须先完成依赖安装（网络可用，registry 200），再跑完整门禁。
+
+### D-U6-5（已实施）plugin.test.tsx mock 随改动增补
+
+- **阶段**：U6
+- **实际**：plugin.tsx 新增 `useStore(store.setting)` 判定后，既有 `vi.mock('@/store')` 无 `setting` 键、且未 mock `valtio-define`（真实 useStore 收到 undefined）。
+- **决定**：mock 增补 `setting: { active_core: null }` 与 `vi.mock('valtio-define', () => ({ useStore: value => value }))`（与 view-menu.test.tsx 同款写法），既有断言不变。
+- **影响**：该用例在 U8 装好 jsdom 后即可运行；不触碰其它测试。
+
+## U7. 自动合并区、系统入口、资源与 CI（2026-10-03，执行端；合并挂起树）
+
+### U7.1 入口审计与最小处理
+
+| 文件/入口 | 处置 |
+|---|---|
+| `bridge/mod.rs`、`service/mod.rs` | 保留 `wsl_core` 模块与 `pub use wsl_core::*`；上游新模块全数并存 |
+| `desktop/builder.rs` | 与 v0.21.0 逐一对比：仅 fork 增「5 条 WSL 命令注册」（list / probe / install / import + U1 `get_wsl_recommended_version`）与 1 处 R-W4-1 顺序注释；上游新命令、`.setup()` 顺序、all-frames 注入（6 脚本）、窗口/退出处理全保留 |
+| `bridge/core.rs` | 与上游仅差 `set_active_core` doc（U3 已改）；`get_cores` → `core::list`（WSL 行 + 缓存探测接线在 service 层）、`set_active_core` 返回本地行（非联网）；上游 `download_core` / `remove_core` / `update_local_core` 保留 |
+| `service/plugin/internal/mod.rs::ensure` | WSL active → `Ok(())` no-op，位于函数首行（早于 `load_presets` 等一切 Windows 档案写入与失效链接清理） |
+| `bridge/plugin.rs::get_preinstall_pending` | WSL → `Ok(false)`（不触发 Windows 预装引导） |
+| `service/plugin/install/mod.rs::install_with_cancel` | guard **上移**至入口（原 `ensure_shims` 之后的位置移除）：早于 `ensure_shims`（Windows profile 写入）、git 预检与一切 node/dsh 执行——覆盖 install / install_internal / install_specs 三入口 |
+| `service/plugin/install/mod.rs::allow_version_exemptions` | **新增入口 guard**（审计新发现）：命令以 `node <dsh 入口>` 执行，WSL 下 `active_dsh_binary` = `wsl.exe`——正是「node.exe wsl.exe ...」形态 |
+| `service/plugin/install/mod.rs::allow_policy_versions` | **新增入口 guard**：豁免条目写 Windows 档案 `pnpm-workspace.yaml`，WSL 下既不生效也污染 Windows 档案 |
+| `service/plugin/install/single.rs::update_many` / `remove_many` | 各自**入口新增** guard（`resolve_missing_targets` 联网 + 读档案、`install_targets`/`update_to_latest` 写档案与起进程均早于 `run_plugin_command` 内的旧 guard）；`run_plugin_command` 内原 guard 保留为纵深 |
+| `bridge/plugin.rs::report_plugin_error` | WSL → `Ok(())` no-op（不写 Windows 错误注册表、不推 `plugin-recovery-required`） |
+| `bridge/plugin.rs::detect_plugin_recovery` | WSL → 空 `PluginRecoveryInfo`（不自动启用 Windows profile 修复；同一份 Linux 日志可能误中同名 Windows 插件） |
+| 插件 recovery / profile 编辑入口（recover / snapshot / disable / enable / quarantine / strip） | 审计结论：全部仍绑定 Windows 档案与 `$DSH_HOME`；错误页「隔离 / 移除悬空条目」按钮以 Windows 后端错误码为门槛（`INTERNAL_PLUGIN_PATCH_PARSE_FAILED` / `PATCH_LAYER_QUARANTINE_FAILED` / `PATCH_LAYER_ENTRY_UNRESOLVED`），WSL 启动路径不运行 preflight / internal 自愈、不产生这些码；插件与档案面板已由 U6 在 WSL 下隐藏编辑区 |
+| `bridge/system_os.rs::get_runtime_info` | WSL 分支：`dsh_version = active_version(...)` **直赋**（缓存空即空，不 `.or()` 回落宿主）；`node_version` ← probe、`data_dir` ← probe home 的 UNC（`wsl_unc_path`）；仅非 WSL 保留上游 `.or()`。`log_path` 不覆盖（桌面自身服务日志，非 Linux 安装信息） |
+| CLI 集成 / task manager / remote | 保持上游宿主功能；无 WSL 误操作面，不做无关重构 |
+
+`active_dsh_binary` 调用点终表（U7.1 要求逐项标记）：
+
+- `launch.rs::start` / `launch.rs::launch`——**已先分流**（WSL 在其前 return）
+- `install/mod.rs::install_with_cancel`、`single.rs::run_plugin_command`——**已先分流**（入口 guard）
+- `install/mod.rs::allow_version_exemptions`——本次补 guard（见 D-U7-1）
+- `patch_entries.rs`（preflight / strip 的 `install_anchor`）——仅显示 / Windows 数据路径：调用方为 Windows launch 内 preflight（WSL 不达）与手动命令（Windows 数据）
+
+`CoreSource::` 匹配审计：全仓无 `_ => App` 类兜底（`source.rs` 枚举/解析、`runtime.rs` 的 `!= App` 早退、`version.rs` 行构造均具名分支，`CoreSource::Wsl` 齐备）。
+
+### U7.2 WSL 目录按钮（UNC 允许根）
+
+- `wsl_core/patch.rs::wsl_unc_path`：`pub(super)` → `pub(crate)`（仅宽一档；模块外只被 guard 使用）。
+- `bridge/guard.rs::allowed_roots`：加 Windows 专用分支（U7.2 方案原样）——只加**后端配置发行版**且 `validate_distro` 通过、`probe::cached` 命中时的 `\\wsl.localhost\<distro>\<home>\.dsh-desktop[.dev]`；用 `cached` 而非 `cached_or_probe`（不因「打开文件夹」探测/启动发行版）；不放开整个 home、发行版共享根或前端传来的任意路径。`existing_roots` 的 `is_dir` 过滤、`dunce::canonicalize` 与组件级 `starts_with` 保持（canonicalize 失败仍拒绝，不降级字符串前缀）。
+- 验收：数据根 / runtime 内目录可打开、相邻目录与他发行版被拒——真机冒烟按 U8（单测不启动文件管理器）；本阶段为静态实现 + 编译验证。
+
+### U7.3 下载导出、资源与 toast
+
+| 项 | 结论 |
+|---|---|
+| `service/download/mod.rs` | 与 v0.21.0 仅差 `ProgressPayload` 导出（fork 复用）。U4 的 D-U4-3「删 `Git` 导出」复核确认：`installable::Git` 仅在模块内部（`tasks()` 内构造 + `impl Installable`）使用，模块外零引用，保持删除 |
+| 构建基线 | `package.json`（`packageManager: pnpm@11.7.0`）/ `pnpm-workspace.yaml` / `Cargo.toml` / `Cargo.lock`（随合并）/ `build.rs` / `tauri.conf.json` / `.gitmodules` 与 v0.21.0 **逐字节一致**（diff 0）；不混搭旧根锁 |
+| resources glob | `tauri.conf.json`: `resources/**/*`——覆盖 `resources/wsl-runtime/<ver>/package.json + package-lock.json`（`runtime.rs` 的 manifest/lock 常量即此二名；U1 哈希测试在盘） |
+| build:plugins | 静态审计：`scripts/build-plugins.ts` 全部清理只针对 `resources/node_modules` 与仓库内 `.build-plugins-tmp`，不触碰 `resources/wsl-runtime/**`；「执行前后 wsl-runtime 仍在」的动态复验随 U8 流水线 |
+| toast-provider | 定位渲染点：`src/components/toast-provider.tsx` 仍在、由 `src/main.tsx` 消费；上游 v0.21.0 **已原生修复**（非 custom 分支传 `undefined`，doc 注释与 R-W5-6 结论一致）——旧 null 问题不存在，不迁移修复本体、不恢复旧组件、不覆盖上游队列/桌宠实现（见 D-U7-4） |
+
+### U7.4 CI 触发与子模块
+
+- `.github/workflows/ci.yml`：`push.branches` = `[main, feat/wsl-core, sync/wsl-core-v0.21.0]`；`pull_request.branches: [main]` 上游语义保持；全部 job/去重/权限未动（与 v0.21.0 的 diff 仅此一行）。
+- 其余 9 个工作流文件与 v0.21.0 逐字节一致（diff 0）。
+- 子模块：13 个 gitlink 与 v0.21.0 **逐一相等**（索引态）；全部 submodule `-`（未初始化）、`source/*` 均为空目录（零用户内容）——无覆盖风险、无需报告；未执行任何 `submodule update`。
+
+### U7.5 验证
+
+| 项 | 结果 |
+|---|---|
+| rustfmt | 5 个改动 Rust 文件：`guard.rs` / `system_os.rs` / `install/mod.rs` 与上游 0=0，`patch.rs`（fork 文件）0，`single.rs` 62=62（上游基线，非新增） |
+| cargo check | 通过（0 error；2 warning = 上游基线：`backup/recovery.rs` unused_mut、`builder.rs ViewMenuEntry` dead_code） |
+| cargo test --lib | **906 passed / 0 failed**（U7 全部改动后） |
+| CI YAML | 语法校验通过；`branches` 行更新正确 |
+| 未解决冲突 | 3（仅 README×3，U9） |
+| 待 U8 | `build:plugins` 实际执行前后 wsl-runtime 复核；UNC 允许根真机冒烟（打开 / 拒绝矩阵）；WSL iframe boot 失败路径不含 Windows 恢复入口的实测 |
+
+### D-U7-1（已实施）插件 guard 上移与豁免入口新增
+
+- **阶段**：U7
+- **假定**：U7.1 表只点名 `{install,install_specs}`、`{update_many,remove_many}` 的 guard 处置。
+- **实际**：现状 guard 位于 `install_with_cancel` 的 `ensure_shims` 之后、`run_plugin_command` 的 `ensure_shims` 之后（W3.6 原布局），前置写盘挡不住；`active_dsh_binary` 审计另发现 `allow_version_exemptions`（`node.exe wsl.exe ...` 形态）与 `allow_policy_versions`（Windows 档案写入）两个豁免入口无 guard。
+- **决定**：guard 上移至 `install_with_cancel` 首语句（覆盖三入口）并在 `update_many`/`remove_many` 入口新增；两个豁免入口按同一错误码补 guard；`run_plugin_command` 内原 guard 保留为纵深；bridge 层不另写 guard（错误语义唯一）。
+- **影响**：WSL 下插件管理全入口先于一切 Windows 写盘/起进程拒绝；非 WSL 行为不变（906 测试全绿）。
+
+### D-U7-2（已实施）WSL 下关闭自动 Windows 插件恢复
+
+- **阶段**：U7
+- **假定**：U7.1 行「WSL active 下 UI 不把它们展示为当前 Linux 核心操作，不为 WSL 启用自动 Windows profile 修复」。
+- **实际**：`report_plugin_error`（运行期弹窗）与 `detect_plugin_recovery`（启动失败自动定位）可在 WSL iframe 的 boot 失败/错误上报时被触达，操作对象是 Windows 档案——会把 Windows 档案修复展示为当前核心的操作。
+- **决定**：两命令 WSL 分支 no-op（`Ok(())` / 空 `PluginRecoveryInfo { plugins: [] }`，reason `unknown`）；错误页照常展示失败文本与日志证据；手动 recovery 命令与错误页补丁按钮不动（其门槛错误码在 WSL 路径不产生，审计见 U7.1 表）。
+- **影响**：WSL 下不再出现指向 Windows 档案的自动修复入口；Linux 侧插件异常仍由发行版内 dsh 界面呈现。
+
+### D-U7-3（已实施）get_runtime_info 的 WSL 字段范围
+
+- **阶段**：U7
+- **假定**：U7.1 要求「WSL 分支直接赋 `dsh_version`；WSL Node/runtime 路径使用 WSL probe 显示」。
+- **实际**：`RuntimeInfo` 中可由 probe 表达的 Linux 信息为 `node_version` 与数据根（`home` + `dsh_home_dir_name`，与 WSL 行 `HarnessCore.dir` 同一形态）；`log_path` 无 probe 对应物（桌面服务日志自身路径）。
+- **决定**：WSL 分支直赋 `dsh_version`；`node_version` ← `probe.node_version`、`data_dir` ← `wsl_unc_path(home/数据目录名)`；`log_path` 不覆盖；probe 缓存未命中时保持基础形态（不额外探测）。
+- **影响**：诊断面板不再把宿主 node/dsh/数据根冒充 Linux 安装信息；`debug.tsx` 的「打开数据目录」按钮仍指 Windows 目录（`reveal_data_dir` 命令未改，属已知残留，U8 真机视需要再议）。
+
+### D-U7-4（无需迁移）toast-provider 的 R-W5-6 修复
+
+- **阶段**：U7
+- **实际**：上游 v0.21.0 已自行修复（非 custom 分支 `: undefined`，doc 注释与 fork 结论一致）；工作区合并态 = 上游实现 + fork 溯源注释。
+- **决定**：不迁移修复本体、不恢复旧组件文件；保留注释（溯源）。
+- **影响**：无代码行为变化。
+
+## U8. 分层验收（执行端；合并挂起树，2026-10-03）
+
+### U8.1 静态完整性
+
+| 项 | 结果 |
+|---|---|
+| 未解决冲突 | 3（`README.md` / `README.en.md` / `src-tauri/resources/README.md`，归 U9） |
+| `git diff --check` | EXIT=2，9 处遗留冲突标记全部落在上述三文件 |
+| 旧 import 残留 | 无（唯一命中 `src/components/panel.tsx:19` 为注释文本） |
+| `CoreSource::` 兜底 | 无 `_ => App`；`source.rs:31-41` 三来源显式映射 |
+| `active_dsh_binary` 调用点 | 与 §U7.1 终表逐一对应（2 处已先分流 / 1 处补 guard / 2 处仅 Windows 数据） |
+
+日志：`validation/sync-v0.21.0-20261003/u8/u8-1-static.log`
+
+### U8.2 前端车道与 Rust 门禁
+
+| 项 | 结果 |
+|---|---|
+| `pnpm run typecheck` | 0 |
+| `pnpm --filter dsh-tauri build` / `dsh-tauri-ui build` | 0 / 0 |
+| `pnpm exec tsc --noEmit` | 0 |
+| `pnpm run lint` | **0**（D-U8-4 已随 README 收口关闭；修正：终值为 0 errors / 16 warnings） |
+| `pnpm build:plugins` | 0；前后 `wsl-runtime` 摘要一致（U7 待办关闭） |
+| `vitest run --project unit` | **1**（D-U8-3；失败 9 例，全部集中在 `packages/dsh-tauri-ssh/src/host/service/bootstrap.test.ts`，见 §U8.5 与 D-U8-11） |
+| `cargo test --lib`（U7 收口） | 906 passed / 0 failed |
+
+台账/日志：`u8/u8-2-lanes.exit`、`u8/u8-2-*.log`、`u8/wsl-runtime-{before,after}.sha256`
+
+### U8.3 契约验证（T6 / T7）
+
+| 项 | 结果 |
+|---|---|
+| 新增实现 | `src/ui/config/core-list.ts`（来源全序 / 跨边界判定 / 兼容性判定） |
+| 新增测试 | `test/core-list.test.ts`（T6 排序 7 组 + T7 兼容与边界 3 组） |
+| 等价验证（探针） | esbuild 打包探针：44 passed / 0 failed |
+| vitest 本体 | 无限制终端跑通：`--project unit test/core-list.test.ts` → **10 passed / 0 failed** |
+| 变异测试 | 7/7 变异体被杀死（M1–M7，见 `u8` 台账与 commands.md #86） |
+| `manifest.jsonc` | JSONC 复校验通过（`recommend=0.2.0-rc.2` / `minimum=0.1.5-rc.1` / `wslRecommend=0.1.2-rc.1`） |
+
+### D-U8-1（已实施）列表纯逻辑抽到 `core-list.ts`，`core.tsx` 只保留展示与文案
+
+- **阶段**：U8.3
+- **假定**：T6/T7 可对 `core.tsx` 内的排序与兼容性判定直接断言。
+- **实际**：`test/core-local-unsupported.test.ts`（上游）按**源码文本**扫描 `src/ui/config/core.tsx`：要求 `function isUnsupportedLocal` 函数体包含 `isUnsupportedCore(core)` 且不含 `recommendedVersion`，并要求文件含 `t('core.local_unsupported_hint', { version: MIN_SUPPORTED_CORE_VERSION })`、不含 `isCoreBelowBaseline`。把判定搬去别处或改写组件签名都会踩到该测试。
+- **决定**：纯逻辑（`SOURCE_RANK` / `compareCores` / `crossesWslBoundary` / `isUnsupportedCore`）抽到 `src/ui/config/core-list.ts` 并被 `core.tsx` import；`isUnsupportedLocal`、提示文案与基线常量引用**留在 `core.tsx`**。上游源码扫描不涉及 `core-list.ts`，两边约束互不冲突。
+- **影响**：T6/T7 可对纯函数直接断言；`core.tsx` 的对外形态与上游测试保持兼容。删除重复定义后 `core.tsx` 不再有第二份排序/兼容实现。
+- **最终结果**：新增测试 `test/core-list.test.ts` 由 `--project unit` 点名执行 10/10 通过（此前 1 例假红已由 D-U8-9 修掉），并随 U8.2 全量车道并入总集（最终失败文件只剩 SSH 的 `bootstrap.test.ts`）。
+
+### D-U8-2（环境限制）本会话沙箱不能运行 vitest，U8.3 用打包探针 + 变异测试代替
+
+- **阶段**：U8.3
+- **实际**：会话沙箱拒绝子进程建立管道/重定向（`spawn EPERM`、`StandardOutputEncoding is only supported when standard output is redirected`）。`vitest` 加载配置时经 esbuild JS API 起服务即失败；`corepack pnpm`、`bash` 同样被拒。可用的替代：`esbuild.exe` 原生二进制、`node <file>`（stdio 继承）、不带管道的 `git.exe`。
+- **决定**：把 `test/core-list.test.ts` 的断言镜像成独立探针（`.temp/u83-probe.mjs`），用 `esbuild.exe --alias:@/ui/config/core-list=<variant>` 打包后由 `node` 执行；再用变异体矩阵验证断言有效性（7/7 被杀死）。真实 `vitest` 结果仍以 U8.2 车道台账为准。
+- **影响**：U8.3 的证据链是「等价断言 + 变异有效性」，与 `pnpm test` 的实际跑分相互独立。
+- **解除（2026-10-03 21:44 起）**：会话改为 `danger-full-access` 后 vitest 本体可跑，已补跑 `--project unit test/core-list.test.ts`（10/10）与 `--project unit` 全量；本条的沙箱替代方案自此仅作历史记录。
+
+### D-U8-3（环境限制，证据已留）unit 项目 10 例失败是上游在 Windows 的既有环境性失败
+
+- **阶段**：U8.2
+- **实际**：合并树上 `vitest run --project unit` 失败例与干净 `baseline-v0.21.0-worktree` 基线**同数同因**：9 例 `bootstrap`/`plugins-sync` 因 `EPERM` 或 `Cannot connect to C:`、1 例因 `ENOENT`（详见 `u8/baseline-repro-tests.log`）。
+- **决定**：判为上游基线在 Windows 的环境性失败，不计入本次合并门禁；不为此改动上游测试。
+- **影响**：U8.2 的 `vitest` 退出码 1 有基线对照，不是合并引入；U8.4/U8.5 真机运行时复核。
+
+### D-U8-4（已定位，随 U9 关闭）`lint` 的唯一 error 来自 README 未收口冲突
+
+- **阶段**：U8.2
+- **实际**：`pnpm run lint` EXIT=1 → `✖ 17 problems (1 error, 16 warnings)`；唯一 **error** 为 `src-tauri/resources/README.md:27:1 Unexpected additional H1 heading found (markdown/no-multiple-h1)`——即 U9 待收口的冲突文件里两个 H1 并存；16 条 warning 分布在 `dsh-tauri-extension` / `dsh-tauri-model` / `dsh-tauri-ui` / `dsh-tauri-worktree` 的上游文件，非本次 WSL 改动。
+- **决定**：不为 lint 改上游规则或无关文件；README×3 冲突在 U9 收口后复跑 `pnpm run lint` 作为关门条件。
+- **影响**：U8.2 的 lint 门禁归因明确（U9 依赖项），不是合并引入的代码问题。
+
+### U8.4 Rust 门禁（双树对照）
+
+| 项 | upstream（干净 v0.21.0 worktree） | merged（合并挂起树） |
+|---|---|---|
+| rustfmt（全树） | EXIT=1 | EXIT=1 |
+| rustfmt（**改动文件**口径） | 37 个改动文件 **0 差异** | 37 个改动文件 **0 差异**（归位前为 7 文件 / 36 hunk，见 D-U8-7、D-U8-8） |
+| clippy | EXIT=0 | EXIT=0；**相对上游新增 0** |
+| cargo test --all-features | — | **906 passed / 0 failed**（2 warning = 上游基线） |
+
+工具链：rustc 1.98.1（x86_64-pc-windows-msvc）、rustfmt 1.9.0-stable、node v24.15.0、pnpm 11.7.0；合并基线 `aff39a991fda3558c5459b54fb3fa1c6984d3227`（= v0.21.0）。
+
+```
+[NEW-HUNKS] src-tauri/src/service/core/mod.rs: 2/2 not present upstream   → pub(crate) use runtime::prepare_active_runtime; 归属调整
+[NEW-HUNKS] src-tauri/src/service/plugin/install/single.rs: 1/13 not present upstream → specs.iter().map(...) 换行形态
+```
+
+### D-U8-5（已定位）rustfmt 在双树上同为失败，差异文件数相同
+
+- **阶段**：U8.4
+- **实际**：合并树与干净 v0.21.0 树用同一 rustfmt 1.9.0 跑，**都是 EXIT=1、都是 36 个文件有差异**；`diff-analysis.txt` 进一步显示两树差异文件集合一致，仅 2 处 hunk 属合并新引入，且都为 fork 既有代码的 rustfmt 形态（`core/mod.rs` 的 `pub(crate)` 重导出归属、`single.rs` 的链式调用换行）。clippy 在两树同为 12 条诊断、新增 0。
+- **决定**：`fmt=1` 判为上游在本工具链下的既有形态，不作为本次合并的门禁失败项；本次不改动上游文件的格式（避免把格式化噪声混进合并 diff），`core/mod.rs` 与 `single.rs` 两处随 U9 收口时一并决定是否按 rustfmt 归位。
+- **影响**：`cargo fmt --check` 不能作为本合并的通过条件；门禁以 `cargo clippy`（新增 0 诊断）与 `cargo test`（906/0）为准。
+
+### D-U8-6（环境限制）本机 IDE 自动构建产物不入库
+
+- **阶段**：U8.2
+- **实际**：`packages/dsh-tauri-ui` 的 IDE/编辑器自动构建与 `src/ui/styles/generated` 产物会让「`build-dsh-tauri-ui` 前后摘要」漂移（tailwind 压缩形态与上游差异）；`git status --short --untracked-files=all -- src/ui/styles packages/dsh-tauri-ui/dist dist` 无输出（均被忽略或未生成）。
+- **决定**：U8 期间构建产物一律不作为交付物；`wsl-runtime` 受控资源摘要以 `u8/wsl-runtime-{before,after}.sha256` 为准。
+- **影响**：避免把构建产物差异误记为合并差异；U9 提交前复核工作区不含生成物。
+
+### D-U8-7（口径纠正 + 已修复）rustfmt 差异必须按「改动文件」口径复核
+
+- **阶段**：U8.3 → U8.4 之间（D-U8-5 的复核）。
+- **纠正的事实**：D-U8-5 用「两树都是 36 个文件有差异」判定 fmt 形态一致，**口径不成立**。干净 v0.21.0 树里那 7 个被 fork 改动过的文件本身是完全符合 rustfmt 的（`upstream-fmt.txt` 对它们 0 条 hunk）；合并树里同样这 7 个文件却出现 36 条 hunk（`merged-fmt.txt`）。即差异不是「上游既有形态」，而是 fork 的编辑引入。按 CORE-REVIEW §K.0 的口径（`0 REGRESSION / 0 CHURN`）复核，本合并**曾存在 7 个文件 / 36 条 rustfmt 回归**：`src-tauri/src/desktop/builder.rs`（2）、`src-tauri/src/service/core/mod.rs`（2）、`src-tauri/src/service/core/version.rs`（1）、`src-tauri/src/service/plugin/install/single.rs`（13）、`src-tauri/src/service/workflow/launch.rs`（5）、`src-tauri/src/service/workflow/process.rs`（3）、`src-tauri/src/utils/mod.rs`（1）。
+- **决定**：把这 7 个文件按 `rustfmt 1.9.0-stable --edition 2021` 归位（**只格式这 7 个改动文件，不对全仓库跑 `cargo fmt`**，避免把 29 个未改动文件的格式噪声混进合并 diff），并把「改动文件 rustfmt 0 差异」补为 U9 收口项。
+- **验收原则**：每个文件 `rustfmt --check` EXIT=0；格式改动只落在上述 7 个文件（`git diff --stat` 仅此 7 个 Rust 文件变化，其余 .rs 与暂存区不动）。
+- **实施状态（2026-10-03）**：已实施。7 个文件 rustfmt 归位后逐文件 `rustfmt --check` 全部 EXIT=0（原文件已备份到 `.temp/pre-fmt-backup/`）；`git diff --stat` 显示 Rust 侧仅这 7 个文件（+98 / −30）。归位内容全部是纯格式：长表达式换行、`use` 顺序、链式调用断行、`assert_eq!` 参数换行，无任何语义改动。
+- **影响**：`cargo fmt --check` 在合并树上仍会 EXIT=1（余下 36 个差异文件中 29 个为 fork 未改动文件，属上游本工具链下的既有形态），但**「改动文件 0 回归」这一条现在成立**；U8.4 的 fmt 行据此改写。
+- **事实依据**：`validation/sync-v0.21.0-20261003/rust-gates/{merged,upstream}-fmt.txt`、`.temp/fmt-regression-audit.json`、`.temp/fmt-regression-detail.txt`。
+
+
+### D-U8-8（口径纠正）rustfmt 逐文件 `--check` 是误报，必须做 hunk 级归因
+
+- **阶段**：U8.4 复核（GATE B）。
+- **实际**：`rerun-lanes.sh` 的 GATE B 逐文件跑 `rustfmt --edition 2021 --check <file>`，报 6 个文件 DIRTY：`src-tauri/src/bridge/mod.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/service/mod.rs`、`src-tauri/src/service/plugin/install/mod.rs`、`src-tauri/src/service/plugin/internal/mod.rs`、`src-tauri/src/service/workflow/mod.rs`。**全部是误报**：`rustfmt` 单文件模式会顺着文件中声明的 `mod` 遍历整棵模块树，每个文件的检查结果等价于整个 crate，逐文件 DIRTY 只是全树结果的重复投影；这也解释了 6 份日志为何都异常巨大（`gate-b-rustfmt-changed-files.log` 144,629 B）。两个 `rustfmt` 行为坑：差异输出在 **stderr**（不是 stdout）；`--check` 与 `--emit stdout` **互斥**（同用报 Invalid to use `--emit` and `--check`，exit=1、stderr 仅 38 B），首版归因脚本因此静默采到空 diff。
+- **决定**：改用 hunk 级归因脚本 `.temp/gate-b-attribution.mjs`——读两侧 stderr，切 `Diff in <path>:<line>:` hunk，按「相对路径 + hunk 正文」对齐。结论：`mergedHunks=101`、`upstreamHunks=128`、**`inheritedFromUpstream=101`**、**`introducedByMerge=0`**、`fixedByMerge=27`、`changedRustFiles=37`。
+- **验收原则**：**绝对量对比毫无意义**（本 fork 还顺手把上游 27 处格式修掉了），只有 hunk 级归因能区分「上游既有债」与「本合并回归」。
+- **事实依据**：`validation/sync-v0.21.0-20261003/u8/rerun/gate-b-attribution.json`、`rust-gates/{merged,upstream}-fmt.txt`。
+
+### D-U8-9（已修复）`Math.sign()` 的 `-0` 造成比较器自洽断言假红
+
+- **阶段**：U8.3。
+- **实际**：`test/core-list.test.ts` 的「来源展示顺序为 local → wsl → app 且比较器自洽」报 `AssertionError: expected -0 to be +0 // Object.is equality`（`test/core-list.test.ts:43:47`，断言为 `expect(Math.sign(compareCores(x, y))).toBe(-Math.sign(compareCores(y, x)))`）。根因：同来源比较返回 0，`Math.sign(0) === 0`，取反得 `-0`，而 `Object.is(-0, 0) === false`。
+- **决定**：引入 `const sign = (n: number) => Math.sign(n) || 0`，**两侧都过 `|| 0`**——只给右侧取反（`-sign(...)`）仍会红（`expected +0 to be -0`）；探针 `.temp/u83-probe.mjs` 第 40 行同步改为同一写法。
+- **影响**：修后 `vitest run --project unit test/core-list.test.ts` → 10 passed / 0 failed，此项不再是 U8 阻塞点。
+
+### D-U8-10（环境限制）`tailwind` 生成物会在本机构建时被改写，必须复位后才算工作区干净
+
+- **阶段**：U9.2（提交前复核）。
+- **实际**：`packages/dsh-tauri-ui/src/client/styles/index.ts` 被本地构建重写为未压缩形态（`1 insertion, 2437 deletions`，文件变 10 行；已提交形态为压缩的 2443 行），属本机构建副作用而非合并差异。
+- **决定**：`git restore --worktree` 复位；提交前用 `git diff --name-only`（未暂存）复核为空。全量 `git status` 在本仓库会因合并索引巨大而截断或被拒，**必须改用分项命令**（`git diff --name-only` / `git diff --cached --name-only` / `--diff-filter=U` / `git status --porcelain --untracked-files=normal`），且不要给 `git` 接管道。
+- **影响**：U9.3 提交时不会把构建产物噪声混进合并提交。
+### D-U8-11（口径修正）U8.2 的 vitest 终值以 21:49 那一轮为准
+
+- **阶段**：U8.2 → U9.2 收口。
+- **实际**：会话内 `vitest run --project unit` 共跑三轮：基线轮（`u8/u8-2-vitest-unit.log`）`Test Files 3 failed | 250 passed (255)`、`Tests 11 failed | 2535 passed (2550)`，失败分布 `test/shell-heroui-theme.test.ts` + SSH `bootstrap.test.ts` + `plugins-sync.test.ts`；21:44 轮（`u8/rerun/u8-2-vitest-unit.final.log`）`Tests 10 failed | 2541 passed`（含 `core-list.test.ts` 的 `-0` 假红）；**21:49:16 起的 ledger-fix 轮（`u8/rerun/u8-2-vitest-unit.log`）为终值**：`Test Files 1 failed | 252 passed | 2 skipped (256)`、`Tests 9 failed | 2536 passed | 4 skipped (2560)`、`Errors 1 error`，**9 例全部在 `packages/dsh-tauri-ssh/src/host/service/bootstrap.test.ts`**（real POSIX sh / curl / wget 用例，本机无 POSIX 工具链），同因失败在干净 v0.21.0 基线上同样出现。
+- **决定**：认定 U8.2 的 vitest 门禁为「既有环境性失败」，失败数由 11（基线）降到 9；此前记录的「10 例」是 21:44 轮中间值，不作为结论。
+- **影响**：`baseline.json` / `gates-final.*` / `wsl-smoke.md` 的 vitest 数字统一取 21:49 轮（9 failed / 2536 passed）。
+
+### U8.5 最终门禁汇总（2026-10-03 21:38—21:50）
+
+| 项 | 结果 |
+|---|---|
+| typecheck / build ×2 / tsc --noEmit | 0 / 0 / 0 / 0 |
+| `pnpm run lint` | **0**（0 errors / 16 warnings，warning 全在 `packages/dsh-tauri-{extension,model,ui,worktree}` 上游文件） |
+| `pnpm build:plugins` | 0；前后 `wsl-runtime` 摘要逐字节一致 |
+| `vitest --project unit` | **1**（9 failed / 2536 passed，见 D-U8-11） |
+| `vitest --project unit test/core-list.test.ts` | 0（10/10） |
+| `cargo test --all-features --locked` | **906 passed / 0 failed** |
+| `cargo clippy --all-targets --all-features --locked` | 双树 exit=0，相对上游新增 0 |
+| `cargo fmt --check` | 双树同为 exit=1（上游本工具链既有形态）；**改动文件 0 回归**（D-U8-8） |
+
+- **台账缺行修补**：`u8/rerun/u8-2-lanes.exit` 里 `vitest-unit` / `vitest-core-list` 两行曾缺失（`rerun-lanes.sh` 无 `set -e`，这两步用 `echo | tee -a`）。由 `u8/finish-lanes.sh`（刻意只用 `>>` 追加、绝不用 tee）补齐：`STEP vitest-unit EXIT=1`、`STEP vitest-core-list EXIT=0`。
+- **汇总产物**：`validation/sync-v0.21.0-20261003/gates-final.json`、`gates-final.md`。
+
+## U9. 冲突闭环、文档与交付门禁（2026-10-03，执行端；合并挂起树）
+
+### U9.1 README ×3 冲突收口（完成）
+
+- 收口脚本 `.temp/resolve-readme-conflicts.mjs`。**首版把冲突块硬编码为 CRLF 而文件是裸 LF，抛 `Error: NOT FOUND in README.md`**；改为「把文件与冲突块统一归一到 LF 再做精确替换、写回时恢复原行尾」后成功：`README.md` 10,690 B、`README.en.md` 11,037 B、`src-tauri/resources/README.md` 15,060 B，三者冲突标记数均为 0。
+- 收口内容：中英两份 README 的功能列表取 v0.21.0 的 6 条并追加第 7 条 **WSL 核心 / WSL core**（点明独立的受控版本与推荐基线 `engines.dsh.wslRecommend`、依随包分发的清单与锁文件受控安装、需在发行版内自备 Node ≥ 20）；资源 README 保留 v0.21.0 的「标识符 `io.github.hairyf.deepseek-harness-desktop` → `dsh-tauri` 搬迁旧 app-data」段在前，后接 `## WSL core runtime — wsl-runtime/<dsh-version>/` 章节，并补 `0.1.2-rc.1` 两个实测 sha256（`package.json` `1a74891b356c8f39852eef0aff635abbeb0d5648a770bd6f8d6e75ab49858398`、`package-lock.json` `46d0671df390de891168284922d4ee3dd62a6e1ba4ca469dd957f37b045fbe54`）与 `bundle.resources` 含 `resources/**/*` 的说明。
+- 取舍：资源 README 的 JSONC 示例**未加 `wslRecommend`**（避免无谓 diff，该独立推荐值由新章节文字与 `resource-check.json` 承担）。
+- 关门条件满足：`rg -l "^(<<<<<<<|>>>>>>>)" --glob "*.md" .` 无匹配；收口后对三个 README 单跑 eslint 均 exit=0（此前 `u8-2-lint.log` 里的 `src-tauri/resources/README.md:27:1 markdown/no-multiple-h1` 是收口前的陈旧日志）。
+
+### U9.2 四份产出（完成）
+
+| 产出 | 状态 | 要点 |
+|---|---|---|
+| `baseline.json` | 15,405 B | 合并四元组（`mergeHead` `aff39a991fda3558c5459b54fb3fa1c6984d3227`、`mergeBase` `fe056f82e596029d1e1a110565a066ec5f64fc0a`）、`stagedEntries=1936`、`unresolvedConflicts=0`、工具链（node v24.15.0 / pnpm 11.7.0 / rustc 1.98.1 / rustfmt 1.9.0-stable / WSL 2.7.14.0 内核 6.18.33.2-2 / Ubuntu）、三推荐值、三类门禁汇总、`resourceCheck 15/15` |
+| `resource-check.json` | 15/15 通过 | manifest 三推荐值互不相等、`wsl-runtime/0.1.2-rc.1` 两文件字节与 sha256、`overrides` 六项精确版本（`@deepseek-ai/cordis` 4.0.2 / `-plugin-group` 1.0.2 / `-plugin-hmr` 1.0.17 / `-plugin-include` 1.0.7 / `-plugin-loader` 1.0.3 / `-plugin-timer` 1.1.4）、`lockfileVersion` 3、锁内 dsh `0.1.2-rc.1` 与 `bin.dsh=lib/bin.js`、Linux 平台可选依赖、`bundle.resources` glob |
+| `wsl-smoke.md` | 10,147 字符 | U8.1 实测 7 项 PASS → U8.2 车道表 → U8.3 T1–T8（全 PASS）→ U8.4 真机 17 行与 U8.5 四项**全部 `NOT_RUN`** → 5 条证据缺口 → 交付口径 |
+| `commands.md` | 已完成 | 追加 §U9 与 #96–#113 |
+
+### U9 裁决
+
+- **D-U9-1（环境限制，证据已留）真机车道不在本环境执行**：U8.4 的 17 个场景与 U8.5 的四项（插件 E2E / 桌面 E2E / 三平台 CI / `pnpm tauri build`）一律记 `NOT_RUN`，**不把静态或单测证据写成 PASS**；每项仍逐条给出代码路径作为执行指引。
+- **D-U9-2（口径）`wsl-smoke.md` 的状态三分**：`PASS`（本轮实际执行的静态/构建/单测证据）、`FAIL（既有环境性）`（有基线对照的 Windows 环境性失败）、`NOT_RUN`（需真机）。禁止把已定位的代码路径计为已验证。
+- **D-U9-3（环境隔离要求，真机执行前必读）**：Windows 侧 `DSH_E2E_HOME`/`USERPROFILE` 隔离**不改变** `wsl.exe` 内的 Linux `$HOME`；WSL debug 固定 `.dsh-desktop.dev`；失败注入必须用专用测试发行版或专用 Linux 测试用户，不得使用真实会话/凭据；不得自动导入或删除发行版、不得改默认用户、不得改 `.wslconfig`、不得执行 `wsl --shutdown`。
+- **D-U9-4（已知证据缺口，不为对齐文档而造证据）**：帧身份握手（#7）在仓库内零命中；网络模式 mirrored/NAT（#17）在 `src-tauri/src` 零命中；同一 PID 热生效（#6）无仓库内断言；凭据 `umask 077`（#14）无现成夹具；前端 WSL 配置（#8/#11）无单测（仓库无 `src-tauri/tests/`、无 `wsl*.test.ts*`）。
+- **交付口径**：目标桌面标签 v0.21.0；WSL 受控基线 `0.1.2-rc.1`；真机与发布包**未运行/未生成**；交付物定性为「**静态与构建完成的迁移候选**」，不得标注「WSL 同步完成」。

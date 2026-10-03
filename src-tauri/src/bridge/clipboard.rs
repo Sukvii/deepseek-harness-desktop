@@ -92,6 +92,27 @@ pub async fn read_clipboard_image(
     Ok(result)
 }
 
+/// 从系统剪贴板读取纯文本。
+///
+/// WKWebView 里的 `navigator.clipboard.readText()` 拿不到授权（macOS 桌面端右键菜单
+/// 「粘贴」因此失败），本命令给 iframe 侧一条原生读取路径：与写入一致，在
+/// `spawn_blocking` 里惰性新建短期 `arboard::Clipboard` 读取，用完即弃。
+/// 剪贴板无文本返回 `Ok(None)`；读取失败返回 `Err`（前缀 `CLIPBOARD_TEXT_`）。
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("CLIPBOARD_TEXT_ACCESS: {e}"))?;
+        match clipboard.get_text() {
+            Ok(text) => Ok(Some(text)),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(e) => Err(format!("CLIPBOARD_TEXT_READ: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("CLIPBOARD_TEXT_TASK: {e}"))?
+}
+
 /// 把纯文本写入系统剪贴板。
 ///
 /// 实现与 [`read_clipboard_image`] 一致：在 `spawn_blocking` 里**惰性新建**短期

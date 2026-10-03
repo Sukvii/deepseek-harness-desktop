@@ -25,10 +25,41 @@ pub fn allowed_roots(app_handle: &AppHandle) -> Vec<PathBuf> {
     }
     let dsh_home = crate::config::get_dsh_data_path(app_handle);
     roots.push(dsh_home);
+    // 自定义缓存根下的恢复导出也允许定位，不扩大到该根下的其他文件。
+    roots.push(crate::config::get_base_dir(app_handle).join("recovery-backups"));
     // 本地核心（用户通过 CLI 安装）的包目录：由后端检测得到的可信路径，
     // 允许「核心」面板的「打开目录」打开它（否则会因不在任何允许根内被拒）。
     if let Some(dir) = crate::service::core::local_core_package_dir(app_handle) {
         roots.push(dir);
+    }
+    // 依赖映射表解析出的安装根：依赖可被映射到任意位置（含 `resources/*` 捆绑
+    // 副本），核心/环境面板的「打开目录」必须能打开它们。
+    for key in [
+        crate::config::dependencies::DEP_NODE,
+        crate::config::dependencies::DEP_PNPM,
+        crate::config::dependencies::DEP_DSH,
+    ] {
+        roots.push(crate::config::dependencies::active_root(app_handle, key));
+    }
+    // WSL 核心数据根（U7.2）：只加入**后端配置发行版**已探测 home 下的本应用数据
+    // 根（`\\wsl.localhost\<distro>\<home>\.dsh-desktop[.dev]`），不放开整个 home、
+    // 发行版共享根或前端传来的任意路径。用进程内探测缓存（`cached`）而非
+    // `cached_or_probe`：这里不因「打开文件夹」探测/启动新发行版。canonicalize
+    // 与组件级前缀匹配照旧，逃逸与相邻目录仍被拒绝。
+    #[cfg(windows)]
+    if let Some(distro) = crate::config::get_store_dat_setting(app_handle).wsl_distro {
+        if crate::service::wsl_core::validate_distro(&distro).is_ok() {
+            if let Some(probed) = crate::service::wsl_core::probe::cached(&distro) {
+                let linux_dir = format!(
+                    "{}/{}",
+                    probed.home.trim_end_matches('/'),
+                    crate::service::wsl_core::dsh_home_dir_name()
+                );
+                roots.push(PathBuf::from(
+                    crate::service::wsl_core::patch::wsl_unc_path(&distro, &linux_dir),
+                ));
+            }
+        }
     }
     roots
 }

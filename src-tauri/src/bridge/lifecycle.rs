@@ -23,18 +23,24 @@ fn active_dsh_version(app_handle: &AppHandle) -> Option<String> {
     core::active_version(app_handle).or_else(|| config::get_dsh_version(app_handle))
 }
 
-/// 已安装版本高于推荐版本时保留现有核心，避免依赖自愈流程触发降级。
-fn preserve_newer_installed_dsh(
-    installed_version: Option<&str>,
-    recommended_version: Option<&str>,
-) -> bool {
-    match (
-        installed_version.and_then(|version| semver::Version::parse(version).ok()),
-        recommended_version.and_then(|version| semver::Version::parse(version).ok()),
-    ) {
-        (Some(installed), Some(recommended)) => installed > recommended,
-        _ => false,
-    }
+/// 比较两个版本的先后（`candidate` 相对 `baseline`）。
+///
+/// 两者都须能解析为语义化版本，否则返回 None——无从比较就不下结论，各调用点
+/// 据此退回原行为：依赖自愈不误降级，更新提示不静音真实可用的更新。
+fn version_order(candidate: Option<&str>, baseline: Option<&str>) -> Option<std::cmp::Ordering> {
+    let candidate = semver::Version::parse(candidate?).ok()?;
+    let baseline = semver::Version::parse(baseline?).ok()?;
+    Some(candidate.cmp(&baseline))
+}
+
+/// 该 release 是否不构成更新：不高于当前运行核心（更旧或同版本）就不提示。
+///
+/// 版本无从比较时返回 false，即宁可按原样提示、也不永久静音一个可能可用的更新。
+fn is_update_suppressed(latest_version: Option<&str>, active_version: Option<&str>) -> bool {
+    matches!(
+        version_order(latest_version, active_version),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    )
 }
 
 fn install_lock() -> &'static tokio::sync::Mutex<()> {
@@ -103,8 +109,9 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
             }
         }
         let before = crate::service::wsl_core::probe::cached(&distro).and_then(|p| p.dsh_version);
-        // D-W5R-2 / R-V8-2：默认目标 = 桌面端推荐版本；缺失/无效对**所有调用方**
-        // 一律报错（不再以已装版本兜底——那会让缺配置在自愈路径上静默 no-op）。
+        // D-W5R-2 / R-V8-2 / U1：默认目标 = 清单 `wslRecommend` 的 WSL 独立推荐
+        // 基线；缺失/无效对**所有调用方**一律报错（不再以已装版本兜底——那会让
+        // 缺配置在自愈路径上静默 no-op）。
         let spec = crate::service::wsl_core::install::default_version_spec(&app_handle)?;
         let after = crate::service::wsl_core::install::ensure(&app_handle, &distro, &spec).await?;
         // `installed` 标记同样适用于 WSL 核心：让前端跳过「正在安装依赖」界面；
@@ -131,6 +138,10 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // Windows 空白环境还必须有可执行的 Git，才能安装 github:/git+ssh: 插件。
     // 非 Windows 返回 true，保持原有依赖集合不变。
     let git_ok = config::git_runtime_ready(&app_handle);
+
+    // 依赖路径映射回写：系统已有合规版本记 `null`（使用系统环境），只有真正托管在
+    // 本地的内核才记路径。幂等，且内容未变化时不落盘。
+    download::record_mappings(&app_handle);
 
     // 启动自愈捷径：记录显示未安装、但运行时文件已全部在盘。常见于桌面端自更新
     // 安装器强杀进程，或上次启动时核心文件短暂缺失被 workflow::start 复位
@@ -178,7 +189,8 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
         .then(|| active_dsh_version(&app_handle))
         .flatten();
     let preserve_installed =
-        preserve_newer_installed_dsh(installed_version.as_deref(), recommended_version.as_deref());
+        version_order(installed_version.as_deref(), recommended_version.as_deref())
+            == Some(std::cmp::Ordering::Greater);
     let dsh_latest = if preserve_installed {
         log::info!(
             "Keeping installed dsh version above recommendation: {}",
@@ -217,16 +229,24 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
                 &legacy_tags,
             ) {
                 // 安装文件已是最新 release，只是记录滞后：修正记录后下次
-                // 启动直接走 commit 快速比对，不再误判、也绝不整包重下
+                // 启动直接走 commit 快速比对，不再误判、也绝不整包重下。
+                // tag 记录同时是核心面板判定 release 身份的唯一依据（就地安装的
+                // 副本没有槽位目录）：缺 tag 会让它把已下载的核心当成没下载过，并
+                // 吞掉核心更新提示（issue #790），所以 commit 相符也要补齐 tag。
                 download::UpdateCheck::UpToDate | download::UpdateCheck::HealUpToDate => {
-                    if record_commit.as_deref() != Some(latest.commit.as_str()) {
+                    if record_tag.as_deref() != Some(latest.tag.as_str())
+                        || record_commit.as_deref() != Some(latest.commit.as_str())
+                    {
                         log::info!(
                             "Installed Harness files already at latest release, healing stale record: {} ({})",
                             latest.tag,
                             latest.commit
                         );
-                        config::set_dsh_pkg_commit(&app_handle, latest.commit.clone());
-                        config::set_dsh_pkg_tag(&app_handle, latest.tag.clone());
+                        config::set_dsh_pkg_identity(
+                            &app_handle,
+                            latest.commit.clone(),
+                            latest.tag.clone(),
+                        );
                     }
                     false
                 }
@@ -360,6 +380,23 @@ pub async fn check_dsh_update(
         }
     }
 
+    // 关键修复3：latest 不高于当前运行核心时不提示。pkg 仓库的「Current latest」
+    // 可能被指向更旧的 release（dsh-0.1.7-rc.2），而用户运行的核心已是更高的
+    // 0.2.0-rc.1；此时提示会把用户引向降级，且「立即更新」也会因保留更高版本
+    // 而实际什么都没做，最终只弹一个「更新校验失败」。
+    // 版本无从比较时不进入本分支，保留原有的「照常提示」行为。
+    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
+        let active = active_dsh_version(&app_handle);
+        if is_update_suppressed(Some(&version), active.as_deref()) {
+            log::info!(
+                "Suppressing dsh update toast because latest {} does not outrank the active core {}",
+                version,
+                active.as_deref().unwrap_or_default()
+            );
+            return Ok(None);
+        }
+    }
+
     Ok(Some(latest))
 }
 
@@ -391,11 +428,67 @@ pub async fn restart_harness(app_handle: AppHandle) -> Result<(), String> {
 /// 自愈与首次引导安装都作用于「当时的活动档案」）；这些插件由启动前的清除流程卸载
 /// （见 `service::plugin::safe::purge_user_plugins_in_safe_profile`），本命令只负责
 /// 切档案——服务仍在运行时删除插件目录不安全，必须等重启后的 spawn 之前再清。
+///
+/// 补丁层是这里唯一的例外：**home 层（`$DSH_HOME/cordis.patch.yml`）作用于所有
+/// 档案**，安全档案也不例外，因此一处手写笔误（典型是 `!!js` 表达式含 `: ` 却没加
+/// 引号）会让安全模式也起不来，把兜底入口一起废掉（issue #525）。这里在切档案前把
+/// 解析不了的补丁文件改名为同名 `.broken-<时间戳>` 备份（只改名、不删除），保证
+/// 「安全模式一定起得来」；记录回传前端提示备份路径，用户修好语法后改回原名即可恢复。
+///
+/// 改名失败（权限/占用）时**不切换档案层**并返回错误：损坏文件还在原地，重启只会
+/// 再次解析失败，切过去等于把「安全模式」也变成失败循环。此时让用户先处理文件，
+/// 而不是假装已恢复。
 #[tauri::command]
-pub async fn enter_safe_mode(app_handle: AppHandle) -> Result<(), String> {
+pub async fn enter_safe_mode(
+    app_handle: AppHandle,
+) -> Result<crate::service::plugin::PatchQuarantineReport, String> {
     crate::service::profile::ensure_safe_profile(&app_handle)?;
+    let report = crate::service::plugin::quarantine_patch_layers_in(
+        &crate::service::profile::profile_dir_of(
+            &app_handle,
+            crate::service::profile::SAFE_PROFILE,
+        ),
+        &config::get_dsh_data_path(&app_handle),
+    );
+    if report.has_failures() {
+        return Err(crate::service::plugin::quarantine_failure_message(&report));
+    }
     crate::service::profile::set_active(&app_handle, crate::service::profile::SAFE_PROFILE)?;
-    Ok(())
+    Ok(report)
+}
+
+/// 隔离解析失败的补丁层：当前档案层 + home 层（错误页「隔离损坏的补丁文件」入口）。
+///
+/// 与 [`enter_safe_mode`] 共用同一套隔离逻辑，区别只在作用范围——本命令让用户留在
+/// 自己的档案里恢复，不切档案、不动插件。补丁文件只改名保存，内容原样保留。
+///
+/// 与 [`enter_safe_mode`] 同样：只要有损坏层没能移走就返回错误，前端不重启——否则
+/// 会立刻回到同一个解析失败。
+#[tauri::command]
+pub async fn quarantine_broken_patch_layers(
+    app_handle: AppHandle,
+) -> Result<crate::service::plugin::PatchQuarantineReport, String> {
+    let report = crate::service::plugin::quarantine_active_patch_layers(&app_handle);
+    if report.has_failures() {
+        return Err(crate::service::plugin::quarantine_failure_message(&report));
+    }
+    Ok(report)
+}
+
+/// 移除补丁层里解析不到包的 `insert` 条目（错误页「移除悬空条目」入口）。
+///
+/// 与 [`quarantine_broken_patch_layers`] 的区别：语法错误只能整层隔离，悬空条目
+/// 可以精确定位——只剥离判定为悬空的 insert 项，同一条目里的其它 insert、其它
+/// 条目与其它配置原样保留。用户手写的补丁层绝不无声丢失：改写前先复制成
+/// `<原名>.bak-<时间戳>` 备份，备份路径回传前端提示。
+///
+/// 判定规则与启动前预检完全一致（见 `service::plugin::patch_entries`），因此本命令
+/// 移除的正是预检报出的那批条目；没有可移除项时返回空报告，前端照常重启。
+#[tauri::command]
+pub async fn strip_unresolved_patch_entries(
+    app_handle: AppHandle,
+) -> Result<crate::service::plugin::PatchEntryStripReport, String> {
+    crate::service::plugin::strip_active_unresolved_entries(&app_handle)
 }
 
 /// 获取当前 Harness 服务状态
@@ -436,7 +529,34 @@ pub async fn runtime_ready(app_handle: AppHandle) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_lock, preserve_newer_installed_dsh};
+    use super::{install_lock, is_update_suppressed, version_order};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn older_latest_release_does_not_outrank_active_core() {
+        // 症状回归：pkg 仓库的「Current latest」可能指向更旧的 release
+        // （dsh-0.1.7-rc.2），而当前运行的核心已是更高的 0.2.0-rc.1，
+        // 此时 latest 不构成更新，不得提示（更不能引导用户降级）。
+        assert!(is_update_suppressed(Some("0.1.7-rc.2"), Some("0.2.0-rc.1")));
+        assert!(is_update_suppressed(Some("0.2.0-rc.1"), Some("0.2.0-rc.1")));
+        // 真正更高的 release 仍须提示
+        assert!(!is_update_suppressed(
+            Some("0.2.0-rc.1"),
+            Some("0.1.7-rc.2")
+        ));
+        // 同一版本的 rc 序号按语义化比较，不是字符串序
+        assert_eq!(
+            version_order(Some("0.1.7-rc.10"), Some("0.1.7-rc.9")),
+            Some(Ordering::Greater)
+        );
+        // 版本无从比较时不得据此静音更新提示
+        assert!(!is_update_suppressed(None, Some("0.2.0-rc.1")));
+        assert!(!is_update_suppressed(Some("0.2.0-rc.1"), None));
+        assert!(!is_update_suppressed(
+            Some("not-a-version"),
+            Some("0.2.0-rc.1")
+        ));
+    }
 
     #[test]
     fn install_lock_is_exclusive_while_held() {
@@ -453,17 +573,11 @@ mod tests {
 
     #[test]
     fn newer_installed_dsh_is_preserved_from_recommended_downgrade() {
-        assert!(preserve_newer_installed_dsh(
-            Some("0.1.1-rc.3"),
-            Some("0.1.1-rc.2")
-        ));
-        assert!(!preserve_newer_installed_dsh(
-            Some("0.1.1-rc.2"),
-            Some("0.1.1-rc.2")
-        ));
-        assert!(!preserve_newer_installed_dsh(
-            Some("0.1.1-rc.1"),
-            Some("0.1.1-rc.2")
-        ));
+        let preserve = |installed: &str, recommended: &str| {
+            version_order(Some(installed), Some(recommended)) == Some(Ordering::Greater)
+        };
+        assert!(preserve("0.1.1-rc.3", "0.1.1-rc.2"));
+        assert!(!preserve("0.1.1-rc.2", "0.1.1-rc.2"));
+        assert!(!preserve("0.1.1-rc.1", "0.1.1-rc.2"));
     }
 }

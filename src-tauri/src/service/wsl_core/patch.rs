@@ -1,11 +1,11 @@
 //! WSL 核心的 `--skip-auth` 补丁：对 UNC 路径直接读写 WSL 内的 dsh 文件。
 //!
-//! 复用 [`crate::service::patch::alpha_auth`] 的两个纯字符串补丁函数；目标文件经
+//! 复用 [`super::auth_patch`] 的两个纯字符串补丁函数；目标文件经
 //! `\\wsl.localhost\<distro>\<受控运行时 node_modules>\…` 的 UNC 路径访问（本机可
 //! 直接读写）。候选相对路径的**根**由调用方给出（v8：正式运行时或候选运行时），
 //! 本模块只认这一个根，不自行推导。
 
-use crate::service::patch::alpha_auth::{patch_connection, patch_startup};
+use super::auth_patch::{patch_connection, patch_startup};
 use crate::utils::{patch_file_at, PatchOutcome};
 use std::path::PathBuf;
 
@@ -20,8 +20,8 @@ use std::path::PathBuf;
 ///   @deepseek-ai/dsh-client-connection`（dsh 直属嵌套）；
 /// - `0.1.5-rc.2`：connection 嵌在 `dsh-web-app/node_modules/@deepseek-ai/` 下。
 ///
-/// 与 Windows 侧 `alpha_auth` 的相对路径口径一致（那边以 dsh 包根为基，此处以
-/// 运行时 `node_modules` 为基）。
+/// 与历史桌面补丁（`alpha_auth`，U2 已删）的相对路径口径一致（那边以 dsh 包根为
+/// 基，此处以运行时 `node_modules` 为基）。
 const WEB_STARTUP_RELS: [&str; 2] = [
     "@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-app/lib/startup.js",
     "@deepseek-ai/dsh-web-app/lib/startup.js",
@@ -38,7 +38,10 @@ fn wsl_unc_root(distro: &str) -> String {
 }
 
 /// Linux 绝对路径 → UNC 路径（`/home/x` → `\\wsl.localhost\<distro>\home\x`）。
-pub(super) fn wsl_unc_path(distro: &str, linux_path: &str) -> String {
+///
+/// `pub(crate)`（U7.2）：`bridge::guard::allowed_roots` 需要用它构造 WSL 数据根的
+/// 允许根（仅限已探测 home 下的本应用数据根，不放开整个 home / 发行版共享根）。
+pub(crate) fn wsl_unc_path(distro: &str, linux_path: &str) -> String {
     format!("{}{}", wsl_unc_root(distro), linux_path.replace('/', "\\"))
 }
 

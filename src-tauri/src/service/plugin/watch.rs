@@ -1,6 +1,6 @@
 //! 已安装插件监控：轮询 profile 插件文件（`package.json` + `node_modules` 下
 //! 各直接依赖清单），内容变化时解析为结构化列表并通过 `dsh-plugins-updated`
-//! 事件实时推送给前端（`use-dsh-plugins` hook 消费）。
+//! 事件实时推送给前端（由根布局写入插件列表查询缓存）。
 //!
 //! 采用与主题轮询（`config/theme.rs`）一致的「秒级 tick + 指纹比对」方案，
 //! 不引入 notify 等文件监听依赖：插件数量少（个位数到十几个），每次读取的
@@ -109,7 +109,7 @@ fn plugin_dir(profile: &Path, id: &str) -> PathBuf {
 
 /// 规范化仓库地址，便于系统浏览器直接打开：
 /// `git+https://...` / `git://...` → `https://...`，去掉末尾 `.git`
-fn normalize_repo_url(url: &str) -> String {
+pub(crate) fn normalize_repo_url(url: &str) -> String {
     let mut normalized = url.trim().to_string();
     if let Some(rest) = normalized.strip_prefix("git+") {
         normalized = rest.to_string();
@@ -174,7 +174,7 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
 
     dep_ids
         .into_iter()
-        .filter_map(|id| {
+        .map(|id| {
             let preset = preset_map.get(id.as_str());
             let meta = read_plugin_meta(&plugin_dir(profile, id));
             let repo_url = meta
@@ -193,7 +193,7 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
                 .or_else(|| preset.map(|p| p.name.clone()))
                 .unwrap_or_else(|| id.clone());
             let patch_disabled_by_name = patch_disabled_set.contains(name.as_str());
-            Some(DshPlugin {
+            DshPlugin {
                 id: id.clone(),
                 name,
                 version: meta
@@ -208,8 +208,7 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
                 repo_url,
                 bundled: bundled.contains(id.as_str()),
                 disabled: disabled_map.contains_key(id),
-                patch_disabled: patch_disabled_set.contains(id.as_str())
-                    || patch_disabled_by_name,
+                patch_disabled: patch_disabled_set.contains(id.as_str()) || patch_disabled_by_name,
                 recommended: preset.map(|p| p.recommended).unwrap_or(false),
                 fix: preset.map(|p| p.fix).unwrap_or(false),
                 internal: internal_names.contains(id.as_str()),
@@ -217,7 +216,7 @@ fn parse_plugins(profile: &Path, presets: &[PreinstallPluginInfo]) -> Vec<DshPlu
                 latest_version: None,
                 has_snapshot: false,
                 error: None,
-            })
+            }
         })
         .collect()
 }
@@ -257,16 +256,7 @@ pub fn list(app_handle: &AppHandle) -> Vec<DshPlugin> {
 /// 同时把监控指纹同步到当前状态，避免紧接着的下一次轮询重复推送同一列表。
 pub fn force_emit(app_handle: &AppHandle) {
     let fp = fingerprint(app_handle);
-    let mut state = STATE
-        .get_or_init(|| {
-            Mutex::new(WatchState {
-                last_fp: None,
-                last_emit: None,
-                pending_fp: None,
-            })
-        })
-        .lock()
-        .unwrap();
+    let mut state = STATE.get_or_init(Mutex::default).lock().unwrap();
     state.pending_fp = None;
     state.last_fp = fp;
     drop(state);
@@ -304,6 +294,7 @@ fn fingerprint(app_handle: &AppHandle) -> Option<String> {
 }
 
 /// 监控状态：指纹 + 防抖窗口（仅 check_and_emit 单线程轮询访问）
+#[derive(Default)]
 struct WatchState {
     /// 上次已推送的指纹（内容一致则跳过）
     last_fp: Option<String>,
@@ -319,16 +310,7 @@ static STATE: OnceLock<Mutex<WatchState>> = OnceLock::new();
 /// 重新解析插件列表并推送 `dsh-plugins-updated` 事件。
 pub fn check_and_emit(app_handle: &AppHandle) {
     let fp = fingerprint(app_handle);
-    let mut state = STATE
-        .get_or_init(|| {
-            Mutex::new(WatchState {
-                last_fp: None,
-                last_emit: None,
-                pending_fp: None,
-            })
-        })
-        .lock()
-        .unwrap();
+    let mut state = STATE.get_or_init(Mutex::default).lock().unwrap();
 
     if state.last_fp.as_deref() == fp.as_deref() {
         return;
@@ -338,7 +320,7 @@ pub fn check_and_emit(app_handle: &AppHandle) {
     state.pending_fp = fp;
     let can_emit = state
         .last_emit
-        .map_or(true, |last| last.elapsed() >= DEBOUNCE);
+        .is_none_or(|last| last.elapsed() >= DEBOUNCE);
     if !can_emit {
         return;
     }
@@ -367,7 +349,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("dsh-watch-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
         let mut manifest = serde_json::json!({
             "name": "dsh-profile-web",
             "private": true,
@@ -406,10 +388,44 @@ mod tests {
             recommended: true,
             fix: false,
             default_checked: false,
+            default_unchecked: false,
+            version: None,
             win_only: false,
             package: None,
             internal: false,
         }]
+    }
+
+    #[test]
+    fn watch_state_default_starts_without_fingerprints_or_debounce() {
+        let state = Mutex::<WatchState>::default();
+        let state = state.lock().unwrap();
+        assert_eq!(state.last_fp, None);
+        assert_eq!(state.last_emit, None);
+        assert_eq!(state.pending_fp, None);
+    }
+
+    #[test]
+    fn repo_url_normalization_preserves_existing_boundaries() {
+        for (input, expected) in [
+            ("  git+git://example/repo.git  ", "https://example/repo"),
+            ("git+https://example/repo.git", "https://example/repo"),
+            ("git://example/repo.git", "https://example/repo"),
+            ("https://example/repo.git/", "https://example/repo.git/"),
+            (
+                "https://example/repo.git?x=1",
+                "https://example/repo.git?x=1",
+            ),
+            ("git+ssh://example/repo.git", "ssh://example/repo"),
+            (
+                "git+git+https://example/repo.git",
+                "git+https://example/repo",
+            ),
+            ("Git://example/repo.git", "Git://example/repo"),
+            ("  ", ""),
+        ] {
+            assert_eq!(normalize_repo_url(input), expected, "{input}");
+        }
     }
 
     #[test]
@@ -490,6 +506,8 @@ mod tests {
             recommended: true,
             fix: false,
             default_checked: false,
+            default_unchecked: false,
+            version: None,
             win_only: false,
             package: None,
             internal: true,
@@ -599,12 +617,9 @@ mod tests {
     /// - 不在 bundles 且不在禁用清单 → bundled=false, disabled=false（未加载，启用会失败）
     #[test]
     fn parse_plugins_distinguishes_disabled_from_unloaded() {
-        let dir = std::env::temp_dir().join(format!(
-            "dsh-watch-disabled-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dsh-watch-disabled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
         let manifest = serde_json::json!({
             "name": "dsh-profile-web",
             "private": true,
@@ -623,7 +638,11 @@ mod tests {
         for id in ["dsh-loaded", "dsh-disabled", "dsh-unloaded"] {
             let pkg_dir = dir.join("node_modules").join(id);
             std::fs::create_dir_all(&pkg_dir).unwrap();
-            std::fs::write(pkg_dir.join("package.json"), format!(r#"{{"name":"{id}"}}"#)).unwrap();
+            std::fs::write(
+                pkg_dir.join("package.json"),
+                format!(r#"{{"name":"{id}"}}"#),
+            )
+            .unwrap();
         }
         // 仅 dsh-disabled 写入禁用清单。
         let disabled = serde_json::json!({
@@ -661,7 +680,10 @@ mod tests {
                     "dshmarket",
                     r#"{"name":"dshmarket","version":"1.13.1","dsh":{"bundle":{}}}"#,
                 ),
-                ("dsh-tauri-pet", r#"{"name":"dsh-tauri-pet","version":"0.1.0"}"#),
+                (
+                    "dsh-tauri-pet",
+                    r#"{"name":"dsh-tauri-pet","version":"0.1.0"}"#,
+                ),
                 ("dsh-other", r#"{"name":"dsh-other","version":"0.1.0"}"#),
             ],
         );

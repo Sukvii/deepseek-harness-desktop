@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, WebviewWindow};
 
+use crate::utils::decode_process_line;
+
 #[cfg(windows)]
 use crate::service::workflow;
 #[cfg(not(windows))]
@@ -108,6 +110,45 @@ pub(crate) fn plugin_process_has_exited(pid: u32) -> bool {
     }
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// dsh 侧 `dsh-atomic-write` 的跨进程写锁路径（`<profile>/package.json.lock`）。
+pub(crate) fn plugin_writer_lock_path(profile_dir: &Path) -> std::path::PathBuf {
+    profile_dir.join("package.json.lock")
+}
+
+/// 锁内容（持有者 PID）是否表明持有者已退出：必须是正 PID，且该进程已不在。
+fn orphan_lock_should_clear(recorded: &str, has_exited: impl Fn(u32) -> bool) -> bool {
+    recorded
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|pid| pid != 0 && has_exited(pid))
+}
+
+/// 清掉由已退出进程留下的孤儿写锁，返回是否真的删除。
+///
+/// `dsh` 用 `wx` 独占创建做锁、等待方只轮询从不删除（库文档明确「孤儿恢复属于运维
+/// 动作」）：安装子进程被强杀（取消 / 页面刷新 / 应用退出）后锁会永久留下，之后每次
+/// 安装都要静默等到 deadline 才报 `atomic-write: timed out waiting for the writer
+/// lock`。这里按 PID 存活做等价恢复——**持有者还活着就绝不碰**，所以并发安装不会互相
+/// 踩；锁内容缺失或无法解析时同样不删（无法证明持有者已退出）。
+pub(crate) fn clear_orphan_plugin_writer_lock(profile_dir: &Path) -> bool {
+    let path = plugin_writer_lock_path(profile_dir);
+    let Ok(recorded) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if !orphan_lock_should_clear(&recorded, plugin_process_has_exited) {
+        return false;
+    }
+    if std::fs::remove_file(&path).is_err() {
+        return false;
+    }
+    log::warn!(
+        "removed orphan plugin writer lock ({}), holder {} already exited",
+        path.display(),
+        recorded.trim()
+    );
+    true
 }
 
 pub(crate) fn mark_process_cleanup_failed(owner: ProcessOwner, reason: String) {
@@ -303,7 +344,7 @@ pub(crate) async fn run_plugin_process(
 }
 
 /// 取出（并清空）共享缓冲区中的全部捕获输出。
-fn drain_captured(captured: Arc<Mutex<String>>) -> String {
+pub(super) fn drain_captured(captured: Arc<Mutex<String>>) -> String {
     captured
         .lock()
         .map(|mut buf| std::mem::take(&mut *buf))
@@ -326,12 +367,13 @@ fn spawn_line_emitter<R: Read + Send + 'static>(
             match buf.read_until(b'\n', &mut acc_buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    // lossy 兜底：zh-CN Windows 下 python MCP 插件输出 GBK 日志时，
-                    // 严格 UTF-8 读取会中断本线程并关闭子进程管道（EPIPE）——
-                    // 安装进程可能因此以非 0 退出码失败，被误判为安装失败。
+                    // 非法 UTF-8 不能中断本线程：管道读端一关，子进程写 stderr
+                    // 就收到 EPIPE，安装进程可能因此以非 0 退出码失败而被误判为
+                    // 安装失败。解码先走 ANSI 代码页（`decode_process_line`），
+                    // zh-CN Windows 下 python MCP 插件的 GBK 日志才不会变乱码。
                     // 行尾剥离与上游 utils.rs 的 #197 修复一致：只剥 \r\n/\n，
                     // 保留行内尾随空白以对齐 BufRead::lines() 语义。
-                    let line = String::from_utf8_lossy(&acc_buf);
+                    let line = decode_process_line(&acc_buf);
                     let trimmed = line
                         .strip_suffix("\r\n")
                         .or_else(|| line.strip_suffix('\n'))
@@ -360,6 +402,43 @@ fn spawn_line_emitter<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_captured_preserves_exact_output_and_clears_shared_buffer() {
+        let captured = Arc::new(Mutex::new(
+            "stdout  \r\n\tstderr\0中文\npartial\r".to_string(),
+        ));
+
+        assert_eq!(
+            drain_captured(captured.clone()),
+            "stdout  \r\n\tstderr\0中文\npartial\r"
+        );
+        assert_eq!(*captured.lock().unwrap(), "");
+        assert_eq!(drain_captured(captured.clone()), "");
+
+        captured.lock().unwrap().push_str("late stderr");
+        assert_eq!(drain_captured(captured.clone()), "late stderr");
+        assert_eq!(*captured.lock().unwrap(), "");
+    }
+
+    #[test]
+    fn drain_captured_returns_empty_without_recovering_poisoned_buffer() {
+        let captured = Arc::new(Mutex::new("retained output".to_string()));
+        let writer = captured.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = writer.lock().unwrap();
+            panic!("poison isolated capture buffer");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(drain_captured(captured.clone()), "");
+        assert!(captured.is_poisoned());
+        assert_eq!(
+            *captured.lock().unwrap_err().into_inner(),
+            "retained output"
+        );
+    }
 
     #[test]
     fn stale_guard_cannot_clear_a_new_process_for_the_same_owner() {
@@ -416,5 +495,51 @@ mod tests {
             "clearing a stale owner must not remove another owner's failure"
         );
         clear_process_cleanup_failed(other_owner);
+    }
+
+    #[test]
+    fn orphan_lock_clears_only_for_exited_positive_pid() {
+        let alive = |_: u32| false;
+        let exited = |_: u32| true;
+        assert!(orphan_lock_should_clear("1234\n", exited));
+        assert!(!orphan_lock_should_clear("1234\n", alive));
+        assert!(!orphan_lock_should_clear("", exited));
+        assert!(!orphan_lock_should_clear("   \n", exited));
+        assert!(!orphan_lock_should_clear("not-a-pid", exited));
+        assert!(!orphan_lock_should_clear("-1", exited));
+        assert!(!orphan_lock_should_clear("0", exited));
+    }
+
+    #[test]
+    fn orphan_lock_file_is_removed_for_dead_holder_and_kept_for_live_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-orphan-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = plugin_writer_lock_path(&dir);
+
+        let live = std::process::id();
+        std::fs::write(&path, format!("{live}\n")).unwrap();
+        assert!(
+            !clear_orphan_plugin_writer_lock(&dir),
+            "live holder must never be touched"
+        );
+        assert!(path.exists());
+
+        std::fs::write(&path, "garbage").unwrap();
+        assert!(!clear_orphan_plugin_writer_lock(&dir));
+        assert!(path.exists());
+
+        std::fs::write(&path, format!("{}\n", u32::MAX - 1)).unwrap();
+        assert!(
+            clear_orphan_plugin_writer_lock(&dir),
+            "unknown/absent pid counts as exited"
+        );
+        assert!(!path.exists());
+
+        assert!(!clear_orphan_plugin_writer_lock(&dir), "no lock, no-op");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

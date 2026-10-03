@@ -1,31 +1,41 @@
-import type * as Types from './index.type'
-import { fetch } from 'dsh-tauri/client'
-import { WORKTREE_API_PREFIX } from '../../shared/constants'
+/*
+ * @title dsh-tauri-worktree
+ * @swagger 2.0
+ * @version 0.0.0
+ */
 
-export const baseURL = WORKTREE_API_PREFIX
+import type { FetchOptions } from "dsh-tauri/client";
+import { ofetch } from "dsh-tauri/client";
+import type * as Types from "./index.type";
 
-/** @method get 查询某会话的工作树状态。 */
-export function getStatus(query: Types.GetStatusQuery): Promise<Types.WorktreeStatus> {
-  const jobId = query.jobId ? `&jobId=${encodeURIComponent(query.jobId)}` : ''
-  return fetch(`${baseURL}/status?sessionId=${encodeURIComponent(query.sessionId)}${jobId}`)
+export const baseURL = "/api/desktop/dsh-tauri-worktree";
+
+/** @method get */
+export function getBindings(options?: FetchOptions) {
+  return ofetch<Types.WorktreeBindings>("/bindings", { baseURL, method: "get", ...options });
 }
 
-/** @method post 为预分配的新会话创建工作树。 */
-export function postCreate(body: Types.PostCreateBody): Promise<Types.WorktreeCreate> {
-  return fetch(`${baseURL}/create`, { method: 'POST', body })
+/** @method post */
+export function postBindings(body: Types.AttachBody, options?: FetchOptions) {
+  return ofetch<Types.WorktreeAttach>("/bindings", { baseURL, method: "post", body, ...options });
 }
 
-/** @method post 将已创建的 worktree 会话归属到源项目 Workspace。 */
-export function postAttach(body: Types.PostAttachBody): Promise<{ ok: boolean, workspaceId: string }> {
-  return fetch(`${baseURL}/attach`, { method: 'POST', body })
+/** @method post */
+export function postCheckouts(body: Types.CheckoutBody, options?: FetchOptions) {
+  return ofetch<Types.WorktreeCheckout>("/checkouts", { baseURL, method: "post", body, ...options });
 }
 
-/** @method post 检出本地（分支名客户端已 trimmed）。 */
-export function postCheckout(body: Types.PostCheckoutBody): Promise<Types.WorktreeCheckout> {
-  return fetch(`${baseURL}/checkout`, { method: 'POST', body })
+/** @method post */
+export function postWorktree(body: Types.CreateBody, options?: FetchOptions) {
+  return ofetch<Types.WorktreeCreate>("", { baseURL, method: "post", body, ...options });
 }
 
-/** @method post 放弃更改：删除工作树并解除绑定，会话保留。 */
-export function postDiscard(body: Types.PostDiscardBody): Promise<Types.WorktreeDiscard> {
-  return fetch(`${baseURL}/discard`, { method: 'POST', body })
+/** @method delete */
+export function deleteWorktree(body: Types.DiscardBody, options?: FetchOptions) {
+  return ofetch<Types.WorktreeDiscard>("", { baseURL, method: "delete", body, ...options });
+}
+
+/** @method get */
+export function getStatus(params?: Types.GetStatusQuery, options?: FetchOptions) {
+  return ofetch<Types.WorktreeStatus>("/status", { baseURL, method: "get", params, ...options });
 }

@@ -1,11 +1,15 @@
 //! 插件更新可用性检测（参考 dsh-market 的 `updates.ts`，但去掉「桌面端」耦合）。
 //!
 //! 每个已安装插件按其在 profile `package.json` 中的依赖 spec 判断：
+//! - `catalog:` / `catalog:<name>` → 先换成 `pnpm-workspace.yaml` 里 catalog 条目的
+//!   真实 spec 再判定（见 [`effective_spec`]）：catalog 依赖在档案里一律写成
+//!   `catalog:`，不换就会被当成 registry 依赖——条目指向 git 提交的插件会去和 npm
+//!   的 latest 比较，lock 里的提交也失去归属依据；
 //! - `link:` / `file:` 本地依赖 → 永不视为有更新；
 //! - git 类型（`github:` / `git+https://github.com/…` / `https://codeload.github.com/…`）
 //!   → 用 pnpm-lock.yaml 里记录的 codeload 提交 SHA 对比 GitHub 跟踪目标：
-//!     git spec 显式声明 `#ref` 时跟踪该 tag / branch / SHA，未声明时跟踪 HEAD；
-//!     镜像安装写入的 codeload archive URL 记录的是当前安装提交，更新源仍是 HEAD；
+//!   git spec 显式声明 `#ref` 时跟踪该 tag / branch / SHA，未声明时跟踪 HEAD；
+//!   镜像安装写入的 codeload archive URL 记录的是当前安装提交，更新源仍是 HEAD；
 //! - 其余（registry）→ 用 npm registry 的 `latest` dist-tag 与已装版本做语义化比较，
 //!   `latest > installed` 才视为有更新（避免把 `latest` 指向更旧版本误判为可升级）。
 //!
@@ -61,11 +65,55 @@ fn cache_key(id: &str, spec: &str, version: &str, locked: &HashMap<String, Strin
     format!("{id}\u{0}{spec}\u{0}{version}\u{0}{locked_commit}")
 }
 
+/// 探测缓存里该插件的「最新版本」；没探测过或缓存里没有它时返回 `None`。
+///
+/// 升级「以 0 退出但版本没动」时需要知道本该装到哪个版本：发布时长豁免是按精确
+/// `包名@版本` 写的，没有目标版本就给不出可授权的条目。这里只读缓存、不新发请求
+/// （探测由 [`refresh`] 统一负责），缓存键以 `id` 开头（见 [`cache_key`]）。
+pub(crate) fn known_latest(id: &str) -> Option<String> {
+    let cache = cache().lock().unwrap();
+    let prefix = format!("{id}\u{0}");
+    cache
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .max_by_key(|(_, entry)| entry.at)
+        .and_then(|(_, entry)| entry.info.latest.clone())
+}
+
 // ---------------------------------------------------------------------------
 // 读取安装态（spec / 版本 / 锁定提交）
 // ---------------------------------------------------------------------------
 
-/// 当前档案的直接依赖（id → spec）。读取失败返回空表（不阻断整体判定）。
+/// 依赖的「生效 spec」：`catalog:` / `catalog:<name>` 换成 `pnpm-workspace.yaml` 里
+/// catalog 条目的真实 spec，其余原样返回。
+///
+/// 必须换：档案里的 catalog 依赖一律写成 `catalog:`，不换就会被当成 registry 依赖
+/// ——条目指向 git 提交的插件（如 `github:owner/repo#<sha>`）会被拿去和 npm 的
+/// latest 版本比较（既可能误报有更新，也可能漏报 git 新提交），并且
+/// [`read_locked_commits`] 认不出仓库、拿不到该依赖的锁定提交，缓存键也随之失真。
+/// 条目缺失或文件不可读/损坏时返回原 spec：宁可保持现状也不猜。
+fn effective_spec(profile: &Path, id: &str, spec: &str) -> String {
+    catalog_spec(profile, id, spec).unwrap_or_else(|| spec.to_string())
+}
+
+/// 取 `pnpm-workspace.yaml` 中 catalog 条目的 spec。
+///
+/// `spec` 形如 `catalog:`（默认 catalog，对应文件里的 `catalog` 表）或
+/// `catalog:<name>`（命名 catalog，对应 `catalogs.<name>`）。非 catalog spec、
+/// 条目缺失、文件不可读或结构不符时返回 `None`。
+fn catalog_spec(profile: &Path, id: &str, spec: &str) -> Option<String> {
+    let name = spec.strip_prefix("catalog:")?;
+    let text = std::fs::read_to_string(profile.join("pnpm-workspace.yaml")).ok()?;
+    let workspace: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+    let entries = if name.is_empty() {
+        workspace.get("catalog")?
+    } else {
+        workspace.get("catalogs")?.get(name)?
+    };
+    entries.get(id)?.as_str().map(String::from)
+}
+
+/// 当前档案的直接依赖（id → 生效 spec）。读取失败返回空表（不阻断整体判定）。
 fn read_specs(app_handle: &AppHandle) -> HashMap<String, String> {
     let dir = profile_dir(app_handle);
     let Ok(content) = std::fs::read_to_string(dir.join("package.json")) else {
@@ -78,7 +126,7 @@ fn read_specs(app_handle: &AppHandle) -> HashMap<String, String> {
     if let Some(deps) = manifest.get("dependencies").and_then(Value::as_object) {
         for (name, spec) in deps {
             if let Some(s) = spec.as_str() {
-                out.insert(name.clone(), s.to_string());
+                out.insert(name.clone(), effective_spec(&dir, name, s));
             }
         }
     }
@@ -343,15 +391,8 @@ fn percent_decode_once(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// percent decode 只接受十六进制字节；非法 nibble 返回 None，使 selector
-/// 解析 fail closed 而不是生成被截断的 ref。
 fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+    char::from(value).to_digit(16).map(|digit| digit as u8)
 }
 
 /// `owner/repo` 形态校验（owner/repo 各仅允许字母数字 `._-`，避免误吞 URL 首位）。
@@ -379,7 +420,10 @@ fn is_upgrade(installed: &str, latest: &str) -> bool {
 }
 
 /// 把 npm 包名编码为 registry 路径（`@scope/name` → `@scope%2Fname`）。
-fn encode_registry_name(name: &str) -> String {
+///
+/// `pub(crate)`：插件 spec 兼容性检查（`install::inspect`）需要读同一个 registry，
+/// 复用这里的编码与请求形状，避免两处 URL 拼装漂移。
+pub(crate) fn encode_registry_name(name: &str) -> String {
     name.replace('@', "%40").replace('/', "%2F")
 }
 
@@ -387,7 +431,8 @@ fn encode_registry_name(name: &str) -> String {
 // 网络判定
 // ---------------------------------------------------------------------------
 
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+/// registry/API 的 JSON GET（非 2xx 与网络错误统一返回 `None`）。
+pub(crate) async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
     let res = client
         .get(url)
         .header("accept", "application/json")
@@ -589,6 +634,37 @@ pub async fn refresh(app_handle: &AppHandle) -> Result<Vec<DshPlugin>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hex_value_accepts_only_ascii_hex_nibbles() {
+        for byte in 0..=u8::MAX {
+            let expected = b"0123456789abcdef"
+                .iter()
+                .position(|candidate| *candidate == byte.to_ascii_lowercase())
+                .map(|position| position as u8);
+            assert_eq!(hex_value(byte), expected, "byte={byte}");
+        }
+    }
+
+    #[test]
+    fn percent_decode_preserves_single_pass_and_rejects_invalid_escapes() {
+        for (encoded, expected) in [
+            ("branch%2Ffeature", Some("branch/feature")),
+            ("%41%4a%4F", Some("AJO")),
+            ("%252F", Some("%2F")),
+            ("%E4%B8%AD", Some("中")),
+            ("%", None),
+            ("%2", None),
+            ("%2G", None),
+            ("%FF", None),
+        ] {
+            assert_eq!(
+                percent_decode_once(encoded).as_deref(),
+                expected,
+                "{encoded}"
+            );
+        }
+    }
+
     fn target(repo: &str, reference: Option<&str>) -> Option<GitHubTarget> {
         Some(GitHubTarget {
             repo: repo.to_string(),
@@ -603,6 +679,87 @@ mod tests {
             repo: repo.to_string(),
             reference: GitReference::Unsupported,
         })
+    }
+
+    // ---- catalog spec 解析（`catalog:` 依赖必须先换出生效 spec）----
+
+    /// 造一个只含 `pnpm-workspace.yaml` 的档案目录。
+    fn workspace_probe(label: &str, yaml: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dsh-update-cat-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pnpm-workspace.yaml"), yaml).unwrap();
+        dir
+    }
+
+    #[test]
+    fn effective_spec_resolves_default_and_named_catalogs() {
+        let dir = workspace_probe(
+            "resolve",
+            "packages:\n  - .\ncatalog:\n  dsh-better-sidebar: ^0.18.1\ncatalogs:\n  next:\n    dsh-better-sidebar: ^0.19.0\n",
+        );
+        // `catalog:` → 文件里的 `catalog` 表（默认 catalog）
+        assert_eq!(
+            effective_spec(&dir, "dsh-better-sidebar", "catalog:"),
+            "^0.18.1"
+        );
+        // `catalog:<name>` → `catalogs.<name>`
+        assert_eq!(
+            effective_spec(&dir, "dsh-better-sidebar", "catalog:next"),
+            "^0.19.0"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn effective_spec_passes_through_when_it_cannot_resolve() {
+        // 非 catalog spec、条目缺失、文件缺失/损坏 → 一律原样返回，绝不猜测
+        let dir = workspace_probe(
+            "passthrough",
+            "packages:\n  - .\ncatalog:\n  other: ^1.0.0\n",
+        );
+        assert_eq!(effective_spec(&dir, "dsh-probe", "^2.0.0"), "^2.0.0");
+        assert_eq!(
+            effective_spec(&dir, "dsh-probe", "github:a/b"),
+            "github:a/b"
+        );
+        assert_eq!(effective_spec(&dir, "dsh-probe", "catalog:"), "catalog:");
+        assert_eq!(
+            effective_spec(&dir, "dsh-probe", "catalog:missing"),
+            "catalog:missing"
+        );
+
+        let absent =
+            std::env::temp_dir().join(format!("dsh-update-cat-{}-absent", std::process::id()));
+        let _ = std::fs::remove_dir_all(&absent);
+        assert_eq!(effective_spec(&absent, "dsh-probe", "catalog:"), "catalog:");
+
+        let broken = workspace_probe("broken", "catalog: [not: a mapping\n");
+        assert_eq!(effective_spec(&broken, "dsh-probe", "catalog:"), "catalog:");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&broken).ok();
+    }
+
+    #[test]
+    fn effective_spec_exposes_the_git_target_of_a_catalog_entry() {
+        // 回归锚点：catalog 指向 git 提交的插件（真实档案里的 billion-context-dsh）。
+        // 不换出生效 spec 时 `extract_github_target("catalog:")` 是 None，判定会错误地
+        // 落到 npm registry 分支、且拿不到 lock 里的锁定提交；换出后必须认出仓库与目标。
+        let sha = "b3a69187e1bac1bf6162e3d37d005e58bc2ee74e";
+        let dir = workspace_probe(
+            "git",
+            &format!(
+                "catalog:\n  billion-context-dsh: github:Tyan66666/billion-context-dsh#{sha}\n"
+            ),
+        );
+        assert_eq!(extract_github_target("catalog:"), None);
+        let spec = effective_spec(&dir, "billion-context-dsh", "catalog:");
+        assert_eq!(
+            extract_github_target(&spec),
+            target("Tyan66666/billion-context-dsh", Some(sha))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

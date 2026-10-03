@@ -1,9 +1,7 @@
-//! 插件清单：分别读取随安装包分发的 `resources/preset-plugins.json` 与
-//! `resources/internal-plugins.json`，弃用名单单独维护在
-//! `resources/deprecated-plugins.json`（只登记预设插件 id，不参与预设合并）。
-//!
-//! 社区预设与内部插件分开维护；运行时合并为统一结构供安装、展示与自愈逻辑使用。
-//! 资源缺失/损坏时报错并回落为空清单，不阻断启动。
+//! 插件清单：读取随安装包分发的 `resources/manifest.jsonc` 的 `plugins` 节
+//! （`preset` 社区预设、`built-in` 内置插件、`depercated` 弃用名单分开维护）；
+//! 运行时合并为统一结构供安装、展示与自愈逻辑使用。
+//! 清单缺失/损坏时报错并回落为空清单，不阻断启动。
 
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -11,46 +9,92 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use crate::config;
+use crate::config::manifest::{PluginEntry, PluginVersion};
 
-/// 预设插件清单文件名
-const PRESET_PLUGINS_FILE: &str = "preset-plugins.json";
-/// 内部插件清单文件名
-const INTERNAL_PLUGINS_FILE: &str = "internal-plugins.json";
-/// 弃用插件清单文件名（只登记预设插件 id）
-const DEPRECATED_PLUGINS_FILE: &str = "deprecated-plugins.json";
-
-/// 插件静态信息，对应预设或内部插件清单中的条目
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// 插件静态信息，对应清单中的条目
+#[derive(Debug, Clone)]
 pub struct PreinstallPluginInfo {
     /// 前端主键 / 仓库跳转查找键
     pub id: String,
     /// 传给 `dsh plugin add` 的依赖形式（npm 包名或 git 依赖形式）
     pub spec: String,
+    /// 版本区间声明：字符串形式或（插件版本区间 ↔ 核心版本区间）配对矩阵
+    pub version: Option<PluginVersion>,
     /// 内置插件：条目来自发布清单，或 debug 下仓库根 `packages/*` 中带有
     /// 有效 `dsh` 对象的 workspace 包。内置插件固定从本地捆绑目录安装，启动时
     /// 强制核对「已安装 + 路径指向当前捆绑目录」，因此不出现在首次引导清单里。
-    #[serde(default)]
     pub internal: bool,
     /// 安装进 profile 后实际出现在 `dependencies`/`bundles` 里的包名。
     /// 默认与 `id` 相同；scoped 包或 id 与包名不同时显式指定。
-    #[serde(default)]
     pub package: Option<String>,
     pub name: String,
     pub description: String,
     pub repo_url: String,
-    /// 绿色「推荐」chip，默认勾选（普通推荐插件）
-    #[serde(default)]
+    /// 绿色「推荐」chip，默认勾选
     pub recommended: bool,
     /// 黄色「修复」chip，默认勾选（Windows 极简模式修复项）
-    #[serde(default)]
     pub fix: bool,
-    /// 无 chip 但默认勾选（如 dsh-notification：不标「推荐」，首次引导仍直接勾上）
-    #[serde(default)]
+    /// 无 chip 但默认勾选（不标「推荐」，首次引导仍直接勾上）
     pub default_checked: bool,
+    /// 显式声明首次引导不默认勾选：仍可标「推荐」chip，但不预选（如 dsh-im）
+    pub default_unchecked: bool,
     /// 仅 Windows 平台列出
-    #[serde(default)]
     pub win_only: bool,
+}
+
+impl PreinstallPluginInfo {
+    /// 当前核心是否已超出该预设声明的全部核心版本区间。
+    ///
+    /// 任一侧版本缺失或无法解析时按兼容处理：清单字段是发布侧提示，解析失败
+    /// 不应把插件在界面上误标为「不支持当前核心」。
+    pub(crate) fn unsupported_on(&self, core_version: Option<&str>) -> bool {
+        self.version
+            .as_ref()
+            .is_some_and(|version| version.unsupported_on(core_version))
+    }
+
+    /// 核心驱动的退役判定（弃用 / 被核心吸收后自动卸载）。
+    ///
+    /// - 核心命中某代区间：已装版本**旧于**该代声明的插件区间 → 退役（安装流程会按该代
+    ///   区间钉版本重装，见 `preset_spec_for_install`）；已装版本达到或超过区间下界
+    ///   （含超出区间上界的自升级版本，如声明 `^0.21.1` 实装 `0.22.0`）→ 保留，
+    ///   区间是发布侧推荐而非硬上界，不能把用户的升级版本卸载掉；
+    /// - 核心超出全部区间：已装版本仍落在任一同代区间内（旧版本）→ 退役；
+    /// - 未声明区间 / 版本不可解析 / 已装版本无法解析 → 不退役（宁可保留也不误删）。
+    pub(crate) fn retire_on(
+        &self,
+        core_version: Option<&str>,
+        installed_version: Option<&str>,
+    ) -> bool {
+        let Some(version) = self.version.as_ref() else {
+            return false;
+        };
+        if version.unsupported_on(core_version) {
+            return version.matches_any_declared(installed_version);
+        }
+        version.outdated_for_core_generation(core_version, installed_version) == Some(true)
+    }
+}
+
+/// 清单条目 → 统一插件信息：`checked` 是唯一真值，按前端预选语义派生出
+/// 「默认勾选」与「显式不预选」两个标记。
+fn plugin_info(entry: PluginEntry, internal: bool) -> PreinstallPluginInfo {
+    let checked = entry.checked;
+    PreinstallPluginInfo {
+        id: entry.id,
+        spec: entry.spec,
+        version: entry.version,
+        internal,
+        package: entry.package,
+        name: entry.name,
+        description: entry.description,
+        repo_url: entry.repo,
+        recommended: entry.recommended,
+        fix: entry.fix,
+        default_checked: checked && !entry.recommended,
+        default_unchecked: !checked,
+        win_only: entry.win_only,
+    }
 }
 
 /// debug workspace 插件 package.json 中用于生成内置元数据的字段。
@@ -86,21 +130,6 @@ fn dev_plugins_root() -> PathBuf {
 }
 
 #[cfg(debug_assertions)]
-fn normalize_dev_repo_url(value: &str) -> String {
-    let mut url = value.trim().to_string();
-    if let Some(rest) = url.strip_prefix("git+") {
-        url = rest.to_string();
-    }
-    if let Some(rest) = url.strip_prefix("git://") {
-        url = format!("https://{rest}");
-    }
-    if let Some(rest) = url.strip_suffix(".git") {
-        url = rest.to_string();
-    }
-    url
-}
-
-#[cfg(debug_assertions)]
 fn dev_repo_url(manifest: &DevPluginPackageJson) -> String {
     let repository = manifest.repository.as_ref().and_then(|repository| {
         repository
@@ -109,7 +138,7 @@ fn dev_repo_url(manifest: &DevPluginPackageJson) -> String {
     });
     repository
         .or(manifest.homepage.as_deref())
-        .map(normalize_dev_repo_url)
+        .map(super::watch::normalize_repo_url)
         .unwrap_or_default()
 }
 
@@ -183,6 +212,8 @@ fn discover_dev_internal_plugins_at(root: &Path) -> Vec<DevPluginCandidate> {
                 recommended: false,
                 fix: false,
                 default_checked: false,
+                default_unchecked: false,
+                version: None,
                 win_only: false,
             };
             Some(DevPluginCandidate { info, directory })
@@ -207,7 +238,7 @@ fn dev_plugin_dir(id: &str) -> Option<PathBuf> {
         .map(|candidate| candidate.directory)
 }
 
-/// 把仓库根 `packages/*` 发现的内置插件合并进静态 `internal-plugins.json` 清单。
+/// 把仓库根 `packages/*` 发现的内置插件合并进清单的 `plugins.built-in` 静态条目。
 ///
 /// 同名 dev 候选覆盖静态条目（开发时以仓库源码为准，安装目标指到 `packages/`）；
 /// 未在静态清单中出现的 dev 插件会被追加，保证 debug 观察到的内置插件集合
@@ -230,44 +261,14 @@ fn merge_dev_internal_plugins_at(
             .collect();
     for plugin in internal.iter_mut() {
         if let Some(candidate) = by_id.remove(&plugin.id) {
+            // 版本区间是发布侧对核心的计划（清单声明），dev 候选不带该字段，覆盖时沿用静态条目。
+            let version = plugin.version.take();
             *plugin = candidate.info;
+            plugin.version = version;
         }
     }
     internal.extend(by_id.into_values().map(|candidate| candidate.info));
     internal
-}
-
-/// 在资源根目录下查找清单：先探测扁平布局（exe 同级），再探测
-/// `resources/` 子目录布局（Tauri 2 的 `bundle.resources` 按相对路径保留前缀）。
-fn find_manifest_in_resource_root(root: &std::path::Path, file_name: &str) -> Option<PathBuf> {
-    let flat = root.join(file_name);
-    if flat.exists() {
-        return Some(flat);
-    }
-    let nested = root.join("resources").join(file_name);
-    nested.exists().then_some(nested)
-}
-
-/// 定位插件清单文件：优先使用随安装包分发的资源目录，回落到源码开发目录。
-///
-/// 注意：Tauri 2 在 Windows 上 `resource_dir()` 恒等于 exe 所在目录，而安装包
-/// （NSIS/MSI）与开发产物都会把资源按 `resources/**` 前缀落盘到
-/// `{resource_dir}/resources/` 子目录，因此必须探测该子目录；`CARGO_MANIFEST_DIR`
-/// 是编译期路径，仅开发机有效（CI/发布版在本机不可用），只作最后兜底。
-fn plugins_manifest_path(app_handle: &AppHandle, file_name: &str) -> Option<PathBuf> {
-    if let Ok(dir) = app_handle.path().resource_dir() {
-        if let Some(candidate) = find_manifest_in_resource_root(&dir, file_name) {
-            return Some(candidate);
-        }
-    }
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join(file_name);
-    source.exists().then_some(source)
-}
-
-fn preset_plugins_path(app_handle: &AppHandle) -> Option<PathBuf> {
-    plugins_manifest_path(app_handle, PRESET_PLUGINS_FILE)
 }
 
 /// 旧版内置插件资源目录名。作为查找回退保留（已装旧布局插件的自愈仍能命中），
@@ -329,6 +330,33 @@ pub(crate) fn bundled_plugin_dir(app_handle: &AppHandle, id: &str) -> Option<Pat
     }
     let legacy = resources.join(BUNDLED_PLUGINS_DIR).join(id);
     legacy.join("package.json").exists().then_some(legacy)
+}
+
+/// 内置插件 `package.json` 中本模块使用的字段。
+#[derive(Deserialize)]
+struct PluginPackageJson {
+    #[serde(default)]
+    description: String,
+}
+
+/// 内置插件描述的唯一真值：插件捆绑目录下 `package.json` 的 `description`。
+///
+/// 描述属于插件自身元数据，与发布到 npm 的那份 `package.json` 同源；清单
+/// `plugins.built-in` 只登记「随包分发哪些插件」，不再重复登记描述，避免同一句话
+/// 在两处各存一份、升级时互相漂移。debug 的 dev 发现与 release 的随包清单最终都落到
+/// 同一个 `package.json`，两种构建因此得到同值。读取失败（目录缺失、JSON 损坏、
+/// 描述为空）返回 `None`，调用方沿用清单登记的空描述——不阻断启动。
+fn bundled_plugin_description(app_handle: &AppHandle, id: &str) -> Option<String> {
+    let dir = bundled_plugin_dir(app_handle, id)?;
+    let raw = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    package_json_description(&raw)
+}
+
+/// [`bundled_plugin_description`] 的纯函数部分：从 `package.json` 原文取描述。
+fn package_json_description(raw: &str) -> Option<String> {
+    let manifest = serde_json::from_str::<PluginPackageJson>(raw).ok()?;
+    let description = manifest.description.trim();
+    (!description.is_empty()).then(|| description.to_string())
 }
 
 /// 删除旧版随包资源目录 `resources/preset-plugins` 与 `resources/internal-plugins`，
@@ -404,99 +432,56 @@ pub(crate) fn bundled_dep_spec(dir: &std::path::Path) -> String {
     format!("link:{}", normalized.trim_end_matches('/'))
 }
 
-/// 解析插件清单 JSON，并由清单来源统一设置内部插件标记。
-///
-/// 清单边界是可信的产品分类：即使条目误带或遗漏 `internal` 字段，也不能让社区
-/// 预设获得必装自愈权限，或让内部插件退出自愈流程，因此始终以文件来源覆盖该值。
-fn parse_plugins(json: &str, internal: bool) -> Result<Vec<PreinstallPluginInfo>, String> {
-    let mut plugins: Vec<PreinstallPluginInfo> =
-        serde_json::from_str(json).map_err(|e| format!("PLUGIN_MANIFEST_INVALID_JSON: {e}"))?;
-    for plugin in &mut plugins {
-        plugin.internal = internal;
-    }
-    Ok(plugins)
-}
-
-/// 读取单个插件清单；资源缺失/损坏时记录错误并返回空清单。
-///
-/// 插件元数据不是桌面壳启动的硬依赖；降级为空列表可让核心服务继续启动，同时用
-/// 明确日志保留发布资源缺失或损坏的诊断信息，避免清单故障导致应用整体不可用。
-fn load_manifest(
-    app_handle: &AppHandle,
-    file_name: &str,
-    internal: bool,
-) -> Vec<PreinstallPluginInfo> {
-    let Some(path) = plugins_manifest_path(app_handle, file_name) else {
-        log::warn!("PLUGIN_MANIFEST_MISSING: {file_name} not found in resource dir or source resources dir");
-        return Vec::new();
-    };
-
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("PLUGIN_MANIFEST_READ_FAILED: {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-
-    parse_plugins(&raw, internal).unwrap_or_else(|e| {
-        log::error!("PLUGIN_MANIFEST_PARSE_FAILED: {}: {e}", path.display());
-        Vec::new()
-    })
-}
-
-/// 读取预设与内部插件清单并合并；内部属性由文件归属决定，不依赖 JSON 字段。
+/// 读取 `plugins.preset` / `plugins.built-in` 并合并；内部属性由清单节归属决定，
+/// 不依赖条目字段。
 ///
 /// **开发覆盖（仅 debug 构建）**：仓库根 `packages/*` 中非私有且含 `dsh` 对象的
-/// workspace 包会按 id 覆盖静态内部清单条目，未登记的新插件一并追加，因此开发时
+/// workspace 包会按 id 覆盖静态内置清单条目，未登记的新插件一并追加，因此开发时
 /// 观察到的内置插件集合以仓库源码为准，与 release（只认随包清单）逻辑一致。
 pub(crate) fn load_presets(app_handle: &AppHandle) -> Vec<PreinstallPluginInfo> {
-    let mut plugins = load_manifest(app_handle, PRESET_PLUGINS_FILE, false);
-    let internal = load_manifest(app_handle, INTERNAL_PLUGINS_FILE, true);
+    let Some(manifest) = config::manifest::read(app_handle) else {
+        return Vec::new();
+    };
+    let mut plugins: Vec<PreinstallPluginInfo> = manifest
+        .plugins
+        .preset
+        .into_iter()
+        .map(|entry| plugin_info(entry, false))
+        .collect();
+    let internal: Vec<PreinstallPluginInfo> = manifest
+        .plugins
+        .built_in
+        .into_iter()
+        .map(|entry| plugin_info(entry, true))
+        .collect();
     #[cfg(debug_assertions)]
     let internal = merge_dev_internal_plugins(internal);
+    let internal: Vec<PreinstallPluginInfo> = internal
+        .into_iter()
+        .map(|mut plugin| {
+            if let Some(description) = bundled_plugin_description(app_handle, &plugin.id) {
+                plugin.description = description;
+            }
+            plugin
+        })
+        .collect();
     plugins.extend(internal);
     plugins
 }
 
-/// 解析弃用插件清单 JSON（纯字符串数组），返回 id 集合（重复 id 自动去重）。
-fn parse_deprecated_ids(json: &str) -> Result<HashSet<String>, String> {
-    let ids: Vec<String> = serde_json::from_str(json)
-        .map_err(|e| format!("DEPRECATED_PLUGINS_MANIFEST_INVALID_JSON: {e}"))?;
-    Ok(ids.into_iter().collect())
-}
-
-/// 读取弃用插件清单（`resources/deprecated-plugins.json`），返回已登记的预设
-/// 插件 id 集合。
+/// 读取弃用插件名单（`resources/manifest.jsonc` 的 `plugins.depercated`），返回
+/// 已登记的预设插件 id 集合。
 ///
-/// 弃用是发布侧决策：某社区插件下架/被替换后，把它的 id 追加进该文件，桌面端
-/// 每次启动核对「已安装 → 自动卸载」（见
-/// [`super::install::uninstall_deprecated_plugins`]）。与 `preset-plugins.json`
-/// 分开维护：预设清单只描述「可安装项」，弃用清单只描述「不再提供安装入口的
-/// 预设 id」，调整弃用名单不会让既有用户重新进入首次引导。资源缺失/损坏时
-/// 记录错误并回落为空集合，不阻断启动（与其它清单同一降级策略）。
+/// 弃用是发布侧决策：某社区插件下架/被替换后，把它的 id 追加进清单，桌面端每次
+/// 启动核对「已安装 → 自动卸载」（见
+/// [`super::install::uninstall_deprecated_plugins`]）。与 `plugins.preset` 分开
+/// 维护：预设清单只描述「可安装项」，弃用名单只描述「不再提供安装入口的预设 id」，
+/// 调整弃用名单不会让既有用户重新进入首次引导。清单缺失/损坏时回落为空集合，
+/// 不阻断启动（与其它清单同一降级策略）。
 pub(crate) fn load_deprecated_ids(app_handle: &AppHandle) -> HashSet<String> {
-    let Some(path) = plugins_manifest_path(app_handle, DEPRECATED_PLUGINS_FILE) else {
-        log::warn!("DEPRECATED_PLUGINS_MANIFEST_MISSING: {DEPRECATED_PLUGINS_FILE} not found in resource dir or source resources dir");
-        return HashSet::new();
-    };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "DEPRECATED_PLUGINS_MANIFEST_READ_FAILED: {}: {e}",
-                path.display()
-            );
-            return HashSet::new();
-        }
-    };
-    parse_deprecated_ids(&raw).unwrap_or_else(|e| {
-        log::error!(
-            "DEPRECATED_PLUGINS_MANIFEST_PARSE_FAILED: {}: {e}",
-            path.display()
-        );
-        HashSet::new()
-    })
+    config::manifest::read(app_handle)
+        .map(|manifest| manifest.plugins.deprecated.into_iter().collect())
+        .unwrap_or_default()
 }
 
 /// 预装清单中某 id 对应的仓库地址
@@ -517,11 +502,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// 当前 `preset-plugins.json` 内容指纹（十六进制 FNV-1a）；文件缺失/不可读返回 None
+/// 当前 `plugins` 节的内容指纹（十六进制 FNV-1a）。
+///
+/// 指纹只覆盖插件节：清单同时承载引擎版本、宠物与依赖映射规范，改宠物不应把用户
+/// 重新拉回首次引导。清单缺失/不可读返回 None。
 pub(crate) fn current_preset_hash(app_handle: &AppHandle) -> Option<String> {
-    let path = preset_plugins_path(app_handle)?;
-    let raw = std::fs::read(&path).ok()?;
-    Some(format!("{:016x}", fnv1a(&raw)))
+    let manifest = config::manifest::read(app_handle)?;
+    let canonical = serde_json::to_string(&manifest.plugins).ok()?;
+    Some(format!("{:016x}", fnv1a(canonical.as_bytes())))
 }
 
 /// 是否需要进入预装插件引导：
@@ -547,23 +535,75 @@ pub(crate) fn preinstall_pending(app_handle: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::manifest::{PluginVersion, VersionPair};
 
-    fn load_manifest_for_test(file_name: &str, internal: bool) -> Vec<PreinstallPluginInfo> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    fn manifest_path_for_test() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
-            .join(file_name);
-        let raw = std::fs::read_to_string(path).expect("plugin manifest should exist");
-        parse_plugins(&raw, internal).expect("plugin manifest should be valid JSON")
+            .join(crate::config::manifest::MANIFEST_FILE)
+    }
+
+    fn load_manifest_for_test() -> crate::config::manifest::Manifest {
+        crate::config::manifest::read_at(&manifest_path_for_test())
+            .expect("resource manifest should exist and parse")
+    }
+
+    /// 解析内联清单文本并投影到统一插件信息（`preset` 或 `built-in` 节）。
+    fn plugin_infos_from(raw: &str, internal: bool) -> Vec<PreinstallPluginInfo> {
+        let manifest = crate::config::manifest::parse(raw).expect("manifest should parse");
+        let entries = if internal {
+            manifest.plugins.built_in
+        } else {
+            manifest.plugins.preset
+        };
+        entries
+            .into_iter()
+            .map(|entry| plugin_info(entry, internal))
+            .collect()
     }
 
     fn load_presets_for_test() -> Vec<PreinstallPluginInfo> {
-        load_manifest_for_test(PRESET_PLUGINS_FILE, false)
+        load_manifest_for_test()
+            .plugins
+            .preset
+            .into_iter()
+            .map(|entry| plugin_info(entry, false))
+            .collect()
+    }
+
+    fn load_internal_for_test() -> Vec<PreinstallPluginInfo> {
+        load_manifest_for_test()
+            .plugins
+            .built_in
+            .into_iter()
+            .map(|entry| plugin_info(entry, true))
+            .collect()
     }
 
     fn load_all_plugins_for_test() -> Vec<PreinstallPluginInfo> {
         let mut plugins = load_presets_for_test();
-        plugins.extend(load_manifest_for_test(INTERNAL_PLUGINS_FILE, true));
+        plugins.extend(load_internal_for_test());
         plugins
+    }
+
+    fn shipped_deprecated_ids() -> HashSet<String> {
+        load_manifest_for_test()
+            .plugins
+            .deprecated
+            .into_iter()
+            .collect()
+    }
+
+    fn matrix(pairs: &[(&str, &str)]) -> PluginVersion {
+        PluginVersion::Matrix(
+            pairs
+                .iter()
+                .map(|(version, dsh)| VersionPair {
+                    version: (*version).to_string(),
+                    dsh: (*dsh).to_string(),
+                })
+                .collect(),
+        )
     }
 
     #[test]
@@ -581,6 +621,117 @@ mod tests {
     }
 
     #[test]
+    fn preset_manifest_specs_match_ids() {
+        let presets = load_presets_for_test();
+        for preset in &presets {
+            assert_eq!(preset.spec, preset.id);
+        }
+    }
+
+    /// 核心驱动的退役判定：核心命中某代区间 → 已装版本不属于该代才退役（旧版插件在
+    /// 核心换代后要卸掉，由安装流程按该代区间钉版本重装）；核心超出全部区间 → 已安装
+    /// 版本仍落在任一同代区间内才退役（新版本宁可保留）。
+    #[test]
+    fn retire_decision_matrix_follows_declared_ranges() {
+        let declared = matrix(&[("^1.2.0", "^0.1.5-rc.1"), ("^1.4.0", "^0.1.7-rc.1")]);
+        for (core, installed, retire) in [
+            (Some("0.1.5-rc.3"), Some("1.2.0"), false),
+            (Some("0.1.6"), Some("1.2.5"), false),
+            (Some("0.1.6"), Some("1.4.0"), false),
+            (Some("0.1.7-rc.2"), Some("1.4.0"), false),
+            (Some("0.1.7-rc.2"), Some("1.2.0"), true),
+            (Some("0.2.0"), Some("1.4.0"), true),
+            (Some("0.2.0"), Some("1.2.0"), true),
+            (Some("0.2.0"), Some("2.0.0"), false),
+            (Some("0.2.0"), Some("1.0.0"), false),
+            (Some("0.1.6"), None, false),
+            (Some("0.1.6"), Some("invalid"), false),
+            (None, Some("1.2.0"), false),
+            (Some("invalid"), Some("1.2.0"), false),
+        ] {
+            let mut entry = load_presets_for_test()
+                .into_iter()
+                .find(|p| p.id == "dshmarket")
+                .expect("dshmarket");
+            entry.version = Some(declared.clone());
+            assert_eq!(
+                entry.retire_on(core, installed),
+                retire,
+                "core={core:?} installed={installed:?}"
+            );
+        }
+    }
+
+    /// 回归：同代内的预发布核心（如 `0.2.1-rc.1`）不得把插件判成不兼容，进而不该触发
+    /// 退役；上一代遗留版本仍要退役重装。
+    #[test]
+    fn prerelease_core_in_same_generation_keeps_plugins() {
+        let mut entry = load_presets_for_test()
+            .into_iter()
+            .find(|p| p.id == "dshmarket")
+            .expect("dshmarket");
+        entry.version = Some(matrix(&[("^0.24.1", "^0.2.0-rc.1")]));
+        for core in ["0.2.0-rc.1", "0.2.0-rc.2", "0.2.0", "0.2.1-rc.1"] {
+            assert!(!entry.unsupported_on(Some(core)), "core={core}");
+            assert!(!entry.retire_on(Some(core), Some("0.24.5")), "core={core}");
+            assert!(entry.retire_on(Some(core), Some("0.23.0")), "core={core}");
+        }
+    }
+
+    #[test]
+    fn plugin_version_deserializes_as_optional_metadata_without_changing_spec() {
+        for (field, expected) in [
+            ("", None),
+            (r#", "version": null"#, None),
+            (
+                r#", "version": "latest""#,
+                Some(PluginVersion::Declared("latest".into())),
+            ),
+            (
+                r#", "version": "1.2.3""#,
+                Some(PluginVersion::Declared("1.2.3".into())),
+            ),
+            (
+                r#", "version": [{"version": "^0.19.1", "dsh": "^0.1.5-rc.1"}]"#,
+                Some(matrix(&[("^0.19.1", "^0.1.5-rc.1")])),
+            ),
+        ] {
+            let raw = format!(
+                r#"{{"plugins":{{"preset":[{{"id":"dshmarket","spec":"dshmarket","name":"Market","description":"","repo":"u"{field}}}]}}}}"#
+            );
+            let plugins = plugin_infos_from(&raw, false);
+            assert_eq!(plugins.len(), 1);
+            assert_eq!(plugins[0].version, expected);
+            assert_eq!(plugins[0].spec, "dshmarket");
+        }
+    }
+
+    /// 内置条目默认不声明版本矩阵、对任何核心版本都兼容；通用矩阵机制仍在生效——
+    /// 显式声明后依旧走 unsupported 判定，只是当前没有任何内置条目使用它。
+    #[test]
+    fn internal_manifest_defaults_to_compatible_and_honours_declared_ceiling() {
+        let internal = load_internal_for_test();
+        assert!(!internal.is_empty());
+
+        assert!(
+            internal
+                .iter()
+                .all(|p| p.version.is_none() && !p.unsupported_on(Some("9.9.9"))),
+            "no internal entry declares a core matrix, so every one stays compatible"
+        );
+
+        let mut capped = internal[0].clone();
+        capped.version = Some(matrix(&[("^1.0.0", "^0.1.5-rc.1")]));
+        assert!(!capped.unsupported_on(Some("0.1.5-rc.1")));
+        assert!(!capped.unsupported_on(Some("0.1.6")));
+        // 预发布核心按数值区间判定：`0.1.7-rc.1` 落在 `^0.1.5-rc.1` 内，故仍兼容
+        assert!(!capped.unsupported_on(Some("0.1.7-rc.1")));
+        // 下界之下的预发布核心依旧不兼容
+        assert!(capped.unsupported_on(Some("0.1.4-rc.1")));
+        assert!(capped.unsupported_on(Some("0.2.0")));
+    }
+
+    #[test]
     fn plugin_manifest_ids_are_unique_across_files() {
         let plugins = load_all_plugins_for_test();
         let ids: std::collections::HashSet<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
@@ -593,57 +744,60 @@ mod tests {
 
     #[test]
     fn internal_manifest_marks_all_entries_internal() {
-        let plugins = load_manifest_for_test(INTERNAL_PLUGINS_FILE, true);
+        let plugins = load_internal_for_test();
         assert!(!plugins.is_empty());
         assert!(plugins.iter().all(|plugin| plugin.internal));
         assert!(plugins.iter().any(|plugin| plugin.id == "dsh-tauri"));
         assert!(!load_presets_for_test().iter().any(|plugin| plugin.internal));
     }
 
+    /// 回归：Windows 安装包（NSIS/MSI）与开发产物把资源按 `resources/**` 前缀落盘到
+    /// `{resource_dir}/resources/` 子目录，而扁平布局（资源直接放 exe 同级）同样合法；
+    /// 两种布局下的清单都必须能被读取解析（定位顺序见 `config::manifest::resource_root`）。
     #[test]
-    fn preset_discovery_finds_nested_resources_dir() {
-        // 回归：Windows 安装包（NSIS/MSI）与开发产物把资源按 `resources/**` 前缀
-        // 落盘到 `{resource_dir}/resources/` 子目录，此前只探测 exe 同级导致
-        // 发布版预装页恒为空清单。
-        let dir = std::env::temp_dir().join(format!("dsh-preset-layout-{}", std::process::id()));
+    fn manifest_reads_in_both_flat_and_nested_resource_layouts() {
+        let dir = std::env::temp_dir().join(format!("dsh-manifest-layout-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         let nested = dir.join("resources");
         std::fs::create_dir_all(&nested).expect("create temp resources dir");
-        std::fs::write(
-            nested.join(PRESET_PLUGINS_FILE),
-            r#"[{"id":"x","spec":"y","name":"X","description":"","repoUrl":"u"}]"#,
-        )
-        .expect("write temp preset file");
+        let body = r#"{"plugins":{"preset":[{"id":"x","spec":"y","name":"X","description":"","repo":"u"}]}}"#;
 
-        let found = find_manifest_in_resource_root(&dir, PRESET_PLUGINS_FILE)
-            .expect("nested resources layout should be found");
-        assert_eq!(found, nested.join(PRESET_PLUGINS_FILE));
+        std::fs::write(nested.join(crate::config::manifest::MANIFEST_FILE), body)
+            .expect("write nested manifest");
+        assert_eq!(
+            crate::config::manifest::read_at(&nested.join(crate::config::manifest::MANIFEST_FILE))
+                .expect("nested layout manifest should parse")
+                .plugins
+                .preset
+                .len(),
+            1
+        );
 
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn preset_discovery_prefers_flat_layout() {
-        // 扁平布局（资源直接放在 exe 同级）仍应优先命中。
-        let dir = std::env::temp_dir().join(format!("dsh-preset-flat-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        std::fs::write(
-            dir.join(PRESET_PLUGINS_FILE),
-            r#"[{"id":"x","spec":"y","name":"X","description":"","repoUrl":"u"}]"#,
-        )
-        .expect("write temp preset file");
-
-        let found = find_manifest_in_resource_root(&dir, PRESET_PLUGINS_FILE)
-            .expect("flat layout should be found");
-        assert_eq!(found, dir.join(PRESET_PLUGINS_FILE));
+        std::fs::write(dir.join(crate::config::manifest::MANIFEST_FILE), body)
+            .expect("write flat manifest");
+        assert_eq!(
+            crate::config::manifest::read_at(&dir.join(crate::config::manifest::MANIFEST_FILE))
+                .expect("flat layout manifest should parse")
+                .plugins
+                .preset
+                .len(),
+            1
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn deprecated_ids_parse_into_set() {
-        // 字符串数组解析为 id 集合；重复 id 去重
-        let raw = r#"["dsh-a","dsh-b","dsh-a"]"#;
-        let ids = parse_deprecated_ids(raw).expect("deprecated manifest should parse");
+        // 弃用名单解析为 id 集合；重复 id 去重
+        let ids: HashSet<String> = crate::config::manifest::parse(
+            r#"{"plugins":{"depercated":["dsh-a","dsh-b","dsh-a"]}}"#,
+        )
+        .expect("deprecated manifest should parse")
+        .plugins
+        .deprecated
+        .into_iter()
+        .collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("dsh-a"));
         assert!(ids.contains("dsh-b"));
@@ -651,31 +805,44 @@ mod tests {
 
     #[test]
     fn deprecated_ids_reject_non_string_entries() {
-        // 非法条目（非字符串）整体解析失败，调用方回落为空集合
-        let raw = r#"[42]"#;
-        assert!(parse_deprecated_ids(raw).is_err());
-        let raw = r#"{"id":"dsh-x"}"#;
-        assert!(parse_deprecated_ids(raw).is_err());
+        // 非法条目（非字符串 / 非数组）整体解析失败，调用方回落为空集合
+        assert!(crate::config::manifest::parse(r#"{"plugins":{"depercated":[42]}}"#).is_err());
+        assert!(
+            crate::config::manifest::parse(r#"{"plugins":{"depercated":{"id":"dsh-x"}}}"#).is_err()
+        );
     }
 
     #[test]
     fn deprecated_manifest_lists_session_context_menu() {
-        // 随包分发的弃用清单应登记 dsh-session-context-menu（已被内部插件替代）
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(DEPRECATED_PLUGINS_FILE);
-        let raw = std::fs::read_to_string(path).expect("deprecated manifest should exist");
-        let ids = parse_deprecated_ids(&raw).expect("deprecated manifest should be valid JSON");
-        assert!(ids.contains("dsh-session-context-menu"));
+        // 随包分发的弃用名单应登记 dsh-session-context-menu（已被内部插件替代）
+        assert!(shipped_deprecated_ids().contains("dsh-session-context-menu"));
+    }
+
+    #[test]
+    fn deprecated_manifest_lists_absorbed_panel() {
+        // 0.15.0 把 dsh-tauri-panel 并入核心，并从内置清单移除了条目，
+        // 升级用户只能靠弃用名单兜底卸载（残留 bundle 会导致无法进入软件页面）。
+        assert!(shipped_deprecated_ids().contains("dsh-tauri-panel"));
+    }
+
+    #[test]
+    fn deprecated_manifest_lists_absorbed_connection() {
+        // dsh-tauri-connection 的载体鉴权适配已并入 dsh-tauri 核心插件，并从内置
+        // 清单移除了条目：升级用户的 link: 依赖与 bundle 引用只能靠弃用名单兜底
+        // 卸载（残留 bundle 会导致无法进入软件页面）。
+        assert!(shipped_deprecated_ids().contains("dsh-tauri-connection"));
     }
 
     #[test]
     fn manifest_source_overrides_internal_field() {
-        let raw =
-            r#"[{"id":"x","spec":"y","internal":true,"name":"X","description":"","repoUrl":"u"}]"#;
-        let preset = parse_plugins(raw, false).expect("preset manifest should parse");
+        // 条目里的 `internal` 字段不参与判定：内部属性只由所在清单节决定
+        let raw = r#"{"plugins":{
+            "preset":[{"id":"x","spec":"y","internal":true,"name":"X","description":"","repo":"u"}],
+            "built-in":[{"id":"x","spec":"y","internal":false,"name":"X","description":"","repo":"u"}]
+        }}"#;
+        let preset = plugin_infos_from(raw, false);
         assert!(!preset[0].internal);
-        let internal = parse_plugins(raw, true).expect("internal manifest should parse");
+        let internal = plugin_infos_from(raw, true);
         assert!(internal[0].internal);
     }
 
@@ -857,6 +1024,30 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    fn dev_repo_url_keeps_repository_precedence_and_homepage_fallback() {
+        for (json, expected) in [
+            (
+                r#"{"repository":" git+git://example/repo.git ","homepage":"https://fallback"}"#,
+                "https://example/repo",
+            ),
+            (
+                r#"{"repository":{"url":"git://example/object.git"}}"#,
+                "https://example/object",
+            ),
+            (
+                r#"{"repository":{"url":42},"homepage":"git+https://example/home.git"}"#,
+                "https://example/home",
+            ),
+            (r#"{"repository":"","homepage":"https://fallback"}"#, ""),
+            (r#"{}"#, ""),
+        ] {
+            let manifest = serde_json::from_str(json).unwrap();
+            assert_eq!(dev_repo_url(&manifest), expected, "{json}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
     fn dev_discovery_empty_root_returns_none() {
         let root = temp_dev_root("empty");
         assert!(discover_dev_internal_plugins_at(&root).is_empty());
@@ -995,6 +1186,8 @@ mod tests {
                 recommended: false,
                 fix: false,
                 default_checked: false,
+                default_unchecked: false,
+                version: None,
                 win_only: false,
             },
             PreinstallPluginInfo {
@@ -1008,6 +1201,8 @@ mod tests {
                 recommended: false,
                 fix: false,
                 default_checked: false,
+                default_unchecked: false,
+                version: None,
                 win_only: false,
             },
         ];
@@ -1020,5 +1215,95 @@ mod tests {
         assert!(merged.iter().any(|p| p.id == "brand-new")); // 追加上去
         assert!(merged.iter().any(|p| p.id == "keep-static")); // 静态未覆盖项保留
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// dev 候选覆盖静态条目时必须沿用清单声明的版本矩阵：退役判定读的是发布侧的
+    /// 核心计划，与当前 checkout 是否存在该包源码无关。
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_merge_carries_static_version_declaration() {
+        let root = temp_dev_root("merge-cap");
+        write_dev_manifest(
+            &root.join("dsh-tauri-experimental"),
+            "dsh-tauri-experimental",
+        );
+        let declared = matrix(&[("^1.2.3", "^0.1.7-alpha.0")]);
+        let static_internal = vec![PreinstallPluginInfo {
+            id: "dsh-tauri-experimental".into(),
+            spec: "dsh-tauri-experimental".into(),
+            internal: true,
+            package: Some("dsh-tauri-experimental".into()),
+            name: "DSH Tauri Experimental".into(),
+            description: String::new(),
+            repo_url: String::new(),
+            recommended: false,
+            fix: false,
+            default_checked: false,
+            default_unchecked: false,
+            version: Some(declared.clone()),
+            win_only: false,
+        }];
+
+        let merged = merge_dev_internal_plugins_at(&root, static_internal);
+        let renamed = merged
+            .iter()
+            .find(|p| p.id == "dsh-tauri-experimental")
+            .expect("merged entry must exist");
+        assert_eq!(renamed.version.as_ref(), Some(&declared));
+        assert_eq!(renamed.spec, "dsh-tauri-experimental");
+        assert_eq!(renamed.description, "desc");
+        assert!(!renamed.unsupported_on(Some("0.1.7-alpha.0")));
+        assert!(renamed.unsupported_on(Some("0.2.0")));
+        assert!(!renamed.retire_on(Some("0.1.7-alpha.0"), Some("1.2.3")));
+        assert!(renamed.retire_on(Some("0.2.0"), Some("1.2.3")));
+        assert!(!renamed.retire_on(Some("0.2.0"), Some("2.0.0")));
+        // dev 覆盖语义不变：条目仍来自仓库源码
+        assert!(renamed.internal);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn package_json_description_is_the_description_source() {
+        assert_eq!(
+            package_json_description(r#"{"description":"  hello  "}"#).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(package_json_description(r#"{"description":"   "}"#), None);
+        assert_eq!(package_json_description(r#"{"name":"x"}"#), None);
+        assert_eq!(package_json_description("not json"), None);
+    }
+
+    /// 清单只登记「随包分发哪些插件」：描述回归插件自身的 `package.json`。
+    #[test]
+    fn internal_manifest_entries_carry_no_description() {
+        let declared: Vec<String> = load_internal_for_test()
+            .into_iter()
+            .filter(|plugin| !plugin.description.is_empty())
+            .map(|plugin| plugin.id)
+            .collect();
+        assert!(
+            declared.is_empty(),
+            "内置插件描述的唯一真值是 package.json，清单不该再登记：{declared:?}"
+        );
+    }
+
+    /// release 从捆绑目录读描述，因此每个内置插件的 `package.json` 都必须声明它。
+    #[cfg(debug_assertions)]
+    #[test]
+    fn every_builtin_plugin_package_declares_a_description() {
+        let missing: Vec<String> = load_internal_for_test()
+            .into_iter()
+            .filter(|plugin| {
+                dev_plugin_dir(&plugin.id)
+                    .and_then(|dir| std::fs::read_to_string(dir.join("package.json")).ok())
+                    .and_then(|raw| package_json_description(&raw))
+                    .is_none()
+            })
+            .map(|plugin| plugin.id)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "内置插件必须在 package.json 声明 description：{missing:?}"
+        );
     }
 }

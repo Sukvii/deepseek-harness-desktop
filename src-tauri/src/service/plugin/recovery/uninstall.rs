@@ -20,19 +20,21 @@ pub(super) fn remove_plugin_from_manifest(manifest: &mut serde_json::Value, id: 
             modified = true;
         }
     }
-    if let Some(bundles) = manifest
+    remove_bundle(manifest, id) || modified
+}
+
+pub(crate) fn remove_bundle(manifest: &mut serde_json::Value, id: &str) -> bool {
+    let Some(bundles) = manifest
         .get_mut("dsh")
         .and_then(|d| d.get_mut("profile"))
         .and_then(|p| p.get_mut("bundles"))
         .and_then(|b| b.as_array_mut())
-    {
-        let before = bundles.len();
-        bundles.retain(|b| b.as_str() != Some(id));
-        if bundles.len() != before {
-            modified = true;
-        }
-    }
-    modified
+    else {
+        return false;
+    };
+    let before = bundles.len();
+    bundles.retain(|b| b.as_str() != Some(id));
+    bundles.len() != before
 }
 
 /// 删除插件入口：符号链接或 junction 只删除入口本身；普通目录递归删除，
@@ -53,6 +55,11 @@ fn remove_plugin_entry(entry: &Path) -> std::io::Result<()> {
 }
 
 /// 删除 `node_modules/<id>`；scoped 目录删除后若 scope 空则一并清理。
+///
+/// 链接入口（符号链接 / Windows junction）只校验父目录、只解链本身：内置插件以
+/// `link:` 指向应用资源目录（在 profile 之外），`canonicalize` 会解析到 profile
+/// 外并被误判为路径逃逸，导致入口永远删不掉（弃用/孤儿/失效链接卸载的残留根因）。
+/// 链接的删除动作不触碰目标，父目录校验已足以保证删除范围仍在 `node_modules` 内。
 pub(super) fn remove_plugin_dir(profile: &Path, id: &str) {
     let node_modules = profile.join("node_modules");
     let Ok(node_modules_root) = fs_guard::ensure_within(&node_modules, profile) else {
@@ -66,15 +73,20 @@ pub(super) fn remove_plugin_dir(profile: &Path, id: &str) {
     let Ok(entry_metadata) = fs::symlink_metadata(&entry) else {
         return;
     };
-    let entry_is_dangling_symlink = entry_metadata.file_type().is_symlink() && !entry.exists();
-    if entry_is_dangling_symlink {
-        // 悬空链接无法规范化目标，只验证父目录，确保删除的仍是 node_modules 内入口。
+    let file_type = entry_metadata.file_type();
+    // junction 在 Rust 中同样满足 `is_symlink()`；两个判定都保留，避免行为差异
+    // 下把重解析点当成普通目录而递归删进应用资源目录。
+    #[cfg(windows)]
+    let entry_is_link = file_type.is_symlink() || file_type.is_symlink_dir();
+    #[cfg(not(windows))]
+    let entry_is_link = file_type.is_symlink();
+    if entry_is_link {
         let Some(parent) = entry.parent() else {
             return;
         };
         if let Err(e) = fs_guard::ensure_within(parent, &node_modules_root) {
             log::warn!(
-                "refusing to remove dangling plugin symlink outside node_modules: {} ({e})",
+                "refusing to remove plugin link outside node_modules: {} ({e})",
                 entry.display()
             );
             return;
@@ -102,10 +114,9 @@ pub(super) fn remove_plugin_dir(profile: &Path, id: &str) {
                     .read_dir()
                     .map(|mut d| d.next().is_none())
                     .unwrap_or(false)
+                && fs_guard::ensure_within(&scope_entry, &node_modules_root).is_ok()
             {
-                if fs_guard::ensure_within(&scope_entry, &node_modules_root).is_ok() {
-                    let _ = remove_plugin_entry(&scope_entry);
-                }
+                let _ = remove_plugin_entry(&scope_entry);
             }
         }
     }
@@ -141,7 +152,7 @@ pub(super) fn strip_cordis_patch_for(profile: &Path, id: &str) {
 }
 
 /// 一个 patch 条目是否「针对」目标插件：顶层 id 字段或任意字段值等于该包名。
-fn patch_entry_targets(entry: &serde_yaml::Value, id: &str) -> bool {
+pub(crate) fn patch_entry_targets(entry: &serde_yaml::Value, id: &str) -> bool {
     match entry {
         serde_yaml::Value::Mapping(map) => map
             .iter()
@@ -154,6 +165,78 @@ fn patch_entry_targets(entry: &serde_yaml::Value, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_bundle_preserves_non_targets_and_reports_only_removal() {
+        let mut manifest = serde_json::json!({
+            "dependencies": {"target": "1"},
+            "dsh": {"profile": {"bundles": ["target", 7, null, {"id": "target"}, "target-extra", "target"]}}
+        });
+        assert!(remove_bundle(&mut manifest, "target"));
+        assert_eq!(manifest["dependencies"], serde_json::json!({"target": "1"}));
+        assert_eq!(
+            manifest["dsh"]["profile"]["bundles"],
+            serde_json::json!([7, null, {"id": "target"}, "target-extra"])
+        );
+        assert!(!remove_bundle(&mut manifest, "target"));
+        for mut malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"dsh": null}),
+            serde_json::json!({"dsh": {"profile": {"bundles": "target"}}}),
+            serde_json::json!({"dsh": {"profile": {"bundles": []}}}),
+        ] {
+            let original = malformed.clone();
+            assert!(!remove_bundle(&mut malformed, "target"));
+            assert_eq!(malformed, original);
+        }
+    }
+
+    #[test]
+    fn manifest_removal_reports_dependency_only_and_bundle_only_changes() {
+        for (mut manifest, expected) in [
+            (serde_json::json!({"dependencies": {"target": "1"}}), true),
+            (
+                serde_json::json!({"dependencies": {"target": "1"}, "dsh": {"profile": {"bundles": ["target"]}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"dependencies": null, "dsh": {"profile": {"bundles": ["target"]}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"dsh": {"profile": {"bundles": ["target"]}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"dependencies": {}, "dsh": {"profile": {"bundles": []}}}),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                remove_plugin_from_manifest(&mut manifest, "target"),
+                expected
+            );
+            assert!(!remove_plugin_from_manifest(&mut manifest, "target"));
+        }
+    }
+
+    #[test]
+    fn patch_targets_match_only_exact_top_level_strings() {
+        for (yaml, expected) in [
+            ("target", true),
+            ("id: target", true),
+            ("target: null", true),
+            ("alias: target", true),
+            ("id: target-extra", false),
+            ("config: {id: target}", false),
+            ("- target", false),
+            ("null", false),
+            ("42", false),
+        ] {
+            let entry = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(patch_entry_targets(&entry, "target"), expected, "{yaml}");
+        }
+    }
 
     #[test]
     fn remove_plugin_dir_rejects_path_escape() {
@@ -225,6 +308,48 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&link).is_err(),
             "dangling plugin symlink entry should be removed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_plugin_dir_unlinks_junction_pointing_outside_profile() {
+        // 内置插件以 link: 指向应用资源目录（在 profile 之外，如 dsh-tauri-panel）：
+        // junction 的 canonicalize 落在 profile 外，仍必须只解链入口、绝不动目标。
+        let root = std::env::temp_dir().join(format!(
+            "dsh-plugin-recovery-junction-{}",
+            std::process::id()
+        ));
+        let profile = root.join("profile");
+        let target = root.join("app-resources/dsh-tauri-panel");
+        let entry = profile.join("node_modules/dsh-tauri-panel");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(target.join("package.json"), "{}").unwrap();
+
+        use std::os::windows::process::CommandExt;
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                entry.display(),
+                target.display()
+            ))
+            .status()
+            .expect("mklink should run");
+        assert!(created.success(), "junction creation should succeed");
+
+        remove_plugin_dir(&profile, "dsh-tauri-panel");
+
+        assert!(
+            std::fs::symlink_metadata(&entry).is_err(),
+            "junction entry should be unlinked"
+        );
+        assert!(
+            target.join("package.json").is_file(),
+            "junction target must remain"
         );
         let _ = std::fs::remove_dir_all(root);
     }

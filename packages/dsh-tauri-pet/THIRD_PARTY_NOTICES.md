@@ -1,13 +1,42 @@
 # Third-party asset notices
 
-## dsh-pet
+## deepseek-ai/deepseek-harness
 
-The pet media assets (WebM animations, preview GIFs and `config.jsonc`) are **no
-longer bundled** in this package. They are downloaded at runtime from
-[`PC2005-cloud/dsh-pet`](https://github.com/PC2005-cloud/dsh-pet) via the preset
-pet catalog (`src-tauri/resources/preset-pets.json`) and installed under
-`~/.dsh/pets/<id>`. The catalog pins a specific commit for reproducible downloads.
+- Repository: <https://github.com/deepseek-ai/deepseek-harness>
+- Version: `dsh-v0.2.0-rc.2`
+- Revision: `639ed015397290b3745d163aafe02ffee4aa3f84`
+- Source: `source/deepseek-harness`
+- License: MIT — Copyright (c) 2026 DeepSeek
+- Not copied: the plugin mounts an official provider and consumes official client contracts.
 
+Integration points:
+
+- Skill provider instance: `cordis.patch.yml` inserts an official `@deepseek-ai/dsh-skill-filesystem` as row `dsh-tauri-pet-skills` (`providerName: dsh-tauri-pet`, `includeDefaultRoots: false`, `customSkillDirs` → this package's bundled `skills/`).
+- Settings entry: clone of the official account menu entry inside the official primitives `Menu` (`src/client/constants/index.ts:37-39`, `src/client/register/settings-menu.utils.ts:24-33`, `src/client/register/settings-menu.ts:16-19`); styling inherited, no generated CSS-module hash hard-coded.
+- Client services: official projections are read, not forked — `workspaces.list` and the official new-session target order (`src/client/service/pet.utils.ts:3,21`); declared client contracts `@deepseek-ai/dsh-client-store`, `@deepseek-ai/dsh-client-ui-layout`, `@deepseek-ai/dsh-client-ui-renderer`, `@deepseek-ai/dsh-client-ui-slots`.
+
+## PC2005-cloud/dsh-pet
+
+- Repository: <https://github.com/PC2005-cloud/dsh-pet>
+- Asset pin: `e1ff8c1e4001878cbb80441262d530e16541f138`
+- License: MIT — Copyright (c) 2026 PC2005-cloud
+- Streaming only: the pet media assets (WebM animations, preview GIFs, `config.jsonc`) are not bundled or downloaded; `pets.built-in` in `src-tauri/resources/manifest.jsonc` registers the remote URLs and the pet window streams them at play time.
+
+## dsh-tauri-desk/dsh-pet-mov
+
+- Repository: <https://github.com/dsh-tauri-desk/dsh-pet-mov>
+- Asset pin: `be0f3bb494cb71a4c73f916c0b92d25a3ab4d002`
+- License: MIT
+- Used: macOS reads this HEVC-alpha `.mov` mirror; it is our own re-encode of the upstream transparent WebM clips and carries no separate artwork.
+
+## References (nothing shipped)
+
+- `source/dsh-pet`: reference copy at `4c097297ca773abb173198b1384b3a11dcf89409`, not the source of the play-time assets above.
+- `QCYTSN/dsh-dafeiyu`: referenced for text and status-priority behaviour only; no sprite or `legacy/` assets are bundled, downloaded or redistributed (see [`docs/sync-log.md`](./docs/sync-log.md)). Its own art was replaced upstream in `v0.1.10` by assets imported from `PC2005-cloud/dsh-pet`.
+
+## License
+
+```text
 MIT License
 
 Copyright (c) 2026 PC2005-cloud
@@ -29,3 +58,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```

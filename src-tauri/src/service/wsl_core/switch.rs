@@ -13,8 +13,9 @@
 //!    反复重试，并明确报告（不宣称成功）。
 //!
 //! R-V8-1A（前端停止轮询后的后端收尾）：前端 readiness 轮询有 180 s inactivity 与
-//! 300 s absolute 两条停止路径（`src/utils/readiness.ts`、
-//! `src/store/modules/harness/store.ts`），停止后不会再有健康调用。因此
+//! 300 s absolute 两条停止路径（`src/store/modules/harness/constants.ts` 的
+//! `STARTUP_INACTIVITY_TIMEOUT` / `STARTUP_ABSOLUTE_TIMEOUT`，由 `harness/utils.ts`
+//! 与 `store.ts` 消费），停止后不会再有健康调用。因此
 //! [`note_launch_started`] 在登记正式启动的同时建立**后端截止任务**
 //! （[`deadline_task`]）：睡到 `started_at + PENDING_GRACE`，先固定探测上下文，
 //! 再自测一次健康——健康则确认，否则回滚。正常就绪会在截止前确认（标记随即

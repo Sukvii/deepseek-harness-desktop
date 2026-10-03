@@ -133,7 +133,7 @@ async fn scan_port(distro: &str, start: u16, attempts: u32) -> Result<Option<u16
 
 /// 端口自愈与冲突避让的 WSL 版（R-W3-2）：判定全部在发行版内做。
 ///
-/// 与 Windows 分支 [`super::launch::resolve_port`] 一一对应——先 heal（配置端口
+/// 与 Windows 分支 [`super::launch::launch`] 的内联端口自愈步骤一一对应——先 heal（配置端口
 /// 已被自动避让顶高、回落目标又空闲时回落），再从当前值起找第一个可绑定端口，
 /// 每次变更都持久化并打同样的日志。差别只在占用判定改用 `PORT_SCAN`
 /// （Linux 侧 `bind`）：镜像网络下 Windows 的 `TcpListener::bind` 看不见 Linux

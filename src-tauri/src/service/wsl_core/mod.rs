@@ -4,7 +4,10 @@
 //! dsh：工作区与命令天然位于 Linux 内，Windows 侧不再改写任何命令。
 //!
 //! 模块划分：`exec`（wsl.exe 调用与解码）/ `script`（常量脚本）/ `probe`（探测与
-//! 进程内缓存）/ `install`（安装与补丁编排）/ `patch`（UNC 路径补丁）。
+//! 进程内缓存）/ `install`（安装与补丁编排）/ `auth_patch`（`--skip-auth` 纯补丁
+//! 函数）/ `patch`（UNC 路径补丁）。
+
+mod auth_patch;
 
 pub mod credentials;
 pub mod exec;

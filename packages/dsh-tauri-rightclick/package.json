@@ -1,8 +1,8 @@
 {
   "name": "dsh-tauri-rightclick",
   "type": "module",
-  "version": "0.6.7",
-  "description": "Native-style right-click context menus for DeepSeek Harness desktop wrappers (sessions, workspaces, conversation text, links, inputs).",
+  "version": "1.0.0",
+  "description": "面向 DeepSeek Harness 桌面外壳的原生风格右键菜单（会话、工作区、会话文本、链接、输入框）；已弃用 dsh-session-context-menu 的自研后继。",
   "author": "Hairyf <wwu710632@gmail.com>",
   "license": "MIT",
   "homepage": "https://github.com/dsh-tauri-desk/dsh-tauri-plugins#readme",
@@ -30,7 +30,6 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "README.md",
     "cordis.patch.yml",
     "dist"
   ],
@@ -38,7 +37,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-workspace",
         "dsh-tauri",
         "dsh-tauri-ui"
       ],
@@ -61,10 +60,12 @@
   },
   "dependencies": {
     "dsh-tauri": "workspace:*",
-    "dsh-tauri-ui": "workspace:*"
+    "lodash-es": "catalog:utils"
   },
   "devDependencies": {
+    "@types/lodash-es": "catalog:types",
     "dsh-tauri-tsdown": "workspace:*",
+    "dsh-tauri-ui": "workspace:*",
     "tsdown": "catalog:cli"
   }
 }

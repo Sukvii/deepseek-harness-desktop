@@ -1,14 +1,13 @@
 //! Harness 服务启动编排：`start` / `restart` / `launch`，含端口自愈
-//! （避让递增 + 回落、等待释放）、`--no-open` 版本判定、补丁挂点与
-//! Windows 隐藏控制台启动。
+//! （避让递增 + 回落、等待释放）、补丁挂点与 Windows 隐藏控制台启动。
 
 use crate::config;
 use std::collections::HashMap;
-#[cfg(windows)]
 use std::ffi::OsString;
 use std::fs;
 #[cfg(not(windows))]
 use std::io::Read;
+use std::path::Path;
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -46,6 +45,25 @@ type SpawnResult = Result<
 /// 存在短暂滞后（taskkill 返回 ≠ 端口已可复用）。等待窗口内端口回落为空闲则
 /// 复用配置端口；到期仍未释放才按“真占用”逐级递增。
 const PORT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn build_harness_args(
+    dsh_binary: &Path,
+    profile: &str,
+    port: u16,
+    heap_mb: Option<u32>,
+) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(7);
+    args.extend(super::heap::heap_option_arg(heap_mb));
+    args.extend([
+        dsh_binary.as_os_str().to_os_string(),
+        OsString::from("--profile"),
+        OsString::from(profile),
+        OsString::from("--port"),
+        OsString::from(port.to_string()),
+        OsString::from("--no-open"),
+    ]);
+    args
+}
 
 /// 轮询等待配置端口释放为空闲（端口本来就空闲则立即返回）。
 ///
@@ -104,102 +122,6 @@ pub(super) fn resolve_heal_port(configured: u16, heal_target: u16, heal_target_f
     } else {
         configured
     }
-}
-
-/// 端口自愈与冲突避让（Windows 与 WSL 两条启动路径共用）。
-///
-/// 步骤：先按「自动避让递增遗留的非默认端口在回落目标空闲时回落」修正
-/// （issue #91：端口只增不减、一路从 3080 漂到 3084+），再等配置端口真正
-/// 释放为空闲，最后从当前值逐个递增到第一个空闲端口；每次变更都持久化，
-/// 供所有调用方（含前端展示）复用。
-async fn resolve_port(
-    app_handle: &tauri::AppHandle,
-    setting: &mut config::Setting,
-) -> Result<(), String> {
-    // 先于 wait_for_port_release 探测：既然放弃旧端口，就无需等它释放。
-    let heal_target = setting.manual_port.unwrap_or(config::default_port());
-    let healed_port = resolve_heal_port(setting.port, heal_target, !is_port_in_use(heal_target));
-    if healed_port != setting.port {
-        log::info!(
-            "Harness port healed from {} back to {} (no longer occupied)",
-            setting.port,
-            healed_port
-        );
-        setting.port = healed_port;
-        config::set_store_dat_setting(app_handle, setting.clone());
-    }
-
-    // 端口冲突时从当前值开始逐个递增，并持久化最终选择供所有调用方复用。
-    // 注意：上个会话的残留 dsh 进程刚被我们结束/清扫（sweep_orphan、stop、
-    // stop_on_exit），TCP 端口释放存在短暂滞后——此刻立刻探测会把“刚释放的
-    // 端口”误判为仍占用，从而把配置端口永久顶高（dev 热更新下 3081→3082→…
-    // 一路漂移，表现为“端口持续累加 + 首次启动超时、刷新后恢复”）。先留出
-    // 窗口等配置端口回落为空闲，再决定是否真的逐级递增。
-    wait_for_port_release(setting.port).await;
-    let available_port = find_available_port(setting.port)?;
-    if available_port != setting.port {
-        log::info!(
-            "Harness port changed from {} to {} because the configured port is occupied",
-            setting.port,
-            available_port
-        );
-        setting.port = available_port;
-        config::set_store_dat_setting(app_handle, setting.clone());
-    }
-    Ok(())
-}
-
-/// dsh 版本是否支持 `--no-open` 标志。
-///
-/// 0.1.0-rc.8 起 `dsh web` 默认在系统浏览器打开 UI（桌面端内嵌 WebView，
-/// 不希望每次启动都弹浏览器），并新增 `--no-open` 关闭该行为。更早的 rc
-/// 版本没有这个标志，commander 会把未知选项当作错误、导致 web profile
-/// 启动失败，因此追加标志前必须按已装版本判定：0.1.0-rc.8 及以上传标志；
-/// 更早不传（保持旧行为）。
-///
-/// 比较用 `semver` 库按完整语义化版本进行：只比 rc 序号会把基础版本更大的
-/// 新版本误判为旧版——`0.1.1-rc.1` 的 rc 号（1）虽小于 8，但晚于
-/// 0.1.0-rc.8，同样支持 `--no-open`（该误判是浏览器复弹的回归根因）。
-/// 版本号非法（无法解析）时保守处理：不追加标志。
-fn version_supports_no_open(version: &str) -> bool {
-    // 首个支持 `--no-open` 的 dsh 版本（0.1.0-rc.8）
-    const NO_OPEN_MIN_VERSION: &str = "0.1.0-rc.8";
-    let Ok(min) = semver::Version::parse(NO_OPEN_MIN_VERSION) else {
-        return false;
-    };
-    semver::Version::parse(version)
-        .map(|v| v >= min)
-        .unwrap_or(false)
-}
-
-/// 按当前活动核心的 dsh 版本决定是否追加 `--no-open`（见 [`version_supports_no_open`]）。
-///
-/// 版本以活动核心为准：本地核心（用户 CLI 安装）与预打包核心各自读自己的
-/// 包清单；读不到时保守处理：不追加标志。
-fn dsh_binary_version(binary: &std::path::Path) -> Option<String> {
-    let package_dir = binary.parent()?.parent()?;
-    let manifest = package_dir.join("package.json");
-    let content = fs::read_to_string(manifest).ok()?;
-    serde_json::from_str::<serde_json::Value>(&content)
-        .ok()?
-        .get("version")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-}
-
-/// 按实际将要执行的 dsh `bin.js` 判定 `--no-open` 能力。
-///
-/// 核心切换槽位的外层 package.json 可能没有 `dependencies` 清单（源码构建
-/// alpha 尤其如此），因此不能只读取活动核心登记版本；必须读取入口所属的
-/// `@deepseek-ai/dsh/package.json`，避免 alpha 因版本读空而漏传参数。
-fn web_supports_no_open_flag(
-    app_handle: &tauri::AppHandle,
-    dsh_binary_path: &std::path::Path,
-) -> bool {
-    dsh_binary_version(dsh_binary_path)
-        .or_else(|| crate::service::core::active_version(app_handle))
-        .map(|version| version_supports_no_open(&version))
-        .unwrap_or(false)
 }
 
 /// 检测并启动 Harness 服务
@@ -323,10 +245,27 @@ fn is_duplicate_loader_exit(exit_code: u32, stderr: &str) -> bool {
 
 /// 启动 Harness 服务进程
 pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
+    // 启动分段计时（issue #766）：只写日志，不改控制流。每段一行 `STARTUP_PHASE`，
+    // `ms` 是本段耗时、`total` 是本次 launch 的累计耗时。启动慢的归因过去只能靠
+    // 时间戳猜测（同一进程内 auto_start 与前端 invoke 并发交错），埋点后可直接
+    // 从 desktop.log 读出「哪一段慢、慢多少」。
+    let startup_started = std::time::Instant::now();
+    let mut phase_started = startup_started;
+    // 段末打点：`ms` 为上一段耗时，`total` 为 launch 累计。closure 只服务本函数，
+    // 因此就地定义而不抽成独立模块/工具。
+    let mark_phase = |name: &str, phase_started: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        log::info!(
+            "STARTUP_PHASE: name={name} ms={} total={}",
+            now.duration_since(*phase_started).as_millis(),
+            now.duration_since(startup_started).as_millis()
+        );
+        *phase_started = now;
+    };
     let mut setting = config::get_store_dat_setting(&app_handle);
 
     // WSL 核心走独立编排（W3.1/W3.2）：入口是 `wsl.exe` 而不是本机 node/dsh
-    // 文件，存在性检查无意义；端口自愈与 Windows 分支共用 `resolve_port`。
+    // 文件，存在性检查无意义；端口自愈在发行版内独立做（[`super::wsl_launch::resolve_port_wsl`]）。
     // 核心转换锁在此获取并持有到中继登记完成（与 Windows 分支同一临界区）。
     #[cfg(windows)]
     if crate::service::core::active_source(&app_handle) == crate::service::core::CoreSource::Wsl {
@@ -334,6 +273,13 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
             .wsl_distro
             .clone()
             .ok_or_else(|| "WSL_DISTRO_NOT_SET: no WSL distro is selected".to_string())?;
+        // 已有持有进程时直接返回（U4.4 廉价早退）：preflight 最长 30 s（含发行版
+        // 冷启动），前端 boot 与 auto_start 并发交错时无需为已运行的目标重复探测；
+        // 锁内还有一次同等检查兜住此后的竞态。
+        if has_owned_process() {
+            log::info!("Owned Harness process is already running, skipping launch");
+            return Ok(());
+        }
         // 从探测到 spawn 的整条链路包成一块：任一失败都可能在「待确认切换」窗口内
         // 发生——按 R-V8-1 回滚到切换前的运行时（没有待确认切换时是 no-op），
         // 避免用户卡在启动不了的新树上。
@@ -343,19 +289,34 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
             // 的新鲜缓存直接复用，省掉开机路径上重复的探测（R-W3-6）。
             super::wsl_launch::preflight(&distro).await?;
             let _transition_guard = super::process::acquire_core_transition().await?;
-            // 已在运行时不碰端口：`resolve_port` 会把「本进程正在监听的端口」判为占用
-            // 并递增，随后 spawn 又因 has_owned_process 直接返回——前端于是按新端口做
-            // 健康检查而永远失败（D-W3-3）。Windows 分支的同等检查也在端口处理之前。
+            // 已在运行时不碰端口：`resolve_port_wsl` 会把「本进程正在监听的端口」
+            // 判为占用并递增，随后 spawn 又因 has_owned_process 直接返回——前端于是
+            // 按新端口做健康检查而永远失败（D-W3-3）。Windows 分支的同等检查也在端口处理之前。
             if has_owned_process() {
                 log::info!("Owned Harness process is already running, skipping launch");
                 return Ok(());
             }
+            // 锁内重读来源与设置（R-W4-4 + U4.4）：preflight 最长 30 s 且期间进程
+            // 尚未登记，`WSL_DISTRO_LOCKED`（以 `has_owned_process()` 为条件）挡不住
+            // 用户改 `wsl_distro` 或切回本机核心；按旧目标启动会与设置不一致。
+            if crate::service::core::active_source(&app_handle)
+                != crate::service::core::CoreSource::Wsl
+            {
+                return Err(
+                    "WSL_DISTRO_CHANGED: active core changed during preflight, retry".to_string(),
+                );
+            }
+            let current_distro = config::get_store_dat_setting(&app_handle).wsl_distro;
+            if current_distro.as_deref() != Some(distro.as_str()) {
+                return Err(
+                    "WSL_DISTRO_CHANGED: distro changed during preflight, retry".to_string()
+                );
+            }
             // 清残留**先于**端口判定（R-W4-3）：崩溃残留占着配置端口时，若先扫描会
             // 白白漂移一次端口并持久化，下次重启才 heal 回来。STOP 幂等、失败仅告警。
             super::wsl_launch::clear_stale(&distro).await;
-            // 锁内重读设置（R-W4-4）：preflight 最长 30 s 且期间进程尚未登记，
-            // `WSL_DISTRO_LOCKED`（以 `has_owned_process()` 为条件）挡不住用户改
-            // `wsl_distro`；按旧目标启动会与设置不一致。
+            // clear_stale（进发行版 STOP）最长数秒，期间目标仍可能被改动：spawn 前
+            // 最后核对一次 distro，确保端口判定与启动落在当前设置的目标上（U4.4）。
             let current_distro = config::get_store_dat_setting(&app_handle).wsl_distro;
             if current_distro.as_deref() != Some(distro.as_str()) {
                 return Err(
@@ -381,7 +342,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     }
 
     let node_binary_path = config::get_node_binary_path(&app_handle);
-    // 活动核心的 dsh 入口（本地核心优先，未检测到走预打包）
+    let _transition_guard = super::process::acquire_core_transition().await?;
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
 
     log::debug!("Checking Node.js path: {:?}", node_binary_path);
@@ -394,10 +355,10 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         log::error!("Harness not installed");
         return Err("HARNESS_NOT_FOUND: Harness not installed".to_string());
     }
+    mark_phase("resolve", &mut phase_started);
 
     // 从这里开始持有与核心切换共用的互斥锁：最终状态检查、启动守卫、残留清扫
     // 及新进程登记必须处于同一临界区，避免切换在检查后插入。
-    let _transition_guard = super::process::acquire_core_transition().await?;
 
     // 避免重复启动（配合启动守卫，确保并发调用只拉起一个进程）
     if has_owned_process() {
@@ -432,17 +393,65 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         }
     }
 
-    resolve_port(&app_handle, &mut setting).await?;
+    // 端口自愈：自动避让递增（配置端口被占 → 逐级顶高）遗留的非默认端口，
+    // 在回落目标（用户手动端口 manual_port，否则默认端口）空闲时回落，避免
+    // 端口只增不减、一路从 3080 漂到 3084+（issue #91）。先于
+    // wait_for_port_release 探测：既然放弃旧端口，就无需等它释放。
+    let heal_target = setting.manual_port.unwrap_or(config::default_port());
+    let healed_port = resolve_heal_port(setting.port, heal_target, !is_port_in_use(heal_target));
+    if healed_port != setting.port {
+        log::info!(
+            "Harness port healed from {} back to {} (no longer occupied)",
+            setting.port,
+            healed_port
+        );
+        setting.port = healed_port;
+        config::set_store_dat_setting(&app_handle, setting.clone());
+    }
+
+    // 端口冲突时从当前值开始逐个递增，并持久化最终选择供所有调用方复用。
+    // 注意：上个会话的残留 dsh 进程刚被我们结束/清扫（sweep_orphan、stop、
+    // stop_on_exit），TCP 端口释放存在短暂滞后——此刻立刻探测会把“刚释放的
+    // 端口”误判为仍占用，从而把配置端口永久顶高（dev 热更新下 3081→3082→…
+    // 一路漂移，表现为“端口持续累加 + 首次启动超时、刷新后恢复”）。先留出
+    // 窗口等配置端口回落为空闲，再决定是否真的逐级递增。
+    wait_for_port_release(setting.port).await;
+    let available_port = find_available_port(setting.port)?;
+    if available_port != setting.port {
+        log::info!(
+            "Harness port changed from {} to {} because the configured port is occupied",
+            setting.port,
+            available_port
+        );
+        setting.port = available_port;
+        config::set_store_dat_setting(&app_handle, setting.clone());
+    }
+    mark_phase("stale_sweep_and_port", &mut phase_started);
 
     // 构造环境变量：隔离的 $DSH_HOME + 隐私默认（关闭遥测）
+    //
+    // 建目录 + 可写性预检（issue #466）：`~/.dsh` 属主不是当前用户时（典型：此前
+    // 用 sudo 运行过 dsh，macOS 的 sudo 保留 $HOME），读得到、写不了——dsh 起来后
+    // 必然崩在写 cordis.yml/settings.yaml 上，前端只能看到
+    // 「Harness exited early: exit status: 1」，完全不可行动。这里提前阻断并给出
+    // 可直接粘贴的 chown 指引。
     let dsh_home = config::get_dsh_data_path(&app_handle);
-    fs::create_dir_all(&dsh_home)
-        .map_err(|e| format!("DSH_HOME_MKDIR_FAILED: create dsh home failed: {e}"))?;
+    crate::service::perm::ensure_dir_writable(&dsh_home, "DSH_HOME_MKDIR_FAILED")?;
+    // 当前档案目录同样必须在 spawn 前可写：`$DSH_HOME` 可写不代表档案可写——属主
+    // 错位可能只落在 `profiles` 或 `profiles/<id>` 上（安全模式要新建 `profiles/safe`，
+    // 因此 `profiles` 不可写同样是致命状态）。
+    //
+    // 先跑一次档案迁移 + 首装引导（幂等）：desktop::setup 的引导若失败（磁盘/权限
+    // 抖动）或本进程没进过 setup，这里兜底；改名必须早于可写性预检，否则预检拿到的
+    // 还是改名前的档案目录。最佳努力：失败只告警，不阻断启动。
+    crate::service::profile::migrate_desktop_profile_name(&app_handle);
 
-    // 首装档案引导重试：desktop::setup 的引导若失败（磁盘/权限抖动），在真正
-    // spawn dsh 前再补一次；幂等，已就绪时直接跳过。最佳努力：失败只告警，
-    // 不阻断启动（回落 web 档案的老行为）。
-    crate::service::profile::ensure_first_run_desktop_profile(&app_handle);
+    // 预检不创建目录，避免抢先建出半初始化档案（issue #452）。
+    crate::service::perm::ensure_writable_path(
+        &crate::service::plugin::profile_dir(&app_handle),
+        &dsh_home,
+        "PROFILE_NOT_WRITABLE",
+    )?;
 
     // 核心 bundle 层自愈（issue #452）：当前档案的 `dsh.profile.bundles` 必须带
     // 桌面端内嵌 web UI 依赖的 `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-web-app`
@@ -462,13 +471,12 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     // 首次引导安装都作用于「当时的活动档案」，于是安全档案里会累积用户插件——它们
     // 往往正是启动失败的元凶，不清干净的话每次进入安全模式都带着同一批插件重启，
     // 隔离形同虚设。必须在 spawn dsh 之前做（服务未运行时改清单、删 node_modules
-    // 目录才安全），且要早于下面的 win_inspector::apply：apply 依据「插件是否装入
-    // profile」决定挂载还是清理 patch 行，先清插件才能让遗留挂载行被正确剥离。
-    // 内置插件与核心包由被调方保留；非安全档案直接跳过。最佳努力：失败只告警，
-    // 不阻断启动（清理不彻底只是隔离效果打折，启动阻塞则让应用彻底不可用）。
+    // 目录才安全）。内置插件与核心包由被调方保留；非安全档案直接跳过。最佳努力：
+    // 失败只告警，不阻断启动（清理不彻底只是隔离效果打折，启动阻塞则让应用彻底不可用）。
     if let Err(e) = crate::service::plugin::purge_user_plugins_in_safe_profile(&app_handle) {
         log::warn!("safe mode user plugin purge failed: {e}");
     }
+    mark_phase("profile_prepare", &mut phase_started);
 
     // Linux 起步前探测 inotify 监视上限：harness 服务（dsh web）用 chokidar 递归
     // 监视 profile 目录，上限过低会在启动一瞬间抛 ENOSPC 直接退出（issue #116）。
@@ -477,17 +485,10 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     #[cfg(unix)]
     warn_if_inotify_watch_limit_low();
 
-    // Windows 极简模式修复的自愈：插件已装入 profile 时确保 patch 挂载行与
-    // minimal-win 用户 preset 落盘（幂等）。最佳努力：失败只告警，不阻断启动。
+    // Windows：剥离历史遗留的 `dsh-win-terminal-inspector` 注入行（幂等，官方核心
+    // 自 0.1.0-rc.8 起内置 inspector）。最佳努力：失败只告警，不阻断启动。
     if let Err(e) = win_inspector::apply(&app_handle) {
-        log::warn!("win32 terminal support apply failed: {e}");
-    }
-    // alpha 的 iframe 无法稳定完成 SameSite=Strict browser-session Cookie 交换：
-    // 补丁让 dsh 接受 `--skip-auth`，仅在桌面端显式传该标志时跳过 browser-session
-    // 层（保留 Host/Origin fence）；普通 `dsh web` 不受影响。旧核心无锚点时
-    // patch_dsh 安全跳过，不改变旧版行为。
-    if let Err(e) = crate::service::patch::alpha_auth::apply(&app_handle) {
-        log::warn!("alpha --skip-auth patch failed: {e}");
+        log::warn!("win32 legacy patch cleanup failed: {e}");
     }
     // renderer 的 SlotOutlet 一行导出补丁（dsh-tauri-ui 设置侧边栏依赖）：只补
     // 活动核心的 dsh-client-ui-renderer lib/client.js，已含导出即跳过（幂等；核心
@@ -496,21 +497,64 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::patch::renderer::apply(&app_handle) {
         log::warn!("renderer SlotOutlet patch failed: {e}");
     }
+    // composer 可用性：官方 ConversationRoot 对「不属于任何工作区的空白会话」把
+    // composer 换成「选择工作区」触发器（`inert` 只看 chipTitle，而 chipTitle 只来自
+    // 工作区），于是 dsh-tauri-ui 的「未分组」新会话无法输入。补丁放宽该判定（会话已有
+    // cwd 即不算 inert）并写入 `data-dsh-composer-cwd` 能力标记；标记缺失时插件侧按
+    // 退级策略禁用「未分组」入口并告警。最佳努力且幂等：锚点缺失安全跳过。
+    if let Err(e) = crate::service::patch::composer::apply(&app_handle) {
+        log::warn!("composer workspace-less patch failed: {e}");
+    }
+    if let Err(e) = crate::service::patch::mobile_composer::apply(&app_handle) {
+        log::warn!("mobile composer patch failed: {e}");
+    }
     // Expose an id-based SessionStore.remove facade so plugins can perform a
     // real in-memory teardown instead of leaving deleted sessions ungrouped.
     if let Err(e) = crate::service::patch::session::apply(&app_handle) {
         log::warn!("SessionStore.remove patch failed: {e}");
+    }
+    // OpenCode Go 需要稳定的会话 ID 头，否则返回 400 MissingSessionID；上游 pi-ai
+    // 适配器把 sessionId 只透传给 SDK、不落成请求头，这里补上原生会话头，并限定到
+    // OpenCode 路由（provider id 前缀或生效 baseUrl 主机为 opencode.ai），其它 provider
+    // 的请求头保持不变。最佳努力且幂等：目标已含标记或锚点缺失时 patch_dsh 安全跳过。
+    if let Err(e) = crate::service::patch::llm_session::apply(&app_handle) {
+        log::warn!("pi-ai session header patch failed: {e}");
+    }
+    // Codex 系端点把思维链写在正文里（`<thinking>…</thinking>`），pi-ai 的
+    // openai-completions 适配器只认识结构化推理字段，思考便混进回答正文。补丁在
+    // 消息开头的围栏处把这段文本改道到 thinking 事件，harness 侧按 reasoning 块落库。
+    // 最佳努力且幂等：目标已含标记或锚点缺失时 patch_dsh 安全跳过。
+    if let Err(e) = crate::service::patch::pi_ai_thinking::apply(&app_handle) {
+        log::warn!("pi-ai thinking-as-text patch failed: {e}");
+    }
+    // WKWebView 点击 `<button>` 不转移焦点：模型座位的 portal 菜单在 mousedown 阶段收到
+    // `relatedTarget` 为 null 的 blur 就直接 close()，菜单在 click 之前卸载，鼠标选择
+    // 模型 / 推理等级变成空操作（键盘 Enter 正常、浏览器正常）。补丁放行该 blur，菜单外的
+    // 点击仍由组件自身的文档级 mousedown 处理器关闭。最佳努力且幂等：锚点缺失时安全跳过。
+    if let Err(e) = crate::service::patch::model_selection::apply(&app_handle) {
+        log::warn!("model selection mouse click patch failed: {e}");
     }
     // worktree 会话以隔离 cwd 执行，但产品归属仍是源 Workspace；放宽上游显式
     // attach 的 cwd 相等约束，其他 cwd 有效性校验保持不变。最佳努力且幂等。
     if let Err(e) = crate::service::patch::workspace::apply(&app_handle) {
         log::warn!("workspace worktree membership patch failed: {e}");
     }
-    // 当前 DSH client-HMR 会卸载第三方插件却不重新挂载。debug 直接联接本地
-    // 插件源码，故将 rebuilt 降级为自动刷新页面；release 保持上游行为。
-    if let Err(e) = crate::service::patch::client_hmr::apply(&app_handle) {
-        log::warn!("debug client plugin reload fallback patch failed: {e}");
+    // 0.1.6-alpha.1 起 dsh-client-ui-workspace 的浏览视图 store 去掉了
+    // `sessionUpdatedAtByAccount`（persist key 仍是 dsh.workspace.view.v5）：先跑过新核心
+    // 再切回 0.1.5-rc.1 / rc.2 时，旧核心的 retainAccountKeys 会
+    // Object.entries(undefined) 抛错，sidebar.workspaces 整条槽崩掉且不会自愈。
+    // 补丁把该 action 的取值放宽为 `?? {}`，逐条独立判定：0.1.7 起上游第三条改成了
+    // `delete`，前两条的放宽仍然生效；只有该 action 被整体改写才安全跳过。
+    if let Err(e) = crate::service::patch::workspace_view::apply(&app_handle) {
+        log::warn!("workspace view state patch failed: {e}");
     }
+    // 内置插件（dsh-tauri-*）只在壳的插件弹窗里可见：官方侧边栏 Plugins 页与插件市场
+    // 都按各自的硬编码内置/inbox 名单判断 bundle 归属，上游没有可配置开关，因此对这两个
+    // 前端做幂等补丁。最佳努力且幂等：锚点缺失（上游改写布局）时安全跳过。
+    if let Err(e) = crate::service::patch::plugin_visibility::apply(&app_handle) {
+        log::warn!("plugin visibility patch failed: {e}");
+    }
+    mark_phase("core_patches", &mut phase_started);
     // 预防性处理：pnpm 在无 TTY 环境（dsh-market 等子进程）下重装/更新插件时，
     // 清理/重建 node_modules 会触发交互确认并因无 TTY 直接中止
     // （ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY），表现为插件更新失败。
@@ -519,12 +563,13 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::plugin::ensure_profile_npmrc(&app_handle) {
         log::warn!("ensure profile .npmrc failed: {e}");
     }
-    // 弃用插件自动卸载：`deprecated-plugins.json` 登记的社区插件若已安装，启动时
+    // 弃用插件自动卸载：`manifest.jsonc` 的 `plugins.depercated` 登记的社区插件若已安装，启动时
     // 自动移除（避免残留插件继续在 profile 里加载、甚至导致启动失败）。最佳努力：
     // 失败只告警，不阻断启动。
     if let Err(e) = crate::service::plugin::uninstall_deprecated_plugins(&app_handle).await {
         log::warn!("uninstall deprecated plugins failed: {e}");
     }
+    mark_phase("deprecated_plugins", &mut phase_started);
     // 内置插件自愈：随包分发的内置插件（dsh-tauri 等）必须在服务进程加载插件
     // 前就绪——核对「已安装 + 安装路径指向当前捆绑目录」，未安装、路径不正确
     // 或用户卸载后重启，一律强制重装（见 service::plugin::internal）。最佳
@@ -532,6 +577,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::plugin::ensure_internal_plugins(&app_handle).await {
         log::warn!("ensure internal plugins failed: {e}");
     }
+    mark_phase("ensure_internal_plugins", &mut phase_started);
     // 预装插件完整性自检：清单引用的预装插件若在 node_modules 缺失产物，服务
     // 启动时 loader 会对每个缺失插件抛 ERR_MODULE_NOT_FOUND 而整体失败（issue
     // #90，日志特征 `Cannot find package`）。用 `pnpm install` 以现有 manifest +
@@ -539,6 +585,12 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     // （启动失败场景由前端 recovery 对话框兜底，见 service::plugin::recovery）。
     if let Err(e) = crate::service::plugin::ensure_preset_plugins(&app_handle).await {
         log::warn!("ensure preset plugins failed: {e}");
+    }
+    mark_phase("ensure_preset_plugins", &mut phase_started);
+    // 插件自愈（内置插件重装 / 预装插件完整性自检）可能刚把插件市场装进档案，而上一轮补丁
+    // 执行时它还不存在、已被安全跳过；自愈完成后按需重打一次（逐名字判定，已登记则跳过）。
+    if let Err(e) = crate::service::patch::plugin_visibility::apply(&app_handle) {
+        log::warn!("plugin visibility patch after plugin self-healing failed: {e}");
     }
     // 预打包核心运行时自愈：把 app 内置插件与 profile 插件入口链接进活动核心的
     // node_modules（dsh 的 loader 以核心根为裸包解析根），并核验/修复 sharp/koffi
@@ -549,6 +601,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         log::error!("prepare active core runtime failed: {e}");
         return Err(e);
     }
+    mark_phase("prepare_active_runtime", &mut phase_started);
     // prepare 可能因核心原生模块的 ABI 与本地 node 不匹配而改用捆绑运行时
     // （issue #441），此时必须重新解析：下面的 DSH_NODE 注入与 PATH 前置都以
     // 这里的结果为准，否则子进程仍会用那个加载不了原生模块的本地 node。
@@ -638,6 +691,12 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         envs.insert("DSH_PREFER_BUNDLED_PNPM".to_string(), "1".to_string());
     }
 
+    // 内嵌 WebView 是 `tauri.localhost` 下的跨源沙箱 iframe，`SameSite=Strict` 的
+    // browser-session Cookie 不会被携带。载体标记交给 dsh-tauri 插件（载体鉴权适配）：
+    // 只有该标记在场时它才覆写 connection 的鉴权闸门，因此同一 profile 下独立运行
+    // 的 `dsh web` 不受影响（取代原先对核心 JS 打的 `--skip-auth` 磁盘补丁）。
+    envs.insert("DSH_TAURI_EMBEDDED".to_string(), "1".to_string());
+
     // 日志文件（前端日志面板读取）。
     // 每次真实启动前轮转：只保留最近 3 次启动的日志，旧文件后退为
     // `dsh-web.log.1` / `dsh-web.log.2`，避免单文件随多次启动无限增长。
@@ -646,17 +705,33 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("LOG_DIR_MKDIR_FAILED: create log dir failed: {e}"))?;
     rotate_service_log(&log_path, 3);
 
-    // rc.8 起 `dsh web` 默认在系统浏览器打开 UI；桌面端内嵌 WebView，不需要
-    // 浏览器，追加 `--no-open` 关闭（老版本无此标志时按版本判定不传）。
-    let no_open = web_supports_no_open_flag(&app_handle, &dsh_binary_path);
+    // `dsh web` 默认在系统浏览器打开 UI；桌面端内嵌 WebView，不需要浏览器，
+    // 追加 `--no-open` 关闭。该标志自 0.1.0-rc.8 起提供，全部受支持核心（≥
+    // 0.1.5-rc.1）均已具备，无需按版本判定。
 
-    // 版本判定打不到 alpha 的 web-startup 选项表（见 web_supports_no_open_flag）。
-    // alpha 的浏览器会话 Cookie 在沙箱跨源 iframe 上下文无法完成交换，因此桌面端
-    // 显式追加 `--skip-auth`：只有核心（经上面的 alpha_auth 补丁，或上游官方合并）
-    // 确实支持该标志才传，避免旧核心把未知选项当成错误退出。
-    let skip_auth = crate::service::patch::alpha_auth::web_startup_supports_skip_auth(&app_handle);
+    // 补丁层悬空 insert 预检：手写的 `insert` 条目在包被卸载（市场会拒绝卸载
+    // 「仍被用户补丁引用」的插件，用户于是改走手工删依赖 / pnpm remove）或本地
+    // `link:` 源被删后仍留在补丁层里，loader 会在 import 时抛 ERR_MODULE_NOT_FOUND，
+    // 让整棵插件树加载失败——应用彻底起不来，用户只看到一坨 Node 堆栈。上游契约
+    // 是「补丁文件存在却应用不了就大声失败」，这里不改变契约，只把同一结果提前成
+    // 一条可操作的错误（哪个文件、哪一行、哪个包），错误页据此给出「移除悬空条目」
+    // 的一键恢复。必须在所有插件自愈之后：那些步骤会改变安装状态。
+    if let Err(e) = crate::service::plugin::preflight_active_patch_entries(&app_handle) {
+        log::error!("patch layer entry preflight failed: {e}");
+        return Err(e);
+    }
+    mark_phase("patch_entry_preflight", &mut phase_started);
 
-    log::info!("Starting Harness process");
+    let node_options = std::env::var("NODE_OPTIONS").ok();
+    let heap_mb = super::heap::resolve_heap_limit_mb(
+        setting.harness_max_heap_mb,
+        node_options.as_deref(),
+        super::heap::physical_memory_mb(),
+    );
+    match heap_mb {
+        Some(mb) => log::info!("Starting Harness process with --max-old-space-size={mb}"),
+        None => log::info!("Starting Harness process with Node default or inherited heap options"),
+    }
 
     // dsh 的 Loader 在插件 dispose 时会把组合后的整棵 entry 树回写进
     // `cordis.yml`（dsh-app-boot：plugin self-disposing persists the current
@@ -672,6 +747,17 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     // node 会让 dsh 派生的子进程各自新建可见控制台窗口（频繁闪烁 cmd 黑窗），
     // 因此 Windows 上改用“隐藏控制台”方式启动，见 win_spawn 模块。
     let active_profile = crate::service::profile::active_profile(&app_handle);
+    let app_core_dir = config::get_dsh_install_path(&app_handle);
+    let core_dir = if dsh_binary_path == config::get_dsh_binary_path(&app_handle) {
+        app_core_dir
+    } else {
+        dsh_binary_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(app_core_dir)
+    };
+    mark_phase("pre_spawn_setup", &mut phase_started);
     let spawn_result: SpawnResult = {
         #[cfg(windows)]
         {
@@ -681,19 +767,12 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                 GetExitCodeProcess, WaitForSingleObject, INFINITE,
             };
 
-            let mut args: Vec<OsString> = vec![
-                dsh_binary_path.as_os_str().to_os_string(),
-                OsString::from("--profile"),
-                OsString::from(active_profile.as_str()),
-                OsString::from("--port"),
-                OsString::from(setting.port.to_string()),
-            ];
-            if no_open {
-                args.push(OsString::from("--no-open"));
-            }
-            if skip_auth {
-                args.push(OsString::from("--skip-auth"));
-            }
+            let args = build_harness_args(
+                &dsh_binary_path,
+                active_profile.as_str(),
+                setting.port,
+                heap_mb,
+            );
 
             // 只负责 spawn 并返回管道/PID/句柄：探测与重试期间不登记、不挂
             // 监视线程——只有最终采用的那个进程才登记，否则旧监视线程会通过
@@ -703,7 +782,7 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                     super::win_spawn::spawn_with_hidden_console_owned(
                         &node_binary_path,
                         &args,
-                        Some(&config::get_dsh_install_path(&app_handle)),
+                        Some(&core_dir),
                         &envs,
                     )
                 };
@@ -796,19 +875,14 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
         {
             use std::os::unix::process::CommandExt;
             let mut cmd = Command::new(&node_binary_path);
-            cmd.arg(&dsh_binary_path)
-                .arg("--profile")
-                .arg(active_profile.as_str())
-                .arg("--port")
-                .arg(&setting.port.to_string());
-            if no_open {
-                cmd.arg("--no-open");
-            }
-            if skip_auth {
-                cmd.arg("--skip-auth");
-            }
+            cmd.args(build_harness_args(
+                &dsh_binary_path,
+                active_profile.as_str(),
+                setting.port,
+                heap_mb,
+            ));
             cmd.envs(&envs)
-                .current_dir(config::get_dsh_install_path(&app_handle))
+                .current_dir(&core_dir)
                 // 核心修正：提供一个空的 stdin 防止 setRawMode 报错
                 .stdin(Stdio::null())
                 // 使用管道捕获输出，以便在子线程中读取
@@ -842,19 +916,14 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
                                         );
                                         reset_active_profile_root(&app_handle);
                                         cmd = Command::new(&node_binary_path);
-                                        cmd.arg(&dsh_binary_path)
-                                            .arg("--profile")
-                                            .arg(active_profile.as_str())
-                                            .arg("--port")
-                                            .arg(setting.port.to_string());
-                                        if no_open {
-                                            cmd.arg("--no-open");
-                                        }
-                                        if skip_auth {
-                                            cmd.arg("--skip-auth");
-                                        }
+                                        cmd.args(build_harness_args(
+                                            &dsh_binary_path,
+                                            active_profile.as_str(),
+                                            setting.port,
+                                            heap_mb,
+                                        ));
                                         cmd.envs(&envs)
-                                            .current_dir(config::get_dsh_install_path(&app_handle))
+                                            .current_dir(&core_dir)
                                             .stdin(Stdio::null())
                                             .stdout(Stdio::piped())
                                             .stderr(Stdio::piped())
@@ -890,6 +959,10 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
             Ok((stdout, stderr, pid))
         }
     };
+
+    // 这一段包含 spawn、2.5s 存活探测与 `set_owned_process` 登记——登记写在 spawn 块
+    // 内部，无法单独切分，所以不再为「登记」另打一个只量到一行 log 的点。
+    mark_phase("spawn_probe_and_register", &mut phase_started);
 
     match spawn_result {
         Ok((stdout, stderr, pid)) => {
@@ -957,40 +1030,6 @@ mod tests {
             "wait_for_port_release should return shortly after the port is released, not wait the full window"
         );
         releaser.join().expect("port releaser thread");
-    }
-
-    #[test]
-    fn no_open_supported_on_rc8_and_later() {
-        assert!(version_supports_no_open("0.1.0-rc.8"));
-        assert!(version_supports_no_open("0.1.0-rc.9"));
-        // 基础版本更大的新版本：0.1.1-rc.1 的 rc 号（1）虽小于 8，但晚于
-        // 0.1.0-rc.8，同样支持 --no-open（只比 rc 号会把这里误判为旧版）
-        assert!(version_supports_no_open("0.1.1-rc.1"));
-        assert!(version_supports_no_open("0.1.2-rc.1"));
-        // 稳定版必然晚于 rc.8
-        assert!(version_supports_no_open("0.1.0"));
-        assert!(version_supports_no_open("0.2.0"));
-        assert!(version_supports_no_open("1.0.0"));
-    }
-
-    #[test]
-    fn no_open_absent_before_rc8() {
-        assert!(!version_supports_no_open("0.1.0-rc.7"));
-        assert!(!version_supports_no_open("0.1.0-rc.0"));
-        // 基础版本更早的 rc 系列一律不支持
-        assert!(!version_supports_no_open("0.0.1-rc.5"));
-        assert!(!version_supports_no_open("0.0.9-rc.99"));
-    }
-
-    #[test]
-    fn no_open_unknown_version_is_conservative() {
-        assert!(!version_supports_no_open(""));
-        // rc 号缺失：`0.1.0-rc` 的预发布 [rc] 短于 [rc, 8]，判为早于 rc.8
-        assert!(!version_supports_no_open("0.1.0-rc"));
-        // 不完整/非法版本号（缺 patch、带 v 前缀、无 semver 结构）：无法解析
-        assert!(!version_supports_no_open("0.1"));
-        assert!(!version_supports_no_open("v0.1.0"));
-        assert!(!version_supports_no_open("not-a-version"));
     }
 
     /// 「duplicate loader entry」竞态签名的判定：只认 exit code 1 + stderr 含

@@ -1,9 +1,10 @@
 import type { ReactNode } from 'react'
-import type { ToastUpdateEvent } from '@/utils/toast'
-import { useEventBus } from '@hairy/react-lib'
+import type { ToastUpdateEvent } from '@/config/hooks'
 import { Spinner, Toast } from '@heroui/react'
+import { useListener } from '@reause/core'
 import { useState } from 'react'
 import { If } from 'react-if-lite'
+import { hooks } from '@/config/hooks'
 import { activeQueues, placements } from '@/utils/toast'
 
 interface ToastProviderProps {
@@ -14,11 +15,15 @@ interface ToastProviderProps {
 /**
  * 应用共用的 HeroUI queue/provider。桌宠窗口通过 custom 渲染精简气泡，
  * 主窗口保留 HeroUI 默认的操作和关闭按钮。
+ *
+ * 非 custom 分支必须传 `undefined`：HeroUI 以 `typeof children === 'undefined'`
+ * 判定「用默认气泡」，传 `null` 会被当作「渲染空内容」而整条提示不落地。
  */
 export function ToastProvider(props: ToastProviderProps) {
   const [updates, setUpdates] = useState(() => new Map<string, ToastUpdateEvent['options']>())
 
-  useEventBus<ToastUpdateEvent>('toast.update').on((event) => {
+  // 订阅 toast 原地更新事件；useListener 负责在卸载时注销
+  useListener(hooks['toast.updated'].on, (event) => {
     if (event === undefined || typeof event.key !== 'string')
       return
     setUpdates((current) => {
@@ -49,12 +54,12 @@ export function ToastProvider(props: ToastProviderProps) {
                         <Spinner color="current" size="sm" />
                       </Toast.Indicator>
                     </If>
-                    <Toast.Content>
+                    <Toast.Content className="overflow-hidden">
                       <If cond={content?.title !== undefined}>
                         <Toast.Title>{content?.title}</Toast.Title>
                       </If>
                       <If cond={content?.description !== undefined}>
-                        <Toast.Description className="line-clamp-2">
+                        <Toast.Description>
                           {content?.description}
                         </Toast.Description>
                       </If>

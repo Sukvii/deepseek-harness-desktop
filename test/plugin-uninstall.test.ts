@@ -33,30 +33,68 @@ describe('plugin preset chip i18n keys', () => {
 // ── Suite B — component references the preset key + condition ────────────────
 describe('configPlugin preset chip', () => {
   it('renders the plugins.preset key', () => {
-    const source = readFileSync(new URL('../src/components/config-plugin.tsx', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
     expect(source).toContain('plugins.preset')
   })
 
+  it('renders internal plugins in a collapsible group instead of hiding them', () => {
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    expect(source, '内置插件分组标题').toContain('plugins.builtin_title')
+    expect(source, '内置插件默认折叠').toContain('const [showInternal, toggleShowInternal] = useToggle()')
+    expect(source, '内置插件与可管理插件分开成两个列表').toContain('const managedPlugins = plugins.filter(plugin => !plugin.internal)')
+    expect(source, '内置插件行由分组条件渲染').toContain('cond={internalPlugins.length > 0}')
+  })
+
+  it('drives the empty state from the managed list only', () => {
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    // 仅剩内置插件时，可管理列表为空态必须显式提示，而不是留下悬空的折叠分组。
+    expect(source, '空态绑定可管理插件列表').toContain(`<If cond={managedPlugins.length > 0} else={<Empty>{t('plugins.empty')}</Empty>}>`)
+  })
+
   it('guards the chip on recommended (preset, non-internal)', () => {
-    const source = readFileSync(new URL('../src/components/config-plugin.tsx', import.meta.url), 'utf8')
-    expect(source).toContain('!plugin.internal && plugin.recommended')
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    // 预设 chip 只对「预设且非内置」渲染：内置插件即便在预设清单中也不打「预设」标。
+    expect(source, '预设 chip 仅对非内置的 recommended 渲染').toContain('cond={!plugin.internal && plugin.recommended}')
+    // 内置插件保留「内置」徽标，但与普通插件分组隔离。
+    expect(source).toContain('plugins.builtin')
+  })
+
+  it('allows internal toggles while withholding uninstall/snapshot', () => {
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    expect(source, '禁用入口包含内置插件').toContain('cond={!plugin.patchDisabled && !plugin.disabled}')
+    expect(source, '启用入口包含内置插件的桌面禁用态').toContain('cond={plugin.patchDisabled || plugin.disabled}')
+    expect(source, '快照入口由 !plugin.internal 守卫').toContain('<If cond={!plugin.internal}>')
+  })
+
+  it('hides the snapshot entries behind a default-off advanced toggle', () => {
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    expect(source, '高级选项默认关闭').toContain('const [advanced, toggleAdvanced] = useToggle()')
+    expect(source, '快照入口受高级选项控制').toContain('<If cond={advanced}>')
+    expect(source, '控件挂在「打开预设」左侧').toContain('plugins.advanced_options')
   })
 })
 
-// ── Suite C — uninstall flow wires to remove_dsh_plugin + restart ────────────
+// ── Suite C — uninstall routes through the manager + settles with one restart ──
 describe('configPlugin uninstall flow', () => {
-  it('calls remove_dsh_plugin', () => {
-    const source = readFileSync(new URL('../src/components/config-plugin.tsx', import.meta.url), 'utf8')
-    expect(source).toContain('remove_dsh_plugin')
+  it('routes uninstall through the manager batch command', () => {
+    const panel = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
+    const store = readFileSync(new URL('../src/store/modules/plugins/store.ts', import.meta.url), 'utf8')
+
+    expect(panel).toContain('manager.uninstall')
+    expect(panel).not.toContain('remove_dsh_plugin')
+    expect(store).toContain('remove_dsh_plugins')
   })
 
-  it('restarts the service after uninstall', () => {
-    const source = readFileSync(new URL('../src/components/config-plugin.tsx', import.meta.url), 'utf8')
-    expect(source).toContain('store.harness.restart()')
+  it('restarts the service once when the group settles', () => {
+    const store = readFileSync(new URL('../src/store/modules/plugins/store.ts', import.meta.url), 'utf8')
+
+    // 重启权收口到组结算：面板不再为卸载单独重启
+    expect(store).toContain('group.options.restartOnSettle')
+    expect(store).toContain('harness.restart()')
   })
 
   it('shows a confirm dialog before uninstall', () => {
-    const source = readFileSync(new URL('../src/components/config-plugin.tsx', import.meta.url), 'utf8')
+    const source = readFileSync(new URL('../src/ui/config/plugin.tsx', import.meta.url), 'utf8')
     expect(source).toContain('remove_confirm_title')
   })
 })

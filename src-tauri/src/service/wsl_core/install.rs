@@ -178,7 +178,7 @@ fn needs_runtime_update(
     }
 }
 
-/// 解析目标版本：精确 semver 直接采用（默认目标 = 桌面推荐版本走这条，离线可用）；
+/// 解析目标版本：精确 semver 直接采用（默认目标 = WSL 推荐基线走这条，离线可用）；
 /// dist-tag 才在线解析（`RESOLVE_DSH`，R-W2-1；显式 spec 仍可能是 dist-tag）。
 async fn resolve_target(distro: &str, version_spec: &str) -> Result<String, String> {
     if semver::Version::parse(version_spec).is_ok() {
@@ -203,16 +203,19 @@ async fn resolve_target(distro: &str, version_spec: &str) -> Result<String, Stri
     }
 }
 
-/// 默认安装目标的解析口径（D-W5R-2 / R-V8-2）：与桌面核心共用
-/// `recommended_dsh_version()`，**对所有调用方统一**——缺失/无效一律明确报错，
-/// 绝不以「已装版本」代替推荐值、也绝不回退 latest。
+/// 默认安装目标的解析口径（D-W5R-2 / R-V8-2 / U1）：读清单 `engines.dsh.
+/// wslRecommend` 的 **WSL 独立推荐基线**（`recommended_wsl_dsh_version`）——
+/// 桌面核心的推荐值升级不再移动 WSL（受控资源按该基线打包与验证），
+/// **对所有调用方统一**：缺失/无效一律明确报错，绝不以「已装版本」代替推荐值、
+/// 也绝不回退 latest（latest 可能是桌面端自己标记为 above-recommended 的预览版，
+/// 装上后客户端资源不兼容——W5-R 验收实测 0.2.0-rc.2 的 client bundle 404）。
 ///
 /// R-V8-2 之前开机自愈传入已装版本兜底（「缺失配置不把已装用户卡死」），但那会
 /// 让缺配置在自愈路径上静默变成 no-op；现在统一失败，用户在任何安装/自愈入口都
 /// 能看到明确原因（资源是随包分发的，缺失属于发布/安装异常）。
 pub fn default_version_spec(app: &AppHandle) -> Result<String, String> {
-    crate::config::recommended_dsh_version(app).ok_or_else(|| {
-        "WSL_DSH_VERSION_UNCONFIGURED: desktop recommended dsh version is missing or invalid"
+    crate::config::manifest::recommended_wsl_dsh_version(app).ok_or_else(|| {
+        "WSL_DSH_VERSION_UNCONFIGURED: WSL recommended dsh version is missing or invalid"
             .to_string()
     })
 }

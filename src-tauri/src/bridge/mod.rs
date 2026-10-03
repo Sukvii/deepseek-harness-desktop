@@ -14,7 +14,9 @@ pub mod pet;
 pub mod plugin;
 pub mod preset_pet;
 pub mod profile;
+pub mod remote;
 pub mod system_os;
+pub mod task_manager;
 pub mod updater;
 pub mod wsl_core;
 
@@ -27,6 +29,8 @@ pub use pet::*;
 pub use plugin::*;
 pub use preset_pet::*;
 pub use profile::*;
+pub use remote::*;
 pub use system_os::*;
+pub use task_manager::*;
 pub use updater::*;
 pub use wsl_core::*;

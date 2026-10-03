@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager, Runtime};
 
 use super::constants::*;
-use super::format::get_dsh_service_url;
+use super::dependencies;
 use super::utils::search_node_binary;
 use super::{detect_region, Region};
 
@@ -14,7 +14,16 @@ use super::{detect_region, Region};
 ///
 /// debug 与 release 不能共用核心安装目录：更新或切换 debug 核心时，可能替换
 /// release 正在加载的 Node 原生模块。用户数据目录另由 `get_dsh_data_path` 隔离。
+///
+/// 环境与核心都装在本根之下。`DOWNLOAD_CACHE_ENV_VAR` 可覆盖它——E2E 每次使用
+/// 全新 scratch home，不覆盖就会反复重下；指向稳定目录即可让首次下载在后续
+/// 运行中复用（清空该目录即回到「首次装配」状态，用于测启动 setup 流程）。
 pub fn get_base_dir<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
+    if let Some(dir) = env::var_os(DOWNLOAD_CACHE_ENV_VAR) {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     let base = app_handle
         .path()
         .app_data_dir()
@@ -60,12 +69,6 @@ pub fn get_node_download_url() -> Result<String, String> {
     ))
 }
 
-/// 打包的 DeepSeek Harness 发行版下载前缀：恒为 GitHub Release 官方直连，
-/// 作为首选下载源（镜像 ghfast.top 中转不稳定，仅作官方失败后的兜底）。
-fn dsh_core_base_url() -> &'static str {
-    DSH_CORE_URL
-}
-
 /// Harness 发行版资产文件名（按平台与架构）
 fn dsh_pkg_asset_filename() -> Result<String, String> {
     let arch = env::consts::ARCH;
@@ -82,11 +85,7 @@ fn dsh_pkg_asset_filename() -> Result<String, String> {
 
 /// 打包的 DeepSeek Harness 发行版下载地址（GitHub 官方直连，首选源）
 pub fn get_dsh_download_url() -> Result<String, String> {
-    Ok(format!(
-        "{}{}",
-        dsh_core_base_url(),
-        dsh_pkg_asset_filename()?
-    ))
+    Ok(format!("{}{}", DSH_CORE_URL, dsh_pkg_asset_filename()?))
 }
 
 /// 为任意 GitHub Release 资产 URL 生成 ghfast.top 镜像兜底地址
@@ -101,7 +100,7 @@ pub fn mirror_download_url(asset_url: &str) -> String {
 /// `releases/download/<tag>/`，镜像/直连与平台文件名逻辑与最新版完全一致
 /// （GitHub 的 tag 下载路径是固定的 release 资产地址，可被确定性推导）。
 pub fn get_dsh_download_url_for_tag(tag: &str) -> Result<String, String> {
-    let base = dsh_core_base_url().replace(
+    let base = DSH_CORE_URL.replace(
         "releases/latest/download/",
         &format!("releases/download/{tag}/"),
     );
@@ -177,7 +176,7 @@ fn node_version_output(node: &Path) -> Option<std::process::Output> {
 }
 
 /// 获取指定 Node.js 二进制的版本号（例如 "22.22.0"）
-fn get_node_version_of(node: &Path) -> Option<String> {
+pub fn get_node_version_of_path(node: &Path) -> Option<String> {
     let output = node_version_output(node)?;
     if !output.status.success() {
         return None;
@@ -194,7 +193,7 @@ fn get_node_version_of(node: &Path) -> Option<String> {
 /// 检测本地是否存在版本兼容的 Node.js 环境，返回其二进制路径
 pub fn get_local_node_path() -> Option<PathBuf> {
     let node = find_local_node_binary()?;
-    let version = get_node_version_of(&node)?;
+    let version = get_node_version_of_path(&node)?;
     is_supported_node_version(&version).then_some(node)
 }
 
@@ -221,32 +220,26 @@ pub fn set_prefer_bundled_node_runtime(prefer: bool) {
 /// 已安装的捆绑运行时 node 二进制（未安装时返回 None）
 pub fn bundled_node_binary(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     let runtime_dir = get_node_install_path(app_handle);
-    // 使用 cfg 宏在编译时确定文件名
-    let (rel_path, bin_name) = if cfg!(windows) {
-        ("", "node.exe")
-    } else {
-        ("bin", "node")
-    };
-    let direct_path = runtime_dir.join(rel_path).join(bin_name);
+    let entry = dependencies::entry_relative(app_handle, dependencies::DEP_NODE);
+    let direct_path = runtime_dir.join(&entry);
     if direct_path.exists() {
-        Some(direct_path)
-    } else {
-        // 只有在直接路径不存在时才进行开销较大的递归搜索
-        search_node_binary(&runtime_dir, bin_name)
+        return Some(direct_path);
     }
+    // 只有在直接路径不存在时才进行开销较大的递归搜索（解压可能多套一层目录）
+    let bin_name = entry.file_name()?.to_string_lossy().into_owned();
+    search_node_binary(&runtime_dir, &bin_name)
 }
 
 /// Node.js 二进制路径
 ///
-/// 优先级：ABI 探测要求捆绑运行时（原生模块不匹配时的兜底）> 本地版本兼容的
-/// Node.js 环境 > 已安装的捆绑运行时
+/// 优先级：ABI 探测要求捆绑运行时（原生模块不匹配时的兜底）> 映射表（`null` =
+/// 系统环境 / 路径 = 指定根）> 未记录时沿用「本地版本兼容优先」> 已安装的捆绑运行时。
 pub fn get_node_binary_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let runtime_dir = get_node_install_path(app_handle);
-    let (rel_path, bin_name) = if cfg!(windows) {
-        ("", "node.exe")
-    } else {
-        ("bin", "node")
-    };
+    let target = runtime_dir.join(dependencies::entry_relative(
+        app_handle,
+        dependencies::DEP_NODE,
+    ));
     let bundled = bundled_node_binary(app_handle);
 
     if prefer_bundled_node_runtime() {
@@ -262,40 +255,48 @@ pub fn get_node_binary_path(app_handle: &tauri::AppHandle) -> PathBuf {
         );
     }
 
+    // 映射显式指定了托管根：该根下的运行时优先（缺失时才回落到系统环境）。
+    let pinned_managed = matches!(
+        dependencies::mapped(app_handle, dependencies::DEP_NODE),
+        Some(Some(_))
+    );
+    if pinned_managed {
+        if let Some(bundled) = bundled.clone() {
+            log::debug!("Using mapped Node.js runtime root: {}", bundled.display());
+            return bundled;
+        }
+    }
+
     if let Some(local_node) = get_local_node_path() {
         log::debug!("Using local Node.js: {}", local_node.display());
         return local_node;
     }
 
-    bundled.unwrap_or_else(|| runtime_dir.join(rel_path).join(bin_name))
+    bundled.unwrap_or(target)
 }
 
 pub fn get_node_install_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    get_base_dir(app_handle).join("runtime")
+    dependencies::active_root(app_handle, dependencies::DEP_NODE)
 }
 
 /// Harness 发行版安装目录
 pub fn get_dsh_install_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_base_dir(app_handle)
-        .join("dependencies")
-        .join(DSH_CORE_DIR)
+    dependencies::active_root(app_handle, dependencies::DEP_DSH)
 }
 
 /// dsh CLI 入口
 pub fn get_dsh_binary_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_dsh_install_path(app_handle).join(DSH_ENTRY_RELATIVE)
+    dependencies::binary_path(app_handle, dependencies::DEP_DSH)
 }
 
 /// pnpm 安装目录
 pub fn get_pnpm_install_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_base_dir(app_handle)
-        .join("dependencies")
-        .join(PNPM_CORE_DIR)
+    dependencies::active_root(app_handle, dependencies::DEP_PNPM)
 }
 
 /// 捆绑 pnpm CLI 入口（纯 JS 发行，用 node 运行）
 pub fn get_pnpm_binary_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_pnpm_install_path(app_handle).join(PNPM_ENTRY_RELATIVE)
+    dependencies::binary_path(app_handle, dependencies::DEP_PNPM)
 }
 
 /// pnpm 官方/镜像下载前缀：国内走 npmmirror registry，其他直连 npmjs.org
@@ -316,18 +317,19 @@ pub fn get_pnpm_download_url() -> String {
 }
 
 /// Windows 免安装 Git 的安装目录。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 Git 运行时探测使用
 pub fn get_mingit_install_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_base_dir(app_handle)
-        .join("dependencies")
-        .join(MINGIT_CORE_DIR)
+    dependencies::active_root(app_handle, dependencies::DEP_GIT)
 }
 
 /// Windows 免安装 Git 的 CLI 入口。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 Git 运行时探测使用
 pub fn get_mingit_binary_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_mingit_install_path(app_handle).join(MINGIT_ENTRY_RELATIVE)
+    dependencies::binary_path(app_handle, dependencies::DEP_GIT)
 }
 
 /// Windows MinGit 官方发行包文件名。
+#[cfg_attr(all(not(windows), not(test)), allow(dead_code))] // 仅 Windows 的 MinGit 任务与单测使用
 fn mingit_pkg_filename(arch: &str) -> Result<String, String> {
     match arch {
         "x86_64" => Ok(format!("MinGit-{MINGIT_VERSION}-64-bit.zip")),
@@ -337,6 +339,7 @@ fn mingit_pkg_filename(arch: &str) -> Result<String, String> {
 }
 
 /// Windows MinGit 官方发行包下载地址。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 MinGit 任务使用
 pub fn get_mingit_download_url() -> Result<String, String> {
     Ok(format!(
         "{MINGIT_BASE_URL}{}",
@@ -345,6 +348,7 @@ pub fn get_mingit_download_url() -> Result<String, String> {
 }
 
 /// Windows MinGit 官方发行包固定 SHA-256。
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 MinGit 任务使用
 pub fn get_mingit_sha256() -> Result<&'static str, String> {
     match env::consts::ARCH {
         "x86_64" => Ok(MINGIT_X64_SHA256),
@@ -428,9 +432,16 @@ pub fn get_git_cmd_dir<R: Runtime>(_app_handle: &AppHandle<R>) -> Option<PathBuf
 }
 
 /// 当前环境是否已有可供插件 Git 依赖使用的 Git。
+///
+/// 随包资源构建（离线安装包）只随包运行 dsh 必需的 Node / pnpm / 内核，不随包 MinGit：
+/// 启动 dsh 本身不需要 Git，而内网补装必然失败，把 Git 当成启动前置条件只会把应用卡在
+/// 安装界面（见 [`dependencies::bundled_core_dir`]）。git 托管的能力（worktree、
+/// `github:` 插件）在真正使用时给出明确失败。
 #[cfg(windows)]
 pub fn git_runtime_ready<R: Runtime>(app_handle: &AppHandle<R>) -> bool {
-    find_system_git_binary().is_some() || git_binary_works(&get_mingit_binary_path(app_handle))
+    find_system_git_binary().is_some()
+        || git_binary_works(&get_mingit_binary_path(app_handle))
+        || dependencies::bundled_core_dir(app_handle).is_some()
 }
 
 /// 非 Windows 平台不属于本次空白 Windows 环境的自动配置范围。
@@ -503,17 +514,12 @@ pub fn get_active_node_version() -> String {
     // 拉起的服务进程一致（否则用户看到的版本与日志里的运行时对不上）。
     if !prefer_bundled_node_runtime() {
         if let Some(local_node) = get_local_node_path() {
-            if let Some(version) = get_node_version_of(&local_node) {
+            if let Some(version) = get_node_version_of_path(&local_node) {
                 return version;
             }
         }
     }
     get_bundled_node_version()
-}
-
-/// 读取任意 node 二进制的版本号（诊断信息用，例如 "v25.8.2"）
-pub fn get_node_version_of_path(node: &Path) -> Option<String> {
-    get_node_version_of(node)
 }
 
 fn parse_node_version(output: &str) -> Option<(u64, u64, u64)> {

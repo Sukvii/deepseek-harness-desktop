@@ -26,14 +26,18 @@ pub const PNPM_SHA256: &str = "deafa7ec98a1218b6a047289b92fbe2395c1e22d3495bb711
 pub const PNPM_BASE_URL: &str = "https://registry.npmjs.org/pnpm/-/";
 
 /// Windows 空白环境使用的免安装 MinGit 版本。
+#[cfg_attr(all(not(windows), not(test)), allow(dead_code))] // 仅 Windows 的 MinGit 任务与单测使用
 pub const MINGIT_VERSION: &str = "2.53.0.2";
 /// MinGit x64 官方发行包 SHA-256。
+#[cfg_attr(all(not(windows), not(test)), allow(dead_code))] // 仅 Windows 的 MinGit 任务与单测使用
 pub const MINGIT_X64_SHA256: &str =
     "d4bf83d6a860ccae9af44e508e1e00a39f09db6fa78a9ba5543b94d87ca22a29";
 /// MinGit ARM64 官方发行包 SHA-256。
+#[cfg_attr(all(not(windows), not(test)), allow(dead_code))] // 仅 Windows 的 MinGit 任务与单测使用
 pub const MINGIT_ARM64_SHA256: &str =
     "842d50edc6bbcf39693e60a8ebb9dabb89b96b932b63aae12d218522b3e497f3";
 /// Git for Windows 官方发行资产地址前缀。
+#[cfg_attr(all(not(windows), not(test)), allow(dead_code))] // 仅 Windows 的 MinGit 任务与单测使用
 pub const MINGIT_BASE_URL: &str =
     "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/";
 
@@ -42,6 +46,11 @@ pub const PNPM_MIRROR_BASE_URL: &str = "https://registry.npmmirror.com/pnpm/-/";
 
 /// Harness 服务地址与默认端口
 pub const DSH_HOST: &str = "http://127.0.0.1";
+
+pub fn get_dsh_service_url(port: u16) -> String {
+    format!("{DSH_HOST}:{port}")
+}
+
 /// 生产（release）默认端口
 pub const DSH_PORT: u16 = 3080;
 /// 开发（debug）默认端口：与生产隔离，避免 `pnpm tauri dev` 与已安装桌面端
@@ -56,29 +65,21 @@ pub const DSH_HOME_DIR_NAME: &str = ".dsh";
 /// 同时运行时互不干扰，也不会互相污染对方的会话数据。
 pub const DSH_HOME_DEV_DIR_NAME: &str = ".dsh.dev";
 
+/// 应用标识符：`app_data_dir()` / `app_local_data_dir()` 的目录名，必须与
+/// `tauri.conf.json` 的 `identifier` 逐字一致（日志目录同样由它派生）。
+pub const APP_IDENTIFIER: &str = "dsh-tauri";
+
 /// 开发构建在 AppData 下使用的独立子目录。Node、Harness、pnpm、Git 等可执行
 /// 核心不应与 release 共用，否则开发版更新/切换核心会替换正在运行的生产文件。
 pub const APP_DATA_DEV_DIR_NAME: &str = "dev";
 
-/// 安装目录与 CLI 入口（相对安装目录）
-pub const DSH_CORE_DIR: &str = "dsh";
-pub const DSH_ENTRY_RELATIVE: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
+/// Harness 发行版清单文件名（相对安装根）。安装根、入口相对路径由
+/// `resources/manifest.jsonc` 的 `dependencies.dsh` 与 AppData 依赖映射表决定。
 pub const DSH_MANIFEST_RELATIVE: &str = "package.json";
 
-/// pnpm 安装目录与 CLI 入口（相对安装目录）
-pub const PNPM_CORE_DIR: &str = "pnpm";
-pub const PNPM_ENTRY_RELATIVE: &str = "bin/pnpm.cjs";
-
 /// 开发构建的用户级 shim 根目录名，不与 release 的 CLI 集成目录冲突。
-pub const CLI_ROOT_DEV_DIR_NAME: &str = "deepseek-harness-dev";
-
-/// Windows 免安装 Git 的安装目录与 CLI 入口（相对安装目录）。
-pub const MINGIT_CORE_DIR: &str = "git";
-pub const MINGIT_ENTRY_RELATIVE: &str = "cmd/git.exe";
-
-/// 旧版数据目录名：迁移前 $DSH_HOME 位于 `{app_data}/data/dsh`，
-/// 现仅用于 legacy 路径识别（见 service::migrate）。新 $DSH_HOME = 官方 `~/.dsh`。
-pub const DSH_DATA_DIR_NAME: &str = "dsh";
+#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 bin 目录计算使用
+pub const CLI_ROOT_DEV_DIR_NAME: &str = "dev-dsh";
 
 /// 简单 Store 持久化
 pub const STORE_DAT_FILE: &str = ".store.dat";
@@ -86,11 +87,55 @@ pub const STORE_DAT_FILE: &str = ".store.dat";
 /// active_core 等设置跨版本互写（生产默认 3080、开发默认 3081，共用一份
 /// store 会让两边端口一路漂移并相互污染状态）。
 pub const STORE_DAT_DEV_FILE: &str = ".store.dev.dat";
+/// E2E 构建的 Store 持久化文件名：与开发/生产三方隔离。
+///
+/// 测试跑的是 debug 二进制，若复用 `.store.dev.dat`，用例写入的窗口几何会覆盖
+/// 用户正在使用的开发版配置（且 `app_data_dir()` 由 `SHGetKnownFolderPath` 解析，
+/// 重定向 `APPDATA`/`USERPROFILE` 环境变量**无法**把它引到 scratch 目录）。
+pub const STORE_DAT_TEST_FILE: &str = ".store.test.dat";
+/// E2E 信号环境变量：与 `tauri-plugin-wdio-webdriver` 的门控同源——该插件只在
+/// 此变量存在时监听，应用也据此切到测试 Store，二者不会各走各的。
+pub const E2E_PORT_ENV_VAR: &str = "TAURI_WEBDRIVER_PORT";
+
+/// 下载缓存根的环境变量：覆盖 `<app-data>[/dev]` 这个基础目录。
+///
+/// 环境（Node/pnpm/Git）与核心都装在该根下。E2E 每次使用全新 scratch home，
+/// 若不覆盖就会反复重下；把它指向一个稳定目录即可让首次下载在后续运行中复用。
+pub const DOWNLOAD_CACHE_ENV_VAR: &str = "DSH_DOWNLOAD_CACHE_DIR";
+
+/// WebView2 用户数据目录的环境变量：仅在 E2E 运行中生效。
+///
+/// `app_local_data_dir()` 由 `SHGetKnownFolderPath` 解析，重定向 `LOCALAPPDATA`
+/// 无效，因此 debug 构建的 WebView2 profile（`EBWebView-dev`，内含 localStorage）
+/// 会与用户正在使用的开发版共用：E2E 写入的语言等前端状态会污染开发会话，用例
+/// 之间也会互相串。E2E 把它指向 scratch home 即可每次运行独占。
+pub const E2E_WEBVIEW_DATA_DIR_ENV_VAR: &str = "DSH_E2E_WEBVIEW_DATA_DIR";
 pub const STORE_SETTING_KEY: &str = "setting";
 /// Store 中记录主窗口几何（位置/大小/最大化）的键
 pub const STORE_WINDOW_STATE_KEY: &str = "window_state";
 /// Store 中记录桌宠（外置透明宠物窗口）几何（位置/大小）的键
 pub const STORE_PET_WINDOW_STATE_KEY: &str = "pet_window_state";
+/// Store 中记录「已下载、等待安装」的桌面端安装包路径的键。
+/// 刻意独立于 `setting` 键：`Setting` 会被前端整对象写回，该运行期标记
+/// 必须由 Rust 精确读写（见 service::update::pending）。
+pub const STORE_PENDING_INSTALLER_KEY: &str = "desktop_pending_installer";
 
 /// 健康检查超时
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod tests {
+    use super::get_dsh_service_url;
+
+    #[test]
+    fn service_url_preserves_loopback_origin_and_entire_port_range() {
+        for (port, expected) in [
+            (0, "http://127.0.0.1:0"),
+            (3080, "http://127.0.0.1:3080"),
+            (3081, "http://127.0.0.1:3081"),
+            (65535, "http://127.0.0.1:65535"),
+        ] {
+            assert_eq!(get_dsh_service_url(port), expected);
+        }
+    }
+}

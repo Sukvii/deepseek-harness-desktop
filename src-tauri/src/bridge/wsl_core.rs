@@ -28,10 +28,11 @@ pub async fn probe_wsl_core(distro: String) -> Result<WslCoreProbe, String> {
 /// 确保发行版内装好 dsh 并打 `--skip-auth` 补丁，返回最新探测结果；进度经
 /// `install-progress` 事件逐行转发。
 ///
-/// `version_spec` 缺省 = 桌面端推荐版本（`version-recommend.json`，D-W5R-2）：
-/// WSL 核心与桌面核心共用同一份权威清单，缺失/无效时明确报错、**绝不回退
-/// latest**（latest 可能是桌面端自己标记为 above-recommended 的预览版，装上后
-/// 客户端资源不兼容——W5-R 验收实测 0.2.0-rc.2 的 client bundle 404）。
+/// `version_spec` 缺省 = 清单 `engines.dsh.wslRecommend` 的 WSL 独立推荐基线
+/// （U1：与桌面推荐值解耦，桌面升级不再移动 WSL）：缺失/无效时明确报错、
+/// **绝不回退 latest**（latest 可能是桌面端自己标记为 above-recommended 的
+/// 预览版，装上后客户端资源不兼容——W5-R 验收实测 0.2.0-rc.2 的 client bundle
+/// 404）。
 #[tauri::command]
 pub async fn install_wsl_core(
     app_handle: AppHandle,
@@ -44,6 +45,15 @@ pub async fn install_wsl_core(
         None => wsl_core::install::default_version_spec(&app_handle)?,
     };
     wsl_core::install::ensure(&app_handle, &distro, &spec).await
+}
+
+/// 读取 WSL 核心的独立推荐版本（清单 `engines.dsh.wslRecommend`，U1）。
+///
+/// 未选择发行版时拿不到 WSL 核心行，面板的安装确认框用它展示默认目标；
+/// 缺失 / 无效时返回错误，前端禁用安装而不是兜底硬编码版本。
+#[tauri::command]
+pub fn get_wsl_recommended_version(app_handle: AppHandle) -> Result<String, String> {
+    crate::service::wsl_core::install::default_version_spec(&app_handle)
 }
 
 /// 把 Windows 侧 `~/.dsh[.dev]` 的 `DEEPSEEK_API_KEY` 导入发行版内的凭据文件

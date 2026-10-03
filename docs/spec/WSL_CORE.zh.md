@@ -54,10 +54,23 @@ WSL 核心与 Windows 核心的数据目录**互不迁移**：切换核心来源
 
 任何一步失败都不会破坏正在使用的运行时：候选失败直接丢弃；切换后启动失败自动回滚到旧运行时（失败树保留便于排查）。请求的版本**缺少资源时停止安装**——不存在无锁的 `npm install` 后备路径（`^` 范围会解析出无法在 `patchReload: "live"` 下启动的依赖组合）。
 
+## 独立版本与推荐基线
+
+WSL 核心的版本由**独立字段**描述，不与 Windows 内核的推荐值/最低基线混用：
+
+| 字段（`src-tauri/resources/manifest.jsonc` → `engines.dsh`） | 含义 | 当前值 |
+| --- | --- | --- |
+| `wslRecommend` | WSL 核心的推荐基线：安装/更新确认框的缺省目标版本，也是判断 WSL 行「高于推荐」的基准 | `0.1.2-rc.1` |
+| `recommend` | Windows 内核的推荐版本 | `0.2.0-rc.2` |
+| `minimum` | Windows 内核的最低支持基线（`MIN_SUPPORTED_CORE_VERSION`） | `0.1.5-rc.1` |
+
+判据落在两处：Rust 侧 `src-tauri/src/config/manifest.rs` 的 `engines.dsh.wslRecommend`（缺字段时为空串，由 `validated_recommendation` 兜底），经 `get_wsl_recommended_version` 命令下发；前端 `src/config/query-keys.ts` 的 `wslRecommendedVersion` 查询与 `src/ui/config/wsl-core.tsx` 使用它。**Windows 内核的推荐值变化不会影响 WSL 行的推荐与「高于推荐」判定**，反之亦然。当前随安装包分发的受控 runtime 只有 `0.1.2-rc.1` 一份资源（见上节）。
+
 ## 已知限制
 
 1. **内置插件缺席**。内置插件（DSH Tauri 系列）只为 Windows 侧档案注入；WSL 核心使用独立的 Linux 数据目录与插件解析根，注入既不生效也不参与启动。设置页对依赖内置插件的操作会给出「WSL 核心不支持」提示。
 2. **网络模式**。WSL 的 Mirrored 与 NAT 两种网络模式均已实测：桌面壳从 Windows 侧通过 `127.0.0.1:<端口>` 访问 Linux 内服务，两种模式都可达（NAT 模式依赖 Windows 的 localhost 转发）。端口占用检测与避让始终在 Linux 侧完成。
-3. **需要自备 Node ≥ 20**。应用不在发行版内做系统级安装：WSL 发行版内需有可用的 Node（≥ 20），否则核心探测会明确报告缺失并停止。
+3. **需要自备 Node ≥ 20**。应用不在发行版内做系统级安装：WSL 发行版内需有可用的 Node，应用只校验**主版本 ≥ 20**（`src-tauri/src/service/wsl_core/install.rs` 的 `MIN_NODE_MAJOR`），否则核心探测会明确报告缺失（`WSL_NODE_MISSING` / `WSL_NODE_TOO_OLD`）并停止。
+   WSL 内的 Node 与桌面侧**内嵌 Node 是两套东西**：桌面下载并管理的 Node 版本由 `src-tauri/src/config/constants.rs` 的 `NODE_VERSION`（当前 `v22.22.0`）与清单 `engines.node.version`（`>=22.22.0`）约束，只用于 Windows 侧；WSL 核心不嵌入、不共享该运行时。
 4. **`--skip-auth` 补丁随 dsh 升级需重打**。该补丁让 dsh 在本地回环下跳过登录检查，锚定 dsh 的源码结构；dsh 版本升级后补丁锚点可能变化。应用会在候选 runtime 上自动重打并验证，补丁缺失或失败时不会切换。
 5. **首次安装需要网络**。候选 `npm ci` 需要访问 npm registry；离线时安装失败并保持现状（不影响已安装的运行时）。

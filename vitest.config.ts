@@ -1,20 +1,32 @@
 import { defineConfig } from 'vitest/config'
+import { SHARED_ALIAS } from './tooling.config'
 
-/**
- * 根测试配置：运行内置插件（packages/**）及 toast 生命周期回归测试，限制并发 worker 数与放宽超时。
- *
- * 仓库根还 vendored 了 dsh 核心源码（src/、source/、test/），其测试依赖 dsh 核心
- * 的 `@/` paths 解析（在插件 workspace 的 vitest 下不可用），故 exclude 出本范围。
- *
- * dsh-tauri-worktree 的 operation.test 会创建真实 git 仓库（clone/checkout/
- * discard），全量并行（默认 cpu-1 个 worker）时与其他文件的 git 操作竞争系统
- * 资源，偶发 5s 超时 flake；限制 maxWorkers 后单独复跑稳定通过。
- */
 export default defineConfig({
+  // 与 vite.config.ts 保持一致：src 内部统一用 `@/` 别名。
+  resolve: {
+    alias: SHARED_ALIAS,
+  },
   test: {
-    include: ['packages/**/*.{test,spec}.{ts,tsx,js,mjs,cjs}', 'test/toast.test.ts'],
-    maxWorkers: 4,
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    projects: [
+      './vitest.unit.config.ts',
+      './vitest.plugin.config.ts',
+      './vitest.desktop.config.ts',
+    ],
+    // 覆盖率只作可见性报告：不设 `thresholds`、不作为 CI 门禁。vendored 源码（`source/`、
+    // `archive/`、`test/archive/`）与 Rust 侧（`src-tauri/`）不是本仓被测面，必须显式排除，
+    // 否则报告数字没有意义。`coverage` 只能在根配置生效——project 级的同名字段会被忽略。
+    coverage: {
+      provider: 'v8',
+      exclude: [
+        '**/node_modules/**',
+        '**/dist/**',
+        '**/.{idea,git,cache,output,temp}/**',
+        '**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*',
+        'source/**',
+        'archive/**',
+        'test/archive/**',
+        'src-tauri/**',
+      ],
+    },
   },
 })

@@ -1,7 +1,10 @@
 //! shim 共享脚本片段（纯文本常量，作为 format! 的参数嵌入各构建函数）。
 //!
 //! shim 文本必须全英文：cmd/ps1 按系统代码页解析，中文注释会乱码成命令执行。
-//! 变量约定：cmd 用 `%APP_DIR%`，ps1 用 `$appDir`，sh 用 `$APP_DIR`；
+//! 变量约定：cmd 用 `%NODE_BIN%` / `%NODE_DIR%` / `%GIT_DIR%` / `%DSH_BIN%` /
+//! `%PNPM_BIN%`，ps1 用 `$nodeBin` / `$nodeDir` / `$gitDir` / `$dshBin` /
+//! `$pnpmBin`，sh 用同名大写下划线形式。路径全部由桌面端在生成 shim 时按
+//! 依赖映射表解析后写死（不再假设 `<AppData>/dependencies/<name>` 布局）；
 //! 这些常量里的 `{`/`}` 是字面量（由 format! 的参数占位符区分）。
 
 // ---------------------------------------------------------------------------
@@ -49,9 +52,9 @@ set "NODE=%DSH_NODE%"
 goto :launch
 
 :use_bundled
-if not exist "%APP_DIR%\runtime\node.exe" goto :no_node
-set "NODE=%APP_DIR%\runtime\node.exe"
-set "PATH=%APP_DIR%\runtime;%PATH%"
+if not exist "%NODE_BIN%" goto :no_node
+set "NODE=%NODE_BIN%"
+set "PATH=%NODE_DIR%;%PATH%"
 "#;
 
 pub(super) const PS1_NODE_RESOLVE: &str = r#"
@@ -82,10 +85,9 @@ if (-not $node) {
     }
 }
 if (-not $node) {
-    $bundled = Join-Path $appDir 'runtime\node.exe'
-    if (Test-Path -LiteralPath $bundled) {
-        $node = $bundled
-        $env:PATH = (Split-Path -Parent $bundled) + ';' + $env:PATH
+    if (Test-Path -LiteralPath $nodeBin) {
+        $node = $nodeBin
+        $env:PATH = $nodeDir + ';' + $env:PATH
     }
 }
 if (-not $node) {
@@ -114,9 +116,9 @@ if [ -z "$NODE" ] && command -v node >/dev/null 2>&1; then
   fi
 fi
 if [ -z "$NODE" ]; then
-  if [ -x "$APP_DIR/runtime/bin/node" ]; then
-    NODE="$APP_DIR/runtime/bin/node"
-    export PATH="$APP_DIR/runtime/bin:$PATH"
+  if [ -x "$NODE_BIN" ]; then
+    NODE="$NODE_BIN"
+    export PATH="$NODE_DIR:$PATH"
   fi
 fi
 if [ -z "$NODE" ]; then
@@ -177,20 +179,121 @@ if ($userDsh) {
 }
 "#;
 
-#[cfg_attr(windows, allow(dead_code))] // 仅 Unix shim 使用
-#[cfg_attr(debug_assertions, allow(dead_code))]
+#[cfg_attr(any(windows, debug_assertions), allow(dead_code))] // 仅 Unix shim 使用
 pub(super) const SH_USER_DSH_PRECEDENCE: &str = r#"
 # Prefer a user-installed dsh on PATH (skip our own shim dir), fall back to bundled.
 # This preserves your own dsh binary and its $DSH_HOME config; nothing is overwritten.
-SELF_DIR=$(cd "$(dirname "$0")" && pwd)
-IFS=:
-for dir in $PATH; do
-  if [ "$dir" = "$SELF_DIR" ]; then
+remaining_path=${PATH-}:
+while [ -n "$remaining_path" ]; do
+  dir=${remaining_path%%:*}
+  remaining_path=${remaining_path#*:}
+  dir=${dir:-.}
+  if [ "$dir/dsh" -ef "$0" ]; then
     continue
   fi
   if [ -x "$dir/dsh" ]; then
     exec "$dir/dsh" "$@"
   fi
 done
-unset IFS
+unset remaining_path
 "#;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::SH_USER_DSH_PRECEDENCE;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dsh_shim_skips_aliases_and_preserves_user_command_arguments_and_status() {
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "dsh-shim-alias-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        let root = &scratch.0;
+        let bin = root.join("shim bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("dsh");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\n{SH_USER_DSH_PRECEDENCE}\nprintf 'FALLBACK\\n'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = root.join("alias");
+        symlink(&bin, &alias).unwrap();
+        let file_alias = root.join("file-alias");
+        std::fs::create_dir_all(&file_alias).unwrap();
+        symlink(&shim, file_alias.join("dsh")).unwrap();
+        let hard_link = root.join("hard-link");
+        std::fs::create_dir_all(&hard_link).unwrap();
+        std::fs::hard_link(&shim, hard_link.join("dsh")).unwrap();
+
+        for prefix in [
+            bin.display().to_string(),
+            format!("{}/", bin.display()),
+            format!("{}:{}", bin.display(), alias.display()),
+            file_alias.display().to_string(),
+            hard_link.display().to_string(),
+            ".".into(),
+            String::new(),
+        ] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::process::Command::new(&shim)
+                    .current_dir(&bin)
+                    .env_clear()
+                    .env("PATH", format!("{prefix}:{}", root.join("missing").display()))
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("shim must not re-execute itself")
+            .unwrap();
+            assert!(output.status.success(), "PATH prefix: {prefix}");
+            assert_eq!(output.stdout, b"FALLBACK\n", "PATH prefix: {prefix}");
+        }
+
+        let user_bin = root.join("user[bin]");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        let user_dsh = user_bin.join("dsh");
+        std::fs::write(&user_dsh, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n").unwrap();
+        std::fs::set_permissions(&user_dsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let decoy = root.join("userb");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let decoy_dsh = decoy.join("dsh");
+        std::fs::write(&decoy_dsh, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&decoy_dsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for path in [
+            format!("{}:{}", bin.display(), user_bin.display()),
+            format!("{}:", root.join("missing").display()),
+            String::new(),
+        ] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::process::Command::new(&shim)
+                    .current_dir(&user_bin)
+                    .env_clear()
+                    .env("PATH", &path)
+                    .args(["two words", "*"])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("user command must finish")
+            .unwrap();
+            assert_eq!(output.status.code(), Some(7), "PATH: {path}");
+            assert_eq!(output.stdout, b"two words\n*\n", "PATH: {path}");
+        }
+    }
+}

@@ -7,7 +7,7 @@
 //! WebKitGTK（Linux）上不存在，导致桌面 WebView 抛出
 //! `AbortSignal.any is not a function. (In '...', 'AbortSignal.any' is undefined)`。
 //!
-//! 本脚本与 [`crate::desktop::nav::NAV_SHIM_JS`] / [`crate::desktop::style::IFRAME_STYLES_JS`]
+//! 本脚本与 [`crate::desktop::notification::NOTIFICATION_SHIM_JS`] / [`crate::desktop::paste::PASTE_SHIM_JS`]
 //! 走同一套注入通道（Windows 在 FrameCreated → ContentLoading 时 ExecuteScript，
 //! 其余平台 `initialization_script_for_all_frames`），在 dsh 页面脚本执行之前
 //! 就位，因此主机框架与 iframe 每次重新加载都会自动重建。
@@ -74,3 +74,24 @@ pub(crate) const ABORT_SIGNAL_ANY_SHIM_JS: &str = r#"(function () {
     } catch (_ignored) { /* 保留原生未定义的现状 */ }
   }
 })();"#;
+
+/// 注入 ES2025 iterator helpers 垫片（`Iterator` / `Iterator.prototype.*`，issue #539）。
+///
+/// 背景：dsh 内置插件 `dsh-client-ui-sidebar-documentpreview` 内联的 pdf.js 在模块顶层
+/// 读取 `Iterator.prototype.join`；`Iterator` 是 Safari 18.4 / WebKit 2163 才引入的全局对象，
+/// macOS 14 / 15.3 随附的系统 WebKit 缺失时插件 import 直接抛
+/// `Can't find variable: Iterator`，桌面端启动即报 “Failed to load plugins”。
+/// 修法只能是壳层补齐——该插件是 dsh 的上游 npm 产物，桌面端无法重建其构建目标。
+///
+/// 与 [`ABORT_SIGNAL_ANY_SHIM_JS`] 走同一套注入通道（Windows 在 FrameCreated →
+/// ContentLoading 时 ExecuteScript，其余平台 `initialization_script_for_all_frames`），
+/// 在页面脚本执行之前就位，主机框架与 iframe 每次重新加载都会自动重建。
+///
+/// 脚本本体放在 `compat_iterator.js.inc`：这一份体积远大于 `AbortSignal.any`，
+/// 且 `test/compat-iterator.test.ts` 需要直接读文件、在 VM 里删掉原生 `Iterator`
+/// 后做差分验证，单列文件比 Rust 字符串字面量更便于测试与阅读。
+///
+/// 仅在非 Windows 平台注入：Windows 用 WebView2（常青 Chromium ≥ 122）原生支持
+/// iterator helpers，故该常量不参与 Windows 构建（与 `AbortSignal.any` 的理由一致）。
+#[cfg(not(windows))]
+pub(crate) const ITERATOR_HELPERS_SHIM_JS: &str = include_str!("compat_iterator.js.inc");

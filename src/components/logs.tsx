@@ -2,11 +2,11 @@ import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { cn } from 'tailwind-variants'
-import { formatLogLine } from '@/utils/log'
+import { formatLogLine } from './logs.utils'
 
 /**
  * 日志面板：带边框的「› + 行」日志容器 + 空日志占位。
- * 供 panel-progress 与 preinstall-setup 的日志控制台共用；
+ * 供 `Panel.Progress` 与 setup-preinstall 的日志控制台共用；
  * 顶部可选 header（如复制按钮）。
  */
 export interface LogsProps {
@@ -39,7 +39,7 @@ export function Logs({ logs, limit = 100, header, className, bodyClassName }: Lo
             // 日志行内容可能重复，需以 index 区分 key
             // eslint-disable-next-line react/no-array-index-key
             <p key={`${line}-${index}`} className="m-0 flex gap-2 overflow-hidden text-ellipsis whitespace-nowrap text-log-ink">
-              <span className="shrink-0 text-accent select-none">›</span>
+              <span className="shrink-0 text-info select-none">›</span>
               <span className="min-w-0 overflow-hidden text-ellipsis">{formatLogLine(line)}</span>
             </p>
           ))}

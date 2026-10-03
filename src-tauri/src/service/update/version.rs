@@ -1,7 +1,7 @@
 //! 版本比较与当前平台安装包资产选择。
 //!
-//! 纯函数：不触网、不依赖运行时状态（仅 `linux_package_family` 探测包管理家族），
-//! 均为 `更新` 模块内其它部分的判定基础。
+//! 除 `linux_package_family`（包管理家族）与 `host_is_aarch64`（宿主 CPU）两处只读
+//! 探测外不触网、不依赖可变运行时状态，均为 `更新` 模块内其它部分的判定基础。
 
 use semver::Version;
 
@@ -37,19 +37,67 @@ pub(super) fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// 宿主 CPU 是否为 aarch64（运行时判定，与编译目标架构解耦）。
+///
+/// `#[cfg(target_arch)]` 描述的是**编译目标**而非宿主 CPU：Intel 版应用在 Apple
+/// Silicon 上经 Rosetta 运行时编译目标仍是 x86_64，会持续给 M 系列芯片用户下载
+/// Intel 安装包（issue #576）。macOS 因此必须运行时探测宿主。
+#[cfg(target_os = "macos")]
+fn host_is_aarch64() -> bool {
+    // 编译目标已是 aarch64 ⇒ 该二进制无法在 Intel Mac 上运行，宿主必为 Apple Silicon
+    cfg!(target_arch = "aarch64") || apple_silicon_host()
+}
+
+/// 非 macOS 平台的宿主架构仍按编译目标判定（安装包与二进制同架构分发）。
+#[cfg(not(target_os = "macos"))]
+fn host_is_aarch64() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
+/// 探测 macOS 宿主是否为 Apple Silicon。
+///
+/// `sysctl hw.optional.arm64` 在 Apple Silicon 上为 `1`（Rosetta 转译下同样为 `1`），
+/// Intel Mac 上该 OID 不存在、查询失败。结果缓存，避免反复打开进程挑选资产。
+#[cfg(target_os = "macos")]
+fn apple_silicon_host() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let mut value: i32 = 0;
+        let mut size = std::mem::size_of::<i32>();
+        let name = b"hw.optional.arm64\0";
+        // SAFETY: 只读查询单个 i32 sysctl，指针与长度均指向本函数栈上的变量
+        let code = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr() as *const libc::c_char,
+                &mut value as *mut i32 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        code == 0 && value == 1
+    })
+}
+
 /// 根据资产文件名判断其架构匹配度，用于同扩展名下挑选正确架构的安装包：
-/// - `2`：与当前运行架构完全匹配（如 `_x64.dmg` / `_aarch64.dmg` / `_amd64.deb`）
+/// - `2`：与宿主架构完全匹配（如 `_x64.dmg` / `_aarch64.dmg` / `_amd64.deb`）
 /// - `1`：通用包（`universal`），任何架构都可用
 /// - `0`：不匹配或文件名未携带架构信息（作为兜底仍可尝试）
 fn arch_rank(name: &str) -> i8 {
+    arch_rank_for(name, host_is_aarch64())
+}
+
+/// 架构匹配度判定；宿主架构由参数给出，两种宿主都能在任意 CI 平台覆盖。
+fn arch_rank_for(name: &str, host_aarch64: bool) -> i8 {
     let lower = name.to_lowercase();
     if lower.contains("universal") {
         return 1;
     }
-    #[cfg(target_arch = "aarch64")]
-    let markers = ["aarch64", "arm64", "apple-silicon", "-arm", "_arm"];
-    #[cfg(target_arch = "x86_64")]
-    let markers = ["x86_64", "amd64", "x64", "intel", "-x86", "_x86"];
+    let markers: &[&str] = if host_aarch64 {
+        &["aarch64", "arm64", "apple-silicon", "-arm", "_arm"]
+    } else {
+        &["x86_64", "amd64", "x64", "intel", "-x86", "_x86"]
+    };
     if markers.iter().any(|k| lower.contains(k)) {
         2
     } else {
@@ -203,28 +251,52 @@ mod tests {
         assert!(pick_asset(&[]).is_none());
     }
 
+    /// 架构匹配度按**宿主 CPU** 判定而非编译目标：issue #576 现场是 Intel 版应用在
+    /// Apple Silicon 上（Rosetta）一直挑到 Intel 安装包。宿主由参数驱动，任意 CI
+    /// 平台都能覆盖两种宿主。
     #[test]
-    fn arch_rank_matches_host_and_universal() {
+    fn arch_rank_for_matches_host_and_universal() {
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop_0.15.3_aarch64.dmg", true),
+            2
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop_0.15.3_x64.dmg", true),
+            0
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop_0.15.3_x64.dmg", false),
+            2
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop_0.15.3_aarch64.dmg", false),
+            0
+        );
+        // Linux / 其它命名同样按宿主判定
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop_0.15.3_amd64.AppImage", false),
+            2
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop-0.15.3-1.x86_64.rpm", false),
+            2
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop-0.15.3-1.aarch64.rpm", true),
+            2
+        );
         // 通用包任何架构都可用
-        assert_eq!(arch_rank("Deepseek.Harness.Desktop-universal.dmg"), 1);
-        // 按编译目标分支断言，保证 CI 在任意架构上都能通过
-        #[cfg(target_arch = "aarch64")]
-        {
-            assert_eq!(arch_rank("Deepseek.Harness.Desktop_0.6.6_aarch64.dmg"), 2);
-            assert_eq!(arch_rank("Deepseek.Harness.Desktop_0.6.6_x64.dmg"), 0);
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            assert_eq!(arch_rank("Deepseek.Harness.Desktop_0.6.6_x64.dmg"), 2);
-            assert_eq!(
-                arch_rank("Deepseek.Harness.Desktop_0.6.6_amd64.AppImage"),
-                2
-            );
-            assert_eq!(arch_rank("Deepseek.Harness.Desktop-0.6.6-1.x86_64.rpm"), 2);
-            assert_eq!(arch_rank("Deepseek.Harness.Desktop_0.6.6_aarch64.dmg"), 0);
-        }
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop-universal.dmg", true),
+            1
+        );
+        assert_eq!(
+            arch_rank_for("Deepseek.Harness.Desktop-universal.dmg", false),
+            1
+        );
         // 未携带架构信息的文件名作为兜底（0）
-        assert_eq!(arch_rank("app.dmg"), 0);
+        assert_eq!(arch_rank_for("app.dmg", true), 0);
+        assert_eq!(arch_rank_for("app.dmg", false), 0);
     }
 
     /// Linux 资产优先级：包管理家族决定原生格式最优先（issue #79），未知家族落回 deb。
@@ -260,30 +332,27 @@ mod tests {
         );
     }
 
+    /// macOS 上 aarch64 二进制不可能跑在 Intel Mac 上 ⇒ 宿主判定必为 Apple Silicon，
+    /// 这也是 Rosetta 场景（Intel 版应用 + M 芯片）能自愈的基础。
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn host_arch_is_apple_silicon_for_aarch64_build() {
+        assert!(host_is_aarch64());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn pick_asset_prefers_host_arch_dmg() {
         let mk = |name: &str| name.to_string();
-        // aarch64 与 x64 并存（与真实发布资产命名一致）：选当前架构匹配的包
-        let assets: Vec<String> = vec![
-            mk("Deepseek.Harness.Desktop_0.6.6_aarch64.dmg"),
-            mk("Deepseek.Harness.Desktop_0.6.6_x64.dmg"),
-        ];
-        let picked = pick_asset(&assets).unwrap();
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(picked, "Deepseek.Harness.Desktop_0.6.6_aarch64.dmg");
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(picked, "Deepseek.Harness.Desktop_0.6.6_x64.dmg");
-        // 通用包优于与本机架构不匹配的包（用「非本机架构」的名字构造，任意架构成立）
-        #[cfg(target_arch = "aarch64")]
-        let wrong = "Deepseek.Harness.Desktop_0.6.6_x64.dmg";
-        #[cfg(target_arch = "x86_64")]
-        let wrong = "Deepseek.Harness.Desktop_0.6.6_aarch64.dmg";
-        let assets: Vec<String> = vec![
-            wrong.to_string(),
-            "Deepseek.Harness.Desktop_0.6.6-universal.dmg".to_string(),
-        ];
-        let picked = pick_asset(&assets).unwrap();
-        assert_eq!(picked, "Deepseek.Harness.Desktop_0.6.6-universal.dmg");
+        let aarch64 = "Deepseek.Harness.Desktop_0.6.6_aarch64.dmg";
+        let x64 = "Deepseek.Harness.Desktop_0.6.6_x64.dmg";
+        let universal = "Deepseek.Harness.Desktop_0.6.6-universal.dmg";
+        // aarch64 与 x64 并存（与真实发布资产命名一致）：选与宿主 CPU 匹配的包
+        let picked = pick_asset(&[mk(aarch64), mk(x64)]).unwrap();
+        assert_eq!(picked, if host_is_aarch64() { aarch64 } else { x64 });
+        // 通用包优于与宿主不匹配的包
+        let wrong = if host_is_aarch64() { x64 } else { aarch64 };
+        let picked = pick_asset(&[mk(wrong), mk(universal)]).unwrap();
+        assert_eq!(picked, universal);
     }
 }

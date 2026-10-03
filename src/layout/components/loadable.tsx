@@ -1,7 +1,7 @@
 import type { ComponentType, ReactNode, SVGProps } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
-import { PanelProgress } from '@/components/panel-progress'
+import { Panel } from '@/components/panel'
 import { button } from '@/components/primitives'
 
 /** 图标组件类型（@gravity-ui/icons 均为 SVG 组件） */
@@ -34,6 +34,8 @@ export interface LoadableProps {
   errorMsg?: string
   /** 失败态时的重试按钮回调 */
   onRetry?: () => void
+  /** 根节点 `data-testid`（E2E 定位用；不传则不渲染该属性） */
+  testId?: string
   /** 附加内容，渲染在提示文字之后 */
   children?: ReactNode
 }
@@ -46,6 +48,7 @@ export function Loadable({
   logs,
   errorMsg,
   onRetry,
+  testId,
   children,
 }: LoadableProps) {
   const { t } = useTranslation()
@@ -56,8 +59,8 @@ export function Loadable({
   const showPanel = hasLogs || percentage != null
 
   return (
-    <div className="flex h-full items-center justify-center bg-load-bg -mt-[1px]">
-      <div className="flex w-[min(460px,88vw)] flex-col items-center gap-4 text-center">
+    <div className="flex h-full items-center justify-center bg-load-bg w-full" data-testid={testId}>
+      <div className="flex w-[min(460px,88vw)] flex-col items-center gap-4 text-center -mt-[1px]">
         {/* 加载态显示 spinner 时隐藏图标（官方 boot 页即无图标），避免与 spinner 重复突兀；仅失败态显示 */}
         {/* 加载态显示 spinner 时隐藏图标（官方 boot 页即无图标），避免与 spinner 重复突兀；仅失败态显示 */}
         <If cond={error && Icon != null}>
@@ -90,7 +93,7 @@ export function Loadable({
 
         <If cond={showPanel}>
           <div className="flex w-full flex-col gap-4">
-            <PanelProgress percentage={percentage} logs={logs} />
+            <Panel.Progress percentage={percentage} logs={logs} />
           </div>
         </If>
 

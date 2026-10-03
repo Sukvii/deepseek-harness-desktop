@@ -4,7 +4,7 @@
  * 默认 node 环境（无 jsdom），用轻量替身 stub DOM 全局（DataTransfer /
  * ClipboardEvent / InputEvent / document / getSelection）模拟三态元素与
  * contenteditable 编辑器接管行为，验证 pasteInto 的逐级回退阶梯：
- * 合成 paste 事件 → execCommand('insertText') → 原 DOM 写入。
+ * 合成 paste 事件（preventDefault / 同步写入视为接管）→ execCommand('insertText') → 原 DOM 写入。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -162,6 +162,25 @@ describe('pasteInto — contenteditable', () => {
     expect(execCommand).not.toHaveBeenCalled()
   })
 
+  it('接收方 preventDefault 但 DOM 异步更新（ProseMirror 竞态）：不触发兜底插入', () => {
+    stubContentEditableGlobals()
+    const execCommand = vi.fn(() => true)
+    vi.stubGlobal('document', { execCommand })
+    const stub = contentEditableStub('ab')
+    // 模拟内核粘贴命令：preventDefault + 异步写模型，同步 textContent 仍是旧值。
+    // 修复前会被误判“没插入”而走 execCommand 兜底 → 右键粘贴重复两次。
+    stub.dispatchEvent = vi.fn((event: FakeClipboardEvent) => {
+      stub.received.push(event)
+      event.preventDefault()
+      return false
+    })
+
+    expect(() => pasteInto(stub as unknown as HTMLElement, 'X')).not.toThrow()
+
+    expect(stub.textContent).toBe('ab')
+    expect(execCommand).not.toHaveBeenCalled()
+  })
+
   it('编辑器未接管（内容未变化）时回退 execCommand(\'insertText\')', () => {
     stubContentEditableGlobals()
     const execCommand = vi.fn(() => true)
@@ -174,12 +193,12 @@ describe('pasteInto — contenteditable', () => {
     expect(execCommand).toHaveBeenCalledWith('insertText', false, 'X')
   })
 
-  it('execCommand 也失败时退回原 DOM 写入（选区未知则抛 editPositionUnknown）', () => {
+  it('execCommand 也失败时退回原 DOM 写入（选区未知则返回 false）', () => {
     stubContentEditableGlobals()
     vi.stubGlobal('document', { execCommand: vi.fn(() => false) })
     vi.stubGlobal('getSelection', () => ({ rangeCount: 0 }))
     const stub = contentEditableStub('ab')
 
-    expect(() => pasteInto(stub as unknown as HTMLElement, 'X')).toThrow('Could not determine the editing position')
+    expect(pasteInto(stub as unknown as HTMLElement, 'X')).toBe(false)
   })
 })

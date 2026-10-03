@@ -1,8 +1,8 @@
-/// <reference types="vitest" />
 import process from 'node:process'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
+import { SHARED_ALIAS } from './tooling.config'
 
 const host = process.env.TAURI_DEV_HOST
 
@@ -28,9 +28,7 @@ export default defineConfig(async () => ({
   },
 
   resolve: {
-    alias: {
-      '@': '/src',
-    },
+    alias: SHARED_ALIAS,
   },
 
   // Vite options tailored for Tauri development.
@@ -52,14 +50,5 @@ export default defineConfig(async () => ({
       // 3. tell vite to ignore watching `src-tauri`
       ignored: ['**/src-tauri/**'],
     },
-  },
-
-  // Vitest 只跑工作区包、应用自有状态机与根 test（不含 source/* 参考子模块）。
-  test: {
-    include: [
-      'packages/**/*.{test,spec}.?(c|m)[jt]s?(x)',
-      'src/**/*.{test,spec}.?(c|m)[jt]s?(x)',
-      'test/**/*.{test,spec}.?(c|m)[jt]s?(x)',
-    ],
   },
 }))

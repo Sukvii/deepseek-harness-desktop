@@ -1,25 +1,30 @@
 /**
- * 错误上报桥（iframe 内 → 桌面宿主）。
+ * utils/error.ts — 插件运行期错误上报桥（iframe → 桌面宿主）。
  *
- * 与桌面端 `use-iframe-shim.ts` 的协议逐字一致 —— 宿主只接受完全匹配的 key，
- * 任何一处不一致都会被静默丢弃：
+ * 协议与宿主入站桥 `src/layout/components/iframe.tsx` 的 `dsh://plugin-error` 分支逐字一致：
  *
- *   { source: 'dsh-plugin-error-bridge', type: 'dsh://plugin-error', id, error, action }
+ *   { type: 'dsh://plugin-error', id, error, action }
  *
- * 宿主收到后经 `report_plugin_error` 持久化到插件错误注册表
- * （plugin-errors.json，按插件 id 幂等覆盖并推送新列表），「插件」面板据此
- * 给本插件显示 danger 标记与更新/卸载入口。
+ * 宿主收到后经 `report_plugin_error` 持久化到插件错误注册表（`plugin-errors.json`，
+ * 按插件 id 幂等覆盖），「插件」面板据此给本插件显示 danger 标记与修复入口。
  */
-import type { ErrorAction } from '../types'
-import { ERROR_SRC, ERROR_TYPE, PLUGIN_ID } from '../constants'
+import type { ErrorAction, ParentMessage } from '../types'
+import { PLUGIN_ID } from '../constants'
+import { invokeParent } from '../service/invoke-parent'
 
-export { ERROR_SRC, ERROR_TYPE, PLUGIN_ID } from '../constants'
+/** iframe → 宿主：插件运行期错误上报（宿主持久化到 `plugin-errors.json`）。 */
+const ERROR_TYPE = 'dsh://plugin-error'
+
 export type { ErrorAction } from '../types'
 
 /**
  * 上报插件运行期错误到宿主。
- * @param error 错误对象/消息（宿主截断保留 2000 字符）
- * @param action 记录动作，默认 runtime
+ *
+ * 上报本身绝不抛错：宿主缺席（`NO_HOST`，非 iframe 的运行形态）时静默丢弃，
+ * 调用点都在 catch 分支里，二次抛错会盖掉原始错误。
+ *
+ * @param error - 错误对象/消息（宿主截断保留 2000 字符）
+ * @param action - 记录动作，默认 runtime
  */
 export function reportPluginError(error: unknown, action: ErrorAction = 'runtime'): void {
   const message = (error instanceof Error ? `${error.name}: ${error.message}` : String(error))
@@ -27,31 +32,11 @@ export function reportPluginError(error: unknown, action: ErrorAction = 'runtime
     .slice(0, 2000)
   if (!message)
     return
-  const payload = { source: ERROR_SRC, type: ERROR_TYPE, id: PLUGIN_ID, error: message, action }
+  const payload: ParentMessage = { type: ERROR_TYPE, id: PLUGIN_ID, error: message, action }
   try {
-    window.parent.postMessage(payload, '*')
+    invokeParent(payload)
   }
   catch {
-    // 宿主已销毁等场景静默（与导航桥 post 的行为一致）
-  }
-}
-
-/**
- * 把可能抛错的回调包装成「捕获 + 上报 + 继续执行」的安全回调：
- * 观测器/监听器回调一旦抛错会变成 uncaught error，宿主无从知晓；包装后统一
- * 上报为本插件的 runtime 错误。
- *
- * 注意只包插件自身代码路径，**不**监听全局 error/unhandledrejection —— dsh
- * 应用与本插件共享同一页面，全量捕获会把整个应用的异常都记到本插件名下，
- * 污染宿主错误注册表。
- */
-export function guard<T extends unknown[]>(fn: (...args: T) => void): (...args: T) => void {
-  return (...args: T) => {
-    try {
-      fn(...args)
-    }
-    catch (error) {
-      reportPluginError(error, 'runtime')
-    }
+    // NO_HOST：没有父窗口可上报，保持原始错误路径不受影响。
   }
 }

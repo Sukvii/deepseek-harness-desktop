@@ -1,34 +1,89 @@
-import type { WorktreeCheckout, WorktreeCreate, WorktreeDiscard, WorktreeStatus } from '../types'
+export type WorktreeBindings = {
+  bindings: WorktreeBindingSummary[];
+  jobs: WorktreeDiscardJobSummary[];
+};
+export type WorktreeBindingSummary = {
+  sessionId: string;
+  sourceSessionId: string;
+  hash: string;
+  dirname: string;
+  worktreeKey: string;
+  worktreePath: string;
+  projectPath: string;
+  log: string[];
+};
+export type WorktreeDiscardJobSummary = {
+  sessionId: string;
+  jobId: string;
+  state: string;
+  error?: string;
+  worktreeKey: string;
+  worktreePath?: string;
+};
+export type WorktreeAttach = {
+  ok?: boolean;
+  workspaceId?: string;
+  error?: string;
+};
+export type WorktreeCheckout = {
+  ok?: boolean;
+  branch?: string;
+  projectPath?: string;
+  targetSessionId?: string;
+  error?: string;
+};
+export type WorktreeDiscard = {
+  ok?: boolean;
+  jobId?: string;
+  error?: string;
+};
+export type WorktreeCreate = {
+  ok?: boolean;
+  error?: string;
+  hash?: string;
+  dirname?: string;
+  worktreeKey?: string;
+  worktreePath?: string;
+  projectPath?: string;
+  sourceSessionId?: string;
+  log?: string[];
+  existed?: boolean;
+  inherited?: boolean;
+};
+export type WorktreeStatus = {
+  mode?: string;
+  jobId?: string;
+  error?: string;
+  hash?: string;
+  dirname?: string;
+  worktreeKey?: string;
+  worktreePath?: string;
+  projectPath?: string;
+  sourceSessionId?: string;
+  log?: string[];
+  isGit?: boolean | null;
+};
 
-export type { WorktreeCheckout, WorktreeCreate, WorktreeDiscard, WorktreeStatus }
-
-/** GET /status 查询参数。 */
+export interface AttachBody {
+  sessionId?: string;
+}
+export interface CheckoutBody {
+  sessionId?: string;
+  worktreeHashDirname?: string;
+  branchName?: string;
+  carryStaged?: boolean;
+}
+export interface DiscardBody {
+  sessionId?: string;
+  worktreeHashDirname?: string;
+}
+export interface CreateBody {
+  sessionId?: string;
+  sourceSessionId?: string;
+  carryStaged?: boolean;
+  inherit?: boolean;
+}
 export interface GetStatusQuery {
-  sessionId: string
-  jobId?: string
-}
-
-/** POST /create 请求体。 */
-export interface PostCreateBody {
-  sessionId: string
-  sourceSessionId: string
-  inherit: boolean
-}
-
-/** POST /attach 请求体。 */
-export interface PostAttachBody {
-  sessionId: string
-}
-
-/** POST /checkout 请求体。 */
-export interface PostCheckoutBody {
-  sessionId: string
-  worktreeHashDirname: string
-  branchName: string
-}
-
-/** POST /discard 请求体。 */
-export interface PostDiscardBody {
-  sessionId: string
-  worktreeHashDirname: string
+  sessionId?: string;
+  jobId?: string;
 }

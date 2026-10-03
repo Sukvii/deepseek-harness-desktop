@@ -1,4 +1,4 @@
-export type ZoomAction = 'increase' | 'decrease' | 'reset'
+import type { ZoomAction } from '@/store/modules/setting/types'
 
 export interface ZoomShortcutLike {
   key: string
@@ -7,8 +7,8 @@ export interface ZoomShortcutLike {
   altKey: boolean
 }
 
+/** iframe 缩放桥消息：宿主按 `type` 分发（来源由 `useIframeMessage` 的 origin 校验负责）。 */
 interface ZoomBridgeMessage {
-  source: 'dsh-zoom-shortcut-bridge'
   type: 'dsh://zoom-shortcut'
   action: ZoomAction
 }
@@ -31,7 +31,9 @@ export function zoomActionFromBridgeMessage(value: unknown): ZoomAction | null {
     return null
 
   const message = value as Partial<ZoomBridgeMessage>
-  if (message.source !== 'dsh-zoom-shortcut-bridge' || message.type !== 'dsh://zoom-shortcut')
+  // 不再校验 `source`：宿主侧由 `useIframeMessage` 的 origin 校验保证来源，
+  // 这里只认协议类型与动作（iframe 侧脚本仍会带 source 字段，多一个字段无影响）。
+  if (message.type !== 'dsh://zoom-shortcut')
     return null
   if (message.action === 'increase' || message.action === 'decrease' || message.action === 'reset')
     return message.action

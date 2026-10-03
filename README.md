@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/dsh-tauri-desk/deepseek-harness-desktop">
+  <a href="https://github.com/dsh-tauri/deepseek-harness-desktop">
     <img src="public/favicon.svg" width="96" alt="DeepSeek Harness Desktop" />
   </a>
 </p>
@@ -7,95 +7,116 @@
 <h1 align="center">DeepSeek Harness 桌面版</h1>
 
 <p align="center">
-  在桌面上一键运行 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> ——<br />
-  无需 Node.js、无需 pnpm、无需 Docker，下载即用。
+  在桌面上运行 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> ——<br />
+  无需手动安装 Node.js、pnpm 或 Docker；普通安装首次启动可能需要联网初始化。
 </p>
 
 <p align="center">
-  <a href="https://github.com/dsh-tauri-desk/deepseek-harness-desktop/releases">
-    <img src="https://img.shields.io/github/v/release/dsh-tauri-desk/deepseek-harness-desktop?style=flat-square&label=release&color=4D6BFE" alt="Release" />
+  <a href="https://github.com/dsh-tauri/deepseek-harness-desktop/releases">
+    <img src="https://img.shields.io/github/v/release/dsh-tauri/deepseek-harness-desktop?style=flat-square&label=release&color=4D6BFE" alt="Release" />
   </a>
-  <img src="https://img.shields.io/github/downloads/dsh-tauri-desk/deepseek-harness-desktop/total?style=flat-square&label=downloads&color=4D6BFE" alt="Downloads" />
-  <img src="https://img.shields.io/github/stars/dsh-tauri-desk/deepseek-harness-desktop?style=flat-square&label=stars&color=4D6BFE" alt="Stars" />
-  <img src="https://img.shields.io/github/license/dsh-tauri-desk/deepseek-harness-desktop?style=flat-square&label=license&color=4D6BFE" alt="MIT License" />
+  <img src="https://img.shields.io/github/downloads/dsh-tauri/deepseek-harness-desktop/total?style=flat-square&label=downloads&color=4D6BFE" alt="Downloads" />
+  <img src="https://img.shields.io/github/stars/dsh-tauri/deepseek-harness-desktop?style=flat-square&label=stars&color=4D6BFE" alt="Stars" />
+  <img src="https://img.shields.io/github/license/dsh-tauri/deepseek-harness-desktop?style=flat-square&label=license&color=4D6BFE" alt="MIT License" />
   <img src="https://img.shields.io/badge/Windows%20%7C%20macOS%20%7C%20Linux-black?style=flat-square" alt="Windows | macOS | Linux" />
-  <img src="https://img.shields.io/badge/dsh-0.1.2--rc.1-4D6BFE?style=flat-square" alt="dsh 0.1.2-rc.1" />
+  <img src="https://img.shields.io/badge/dsh-0.2.0--rc.2-4D6BFE?style=flat-square" alt="dsh 0.2.0-rc.2" />
 </p>
 
 <p align="center">
-  <samp><a href="./README.en.md">English</a> · <a href="https://dshtauri.mintlifysite.com">文档</a> · <strong>中文</strong></samp>
+  <samp><a href="./README.en.md">English</a> · <a href="./README.es.md">Español</a> · <a href="https://dshtauri.mintlify.site">文档</a> · <strong>中文</strong></samp>
 </p>
 
 <p align="center">
- <a href="https://trendshift.io/repositories/151676?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-151676" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/151676/daily?language=Rust" alt="dsh-tauri-desk%2Fdeepseek-harness-desktop | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/151676?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-151676" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/151676/daily?language=Rust" alt="dsh-tauri%2Fdeepseek-harness-desktop | Trendshift" width="250" height="55"/></a>
 </p>
-
 
 <p align="center">
-  <img src="./docs/images/hero-zh.png" width="100%" alt="DSH Desktop 中文宣传横幅" />
+  <a href="docs/PREVIEW.md">
+    <img src="./docs/images/hero-zh.png" width="100%" alt="DSH Desktop 中文宣传横幅" />
+  </a>
 </p>
 
-<table>
-  <tr>
-    <td><a href="docs/PREVIEW.md"><img src="./docs/images/previews/preview-1.png" alt="preview 1" /></a></td>
-    <td><a href="docs/PREVIEW.md"><img src="/docs/images/previews/preview-2.png" alt="preview 2" /></a></td>
-    <td><a href="docs/PREVIEW.md"><img src="/docs/images/previews/preview-4.png" alt="preview 4" /></a></td>
-    <td><a href="docs/PREVIEW.md"><img src="/docs/images/previews/preview-5.png" alt="preview 5" /></a></td>
-  </tr>
-</table>
+## 功能
 
-- 🧩 **插件管理** — 插件面板管理已安装插件，出现异常时提供升级 / 卸载入口，错误详情。
-- 🎁 **内置插件** — 随安装包内置插件，以及将来引入更多高质量的内置插件。
-- 🪶 **原生轻量** — Tauri 2 外壳（非 Electron）：更小的安装包、更低的内存占用、原生窗口。
-- ⌨️ **命令行集成** — 安装自动注册 `dsh` 命令，新开终端即用；不覆盖你已有 shell 配置。
-- 🧭 **启动引导** — 首次启动可选推荐插件，也可在配置中重新选择。
-- 🚀 **自更新** — 应用内更新，不需要重新下载；
-- 🐾 **桌宠** — 提供 Pets / Codex 双来源桌宠管理，可下载预设宠物、导入 Codex `.zip` 资源包，并根据会话活动显示状态气泡。
-- 🐧 **WSL 核心** — Windows 上可把 Harness 核心切换为 WSL 发行版内运行的 dsh：数据目录、工作区与命令都在 Linux 侧；需自备 Node ≥ 20。
+- 🪶 **原生桌面** — Tauri 2 + React 19，内嵌本地 Harness Web 界面。
+- 🔄 **运行时管理** — 安装依赖、选择内核版本，并提供桌面端与内核更新入口。
+- 🧩 **插件管理** — 11 个内置插件；支持社区插件安装、升级、卸载与错误查看。
+- 🗂️ **档案配置** — 分别管理插件与设置；档案不是操作系统安全沙箱。
+- ⌨️ **命令行集成** — 通过托管 shim 提供 `dsh` / `pnpm`，不是全局 npm 内核安装。
+- 🐾 **桌宠** — Pets / Codex 资源管理、资源包导入与会话状态展示；预设素材来自远端。
+- 🐧 **WSL 核心** — Windows 上可把 Harness 核心切换为 WSL 发行版内运行的 dsh：数据目录、工作区与命令都在 Linux 侧，需在发行版内自备 Node ≥ 20。WSL 核心使用**独立的受控版本与推荐基线**（清单 `engines.dsh.wslRecommend`，与 Windows 内核推荐值互不影响），首次使用由应用按随包分发的清单与锁文件受控安装，不依赖发行版内的全局 npm 包。
 
-## 预设插件
-
-首次启动引导中提供的插件，按需勾选安装：
-
-- [DSH Win Terminal Inspector](https://github.com/clearkurt/dsh-win-terminal-inspector) — Windows 极简模式修复
-- [DSH Market](https://github.com/dsh-market/dsh-market) — 浏览、搜索并一键安装社区插件（推荐）
-- [DSH Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) — 类 VSCode 右侧栏，按会话隔离（推荐）
-- [DSH Notification](https://github.com/omdsh-dev/dsh-notification) — 回合完成时的桌面通知
-
-<!-- > 你想收录新的插件作为预设？修改 [preset-plugins.json](https://github.com/dsh-tauri-desk/deepseek-harness-desktop/blob/main/src-tauri/resources/preset-plugins.json) 并提交 PR，通过后将在将来版本新增为预设插件。 -->
-
-> 为避免不稳定的预设插件导致软件异常，如需新增插件，请在 [dsh-tauri-plugins/issues](https://github.com/dsh-tauri-desk/dsh-tauri-plugins/issues) 提起请求
+“设置 → 外观”提供默认、北欧、日光、森林、琥珀、GitHub、GitHub 柔和和 GitHub 高对比度配色，跟随现有浅色/深色/系统主题。终端模式保留原有字体并隐藏侧栏，左上角按钮可重新展开。启用原生透明模式后，可通过滑块将背景不透明度设为 20–100%，也可选择让会话区域保持不透明。文字和菜单保持不透明，100% 不透明度不会关闭原生透明模式；启用或关闭原生透明模式后需完全退出并重新打开应用，效果取决于窗口系统。所有外观设置均可一键恢复默认。
 
 ## 内置插件
 
-随安装包资源内置的第一方插件：
+随桌面资源分发的 11 个第一方插件：
 
-- [DSH Tauri](https://github.com/dsh-tauri-desk/dsh-tauri) — 提供与 Tauri 2 外壳的通信通道
-- [DSH Tauri UI](https://github.com/dsh-tauri-desk/dsh-tauri-ui) — 为 Tauri 2 外壳提供自定义设置侧边栏
-- [DSH Tauri Worktree](https://github.com/dsh-tauri-desk/dsh-tauri-worktree) — 为每个会话创建隔离的 Git Worktree，并支持检出到本地分支或归档放弃
-- [DSH Tauri Panel](https://github.com/dsh-tauri-desk/dsh-tauri-plugins/tree/main/packages/dsh-tauri-panel) — 侧栏外壳、面板协议
-- [DSH Tauri Panel Extension](https://github.com/dsh-tauri-desk/dsh-tauri-plugins/tree/main/packages/dsh-tauri-panel-extension) — Skills/MCP 管理与导入技能仓库
-- [DSH Tauri Panel Scheduler](https://github.com/dsh-tauri-desk/deepseek-harness-desktop/tree/main/packages/dsh-tauri-panel-scheduler) — 创建每天、间隔、工作日或每周的定时任务；在独立 Agent 会话中执行，并保留执行记录
-- [DSH Tauri Session](https://github.com/dsh-tauri-desk/dsh-tauri-plugins/tree/main/packages/dsh-tauri-session) — 将删除工作区改为归档，并提供支持搜索、排序、分组、项目筛选和取消归档的「已归档聊天」设置页
-- [DSH Tauri Pet](https://github.com/dsh-tauri-desk/deepseek-harness-desktop/tree/main/packages/dsh-tauri-pet) — 管理 Chat / Codex 桌宠、预设宠物下载、资源包导入和会话活动状态
-- [DSH Tauri Rightclick](https://github.com/dsh-tauri-desk/dsh-tauri-plugins/tree/main/packages/dsh-tauri-rightclick) — 为会话、工作区、正文、链接和输入框补充常用操作
-- 更多即将引入的插件...
+| 插件 | 包标识 | 用途 |
+| --- | --- | --- |
+| [DSH Tauri](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri) | `dsh-tauri` | 桌面壳与 Harness 通信 |
+| [DSH Tauri UI](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-ui) | `dsh-tauri-ui` | 桌面设置界面 |
+| [DSH Tauri Worktree](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-worktree) | `dsh-tauri-worktree` | 会话 Git 工作树与检出 |
+| [DSH Tauri Extension](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-extension) | `dsh-tauri-extension` | Skills、技能来源与 MCP 管理 |
+| [DSH Tauri Scheduler](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-scheduler) | `dsh-tauri-scheduler` | 定时任务与执行记录 |
+| [DSH Tauri Archive](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-archive) | `dsh-tauri-archive` | 聊天归档与恢复 |
+| [DSH Tauri Pet](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-pet) | `dsh-tauri-pet` | 桌宠与活动状态 |
+| [DSH Tauri Rightclick Menu](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-rightclick) | `dsh-tauri-rightclick` | 会话、工作区与正文右键菜单 |
+| [DSH Tauri Model](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-model) | `dsh-tauri-model` | 模型选择与参数 |
+| [DSH Tauri SSH](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-ssh) | `dsh-tauri-ssh` | SSH 远端 Harness 连接与同步 |
+| [DSH Tauri Notification](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-notification) | `dsh-tauri-notification` | 会话通知与交互操作 |
+
+`dsh-tauri-experimental` 为可选实验包，默认关闭，不计入上述 11 个内置插件。
+
+## 可选预设
+
+启动引导提供以下 6 个社区插件，按需安装；前 5 个标记为推荐，Billion Context 需主动选择。
+
+| 插件 | 包标识 | 用途 |
+| --- | --- | --- |
+| [DSH Market](https://github.com/dsh-market/dsh-market) | `dshmarket` | 社区插件市场 |
+| [DSH Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | `dsh-better-sidebar` | 按会话隔离的编辑器侧栏 |
+| [DSH Rewind](https://github.com/SiriLee/dsh-rewind) | `dsh-rewind-plugin` | 对话回退与工作区备份 |
+| [DSH Bridge](https://github.com/wenbin-wb/dsh-bridge) | `@wenbin_wb/dsh-bridge` | 远程访问、隧道与机器人接入 |
+| [DSH IM](https://github.com/xmanrui/dsh-im) | `@xmanrui/dsh-im` | IM 渠道与机器人管理 |
+| [Billion Context](https://github.com/ranxianglei/billion-context) | `billion-context` | 上下文压缩与历史恢复 |
+
+新增或更新预设请提交 [Issue](https://github.com/dsh-tauri/deepseek-harness-desktop/issues)；可用版本由清单中的内核兼容规则决定。
 
 ## 快速开始
 
-从 [Releases](https://github.com/dsh-tauri-desk/deepseek-harness-desktop/releases) 下载对应平台安装包，安装后启动即可。
+从 [Releases](https://github.com/dsh-tauri/deepseek-harness-desktop/releases) 下载对应平台与架构的安装包：
 
-**macOS（Homebrew）：** 也可通过 Homebrew 一键安装：
+| 平台 | 要求 | 安装包 |
+| --- | --- | --- |
+| Windows | Windows 10+、WebView2 | x64 `.exe` / `.msi` |
+| macOS | macOS 12+；Web 界面需 Safari 17.4+ 能力 | Intel / Apple Silicon `.dmg` |
+| Linux | WebKit2GTK 4.1 运行库 | x64 `.AppImage` / `.deb` |
+
+macOS 也可通过 Homebrew 安装：
 
 ```bash
-brew install dsh-tauri-desk/desktop/deepseek-harness
+brew install dsh-tauri/desktop/deepseek-harness
 ```
 
-首次运行会下载 Node 运行时与 Harness 内核（如已经安装 `dsh` ，则使用安装版本），随后直接进入 `http://127.0.0.1:3080` 的 Harness 界面；此后完全本地运行，无需联网。
+- 普通安装包首次启动需联网下载缺失的运行时与内核；Git 功能需要可用的 Git。
+- 仅在对应 Release 实际发布含运行时与内核资源的 `Bundle` 时，才可使用该捆绑包；**v0.20.0-beta.1 没有 Bundle 资产**。
+- 本地运行不等于完全离线：模型服务、插件安装、更新与桌宠预设素材仍可能联网。
+- Linux 显示、Wayland、AppImage 与权限问题的处理见[安装与故障排查文档](https://dshtauri.mintlify.site)。
 
-**系统要求：** Windows 10+ · macOS 10.15+ · Linux（AppImage / .deb）· 首次运行需要网络
+## 运行方式
 
-> **Linux Wayland 注意（PikaOS / GNOME Wayland / Ubuntu 22.04+）：** AppImage 在 Wayland 下可能因 WebKitGTK 黑屏/崩溃，应用已自动处理常见情形。 <details><summary>若仍黑屏/崩溃：</summary><br>**改用 `.deb`**（已验证 PikaOS 4 Wayland），或手动 `WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=x11 ./AppImage`。图标不显示时，将应用内 `hicolor` 图标复制到 `~/.local/share/icons` 并运行 `update-desktop-database`。<br></details>
+| 当前基线 | 版本 |
+| --- | --- |
+| 桌面端 | `0.20.0-beta.1` |
+| 推荐 Harness 内核 | `0.2.0-rc.2` |
+| 声明的内核最低版本 | `0.1.5-rc.1`，不保证所有插件兼容 |
+| Node.js 运行时 | `22.22.0` |
+| pnpm | `11.7.0` |
+
+- Rust 后端管理依赖与 Harness 进程，React WebView 内嵌其界面；正式版默认地址为 `http://127.0.0.1:3080`，端口占用时可能调整。
+- 内核与预设选择遵循[资源清单](<./src-tauri/resources/manifest.jsonc>)及插件声明的版本范围；不保证任意最新上游版本都兼容。
+- 正式版默认启用 CLI 集成：Windows 更新用户 PATH，macOS / Linux 按需在 Bash / Zsh 配置中加入托管 PATH 块。需重新打开终端，其他 shell 可能需要手动配置。
 
 ## 交流
 
@@ -109,47 +130,14 @@ brew install dsh-tauri-desk/desktop/deepseek-harness
   </tr>
 </table>
 
-
 ## 开发
 
-想参与开发？参见 [docs/DEVELOPMENT.zh.md](./docs/DEVELOPMENT.zh.md)。
-
-## 工作原理
-
-```text
-┌──────────────────────────────────────────────┐
-│ Tauri WebView (React)                        │
-│   安装状态机 → 下载进度 → iframe              │
-│   加载 dsh Web 界面 + 侧边栏控制              │
-└──────────────────────┬───────────────────────┘
-                       │ invoke 命令 + 事件
-┌──────────────────────┴───────────────────────┐
-│ Tauri Rust 后端                              │
-│   service/download  安装器 + 解压            │
-│   service/core      Harness 核心多版本管理   │
-│   service/profile   dsh 档案管理             │
-│   service/plugin    插件卸载 / 升级          │
-│   service/cli       dsh 命令 shim + PATH     │
-│   service/update    桌面端自更新             │
-│   service/workflow  dsh 进程生命周期         │
-│   task              dsh 健康检查             │
-└──────┬───────────────────────────┬───────────┘
-       │                           │
-  runtime/ (Node.js v22.22.0)   dependencies/dsh/ (发行版)
-       └─────────────┬─────────────┘
-                     ▼
-   dsh --profile <档案> --host 127.0.0.1 --port 3080
-                     │  DSH_HOME=~/.dsh
-                     ▼
-        http://127.0.0.1:3080/  ← 内嵌界面
-```
-
-Harness 发行版由 [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/deepseek-harness-pkg) 构建发布。每次启动都会对比最新发行版，本地过期时提醒下载更新；GitHub 不可达时保留本地安装。通过 CLI 全局安装的本地核心会被优先使用。
+参见[中文开发指南](<./docs/DEVELOPMENT.zh.md>)或[英文开发指南](<./docs/DEVELOPMENT.md>)。功能详情见[在线文档](https://dshtauri.mintlify.site)。
 
 ## 说明
 
 > [!WARNING]
-> **开发预览** — 上游 `dsh` 仍在快速迭代，存在破坏性变更；本项目同步跟随。
+> **开发预览** — 上游 `dsh` 仍在快速迭代，可能存在破坏性变更；升级前请确认兼容性。
 
 > [!NOTE]
 > **安全声明** — `dsh` 具备本地代码执行能力。仅供学习 / 研究 / 测试，请在可信、隔离的环境中使用。
@@ -157,9 +145,10 @@ Harness 发行版由 [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/de
 ## 相关项目
 
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — 上游 `dsh` agent 平台
-- [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/deepseek-harness-pkg) — 预打包 Harness 发行版（本应用下载源）
-- [n8n-desktop](https://github.com/tangtao646/n8n-desktop) — 参考实现
+- [deepseek-harness-pkg](https://github.com/dsh-tauri/deepseek-harness-pkg) — 预打包 Harness 发行版与下载源
+- [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) · [dsh-pet-mov](https://github.com/dsh-tauri/dsh-pet-mov) · [dsh-pet-component](https://github.com/hairyf/dsh-pet-component) — 桌宠素材与渲染组件
+- [dsh-plugin-codex-pets](https://github.com/Skylarking/dsh-plugin-codex-pets) · [BongoCat](https://github.com/ayangweb/BongoCat) · [dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu) · [codex-to-dsh-pet](https://github.com/Signalight/codex-to-dsh-pet) — 桌宠参考项目
 
 ## License
 
-[MIT](./LICENSE)，附加[非商用条款](./LICENSE.details) © deepseek-harness-desktop contributors
+[MIT](<./LICENSE>)，附加[非商用条款](<./LICENSE.details>) © deepseek-harness-desktop contributors

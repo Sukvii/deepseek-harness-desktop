@@ -7,8 +7,12 @@ use tauri_plugin_store::StoreExt;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Setting {
+    #[serde(default)]
+    pub appearance: super::Appearance,
     pub installed: bool,
     pub port: u16,
+    #[serde(default)]
+    pub harness_max_heap_mb: Option<u32>,
     pub auto_start: bool,
     pub language: String,
     #[serde(default)]
@@ -23,22 +27,20 @@ pub struct Setting {
     /// 预装插件引导是否已完成（确认安装或跳过都算完成，之后不再弹出）
     #[serde(default)]
     pub preinstall_done: bool,
-    /// 上次引导结束时的 `preset-plugins.json` 内容指纹。资源文件每次安装都会被
+    /// 上次引导结束时的清单 `plugins` 节内容指纹。资源清单每次安装都会被
     /// 强制覆盖、旧文件不复存在，只能把「上次看到的内容」记在这里，每次启动再比对：
     /// 内容有变更 → 重新进入预设引导。`None` = 老用户升级（无基线）→ 弹一次建立基线。
     #[serde(default)]
     pub preset_hash: Option<String>,
-    /// 旧版 AppData `data/dsh` → 官方 `$DSH_HOME`（~/.dsh）数据迁移是否已完成。
-    /// 幂等标记：迁移成功并删除旧目录后置位，避免重复合并。
-    #[serde(default)]
-    pub dsh_home_migrated: bool,
     /// 当前使用的档案 id（`$DSH_HOME/profiles/<id>`，默认 web）。
     /// 桌面端启动服务与插件管理都以它为准（见 service::profile）。
+    /// 老用户 store 里可能仍是旧引导档案名 `desktop`：启动迁移
+    /// （`service::profile::migrate_desktop_profile_name`）会把它改指 `tauri`。
     #[serde(default = "default_active_profile")]
     pub active_profile: String,
-    /// 首装档案引导是否已完成：桌面端首次安装时自动新建 Desktop 档案并切换为
-    /// 当前档案（见 service::profile::ensure_first_run_desktop_profile），成功后
-    /// 置位，之后启动不再重做（幂等标记，语义同 dsh_home_migrated）。
+    /// 首装档案引导是否已完成：桌面端首次安装时自动新建引导档案（`tauri`）并
+    /// 切换为当前档案（见 service::profile::migrate_desktop_profile_name），成功
+    /// 后置位，之后启动不再重做（一次性幂等标记）。
     #[serde(default)]
     pub desktop_profile_ready: bool,
     /// 活动核心的显式选择：`Some("local")` = 用户 CLI 安装的本地核心，
@@ -76,18 +78,33 @@ pub struct Setting {
     /// 桌宠能力是否永久启用；临时隐藏不能改动此字段。
     #[serde(default)]
     pub pet_enabled: bool,
-    /// 当前选中的桌宠模型包（`x.x.x.sprites/` 目录名或用户导入的 .zip 包名）；
-    /// `None` 或空串对外统一映射到内置默认宠物。
+    /// 当前选中的桌宠模型包（预设 id，或 `chat:` / `codex:` 来源限定 id）；
+    /// `None` = 从未选择，对外回落清单里的第一只预设宠物；空串 = 用户显式取消选择。
     #[serde(default)]
     pub active_pet: Option<String>,
     /// 桌宠精灵图的显示宽度（逻辑像素）；`None` = 沿用窗口侧默认值。
     #[serde(default)]
     pub pet_size: Option<f64>,
+    /// 强制以 XWayland 运行（默认关闭，下次启动生效）。
+    ///
+    /// 影响的是整个应用而非只有桌宠：原生 Wayland 下桌宠既不能置顶也不能定位
+    /// （issue #649），把应用拉到 XWayland 是在 GNOME 上恢复这两项能力的唯一办法，
+    /// 代价是主窗口也一并经 XWayland 渲染。默认关闭，由用户显式开启。
+    #[serde(default)]
+    pub force_xwayland: bool,
 }
 
 pub const ZOOM_FACTOR_MIN: f64 = 0.5;
 pub const ZOOM_FACTOR_MAX: f64 = 2.0;
 pub const ZOOM_FACTOR_STEP: f64 = 0.1;
+pub const HARNESS_HEAP_MIN_MB: u32 = 1024;
+pub const HARNESS_HEAP_MAX_MB: u32 = 32768;
+pub const CLOSE_ACTION_TRAY: &str = "tray";
+pub const CLOSE_ACTION_QUIT: &str = "quit";
+
+pub fn normalize_harness_max_heap_mb(value: Option<u32>) -> Option<u32> {
+    value.filter(|mb| (HARNESS_HEAP_MIN_MB..=HARNESS_HEAP_MAX_MB).contains(mb))
+}
 
 /// 默认档案：桌面端内置的 web 档案
 fn default_active_profile() -> String {
@@ -106,7 +123,7 @@ pub fn default_zoom_factor() -> f64 {
 
 /// 默认关闭行为：隐藏到托盘继续驻留（D-09）。
 pub fn default_close_action() -> String {
-    "tray".to_string()
+    CLOSE_ACTION_TRAY.to_string()
 }
 
 /// 默认保留备份份数：10 份。
@@ -120,7 +137,7 @@ pub fn default_backup_retention_count() -> u32 {
 /// 平台写入，宽松匹配会让 `"quit "` / `"TRAY"` 这类值以非预期形态进入下游判断。
 pub fn normalize_close_action(value: &str) -> String {
     match value {
-        "tray" | "quit" => value.to_string(),
+        CLOSE_ACTION_TRAY | CLOSE_ACTION_QUIT => value.to_string(),
         _ => default_close_action(),
     }
 }
@@ -144,8 +161,11 @@ pub fn normalize_backup_retention(retention_count: u32) -> u32 {
     }
 }
 
-/// 把 Setting 的保留份数字段归一化到有效范围。
-fn normalize_backup_fields(setting: &mut Setting) {
+fn normalize_setting(setting: &mut Setting) {
+    setting.appearance.normalize();
+    setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
+    setting.harness_max_heap_mb = normalize_harness_max_heap_mb(setting.harness_max_heap_mb);
+    setting.close_action = normalize_close_action(&setting.close_action);
     setting.backup_retention_count = normalize_backup_retention(setting.backup_retention_count);
 }
 
@@ -161,8 +181,10 @@ pub fn default_port() -> u16 {
 impl Default for Setting {
     fn default() -> Self {
         Self {
+            appearance: super::Appearance::default(),
             installed: false,
             port: default_port(),
+            harness_max_heap_mb: None,
             auto_start: true,
             language: "zh-CN".to_string(),
             dsh_pkg_commit: None,
@@ -170,7 +192,6 @@ impl Default for Setting {
             cli_link_enabled: default_cli_link_enabled(),
             preinstall_done: false,
             preset_hash: None,
-            dsh_home_migrated: false,
             active_profile: default_active_profile(),
             desktop_profile_ready: false,
             active_core: None,
@@ -183,22 +204,67 @@ impl Default for Setting {
             pet_enabled: false,
             active_pet: None,
             pet_size: None,
+            force_xwayland: false,
         }
     }
 }
 
-/// Store 持久化文件名：debug 构建与生产隔离（各自独立文件）。
+/// 当前是否为 E2E 运行（内嵌 WebDriver server 被请求）。
+pub fn is_e2e_run() -> bool {
+    std::env::var_os(E2E_PORT_ENV_VAR).is_some_and(|v| !v.is_empty())
+}
+
+/// 当前进程应使用的 Store 持久化文件名（生产 / 开发 / E2E 三方隔离的唯一真值）。
 ///
-/// store（端口、installed、active_core 等）属于「应用数据」而非共用核心——
-/// 生产默认 3080、开发默认 3081，共用一份 store 会让两边端口一路漂移
-/// （release 读到开发写入的 3081 后把 3080 让出，开发下次又从 3081 漂走）
-/// 并相互污染安装/核心等状态。
-fn store_dat_file_name() -> &'static str {
-    if cfg!(debug_assertions) {
+/// store（端口、installed、active_core、窗口几何等）属于「应用数据」而非共用核心：
+/// 生产默认 3080、开发默认 3081，共用一份 store 会让两边端口一路漂移并相互污染状态；
+/// E2E 若复用开发文件，用例写入的窗口几何会覆盖用户正在使用的开发版配置。
+///
+/// 注意 `app_data_dir()` 在 Windows 上由 `SHGetKnownFolderPath` 解析，重定向
+/// `APPDATA` 环境变量**无法**把 store 引到 scratch 目录——三方隔离只能靠换文件名。
+pub fn store_dat_file_name() -> &'static str {
+    resolve_store_dat_file(is_e2e_run(), cfg!(debug_assertions))
+}
+
+/// `store_dat_file_name` 的纯函数内核：把「是否 E2E」「是否 debug」映射到文件名。
+fn resolve_store_dat_file(e2e: bool, debug: bool) -> &'static str {
+    if e2e {
+        STORE_DAT_TEST_FILE
+    } else if debug {
         STORE_DAT_DEV_FILE
     } else {
         STORE_DAT_FILE
     }
+}
+
+/// 启动最早期读取 `force_xwayland`，绕过 `tauri_plugin_store` 直接解析 store 文件。
+///
+/// `GDK_BACKEND` 必须在 GTK 初始化之前设置，那时 `AppHandle` 尚不存在，插件的
+/// `StoreExt` 用不了。路径由 `logger::identifier_dir()` 与 `store_dat_file_name()` 拼出，
+/// 与插件的 `BaseDirectory::AppData` + 文件名解析一致，开发 / E2E / 生产三份 store
+/// 不互读。store 靠文件名区分 dev，目录不带 `dev/` 一层，与日志的做法不同。
+/// 文件缺失、JSON 非法、键缺失一律按关闭处理：此处早于 `logger::init()`，
+/// 无处告警，静默回落到默认行为比中断启动合适。
+pub fn force_xwayland_setting() -> bool {
+    crate::logger::identifier_dir()
+        .map(|dir| dir.join(store_dat_file_name()))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|raw| force_xwayland_in_store_json(&raw))
+}
+
+/// `force_xwayland_setting` 的纯函数内核，便于单测覆盖各种损坏输入。
+fn force_xwayland_in_store_json(raw: &str) -> bool {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(value) = root.get(STORE_SETTING_KEY) else {
+        return false;
+    };
+    let object = unwrap_json_value(value);
+    object
+        .get("force_xwayland")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn setting_write_lock() -> &'static Mutex<()> {
@@ -232,23 +298,30 @@ pub fn is_first_install() -> bool {
     FIRST_INSTALL.get().copied().unwrap_or(false)
 }
 
+pub(crate) fn unwrap_json_value(
+    value: &serde_json::Value,
+) -> std::borrow::Cow<'_, serde_json::Value> {
+    value
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(value))
+}
+
+fn setting_from_value(value: Option<&serde_json::Value>) -> Setting {
+    let mut setting = value
+        .and_then(|value| serde_json::from_value(unwrap_json_value(value).into_owned()).ok())
+        .unwrap_or_default();
+    normalize_setting(&mut setting);
+    setting
+}
+
 fn read_store_dat_setting<R: Runtime>(app_handle: &AppHandle<R>) -> Setting {
     let store = app_handle
         .store(store_dat_file_name())
         .expect("Failed to load store");
     let raw = store.get(STORE_SETTING_KEY);
-    let value = raw.as_ref().and_then(|v| {
-        v.as_str()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .or_else(|| Some(v.clone()))
-    });
-    let mut setting = value
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_else(Setting::default);
-    setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
-    setting.close_action = normalize_close_action(&setting.close_action);
-    normalize_backup_fields(&mut setting);
-    setting
+    setting_from_value(raw.as_ref())
 }
 
 fn write_store_dat_setting(app_handle: &AppHandle, setting: &Setting) -> serde_json::Value {
@@ -268,11 +341,14 @@ fn emit_setting(app_handle: &AppHandle, value: &serde_json::Value) {
 }
 
 fn preserve_persisted_fields(mut replacement: Setting, current: &Setting) -> Setting {
+    replacement.appearance.clone_from(&current.appearance);
     replacement.zoom_factor = normalize_zoom_factor(current.zoom_factor);
+    replacement.harness_max_heap_mb = normalize_harness_max_heap_mb(current.harness_max_heap_mb);
     replacement.close_action = normalize_close_action(&current.close_action);
     replacement.pet_enabled = current.pet_enabled;
     replacement.active_pet.clone_from(&current.active_pet);
     replacement.pet_size = current.pet_size;
+    replacement.force_xwayland = current.force_xwayland;
     replacement
 }
 
@@ -285,7 +361,7 @@ pub fn set_store_dat_setting(app_handle: &AppHandle, mut setting: Setting) {
             .unwrap_or_else(|error| error.into_inner());
         let current = read_store_dat_setting(app_handle);
         setting = preserve_persisted_fields(setting, &current);
-        normalize_backup_fields(&mut setting);
+        normalize_setting(&mut setting);
         write_store_dat_setting(app_handle, &setting)
     };
     emit_setting(app_handle, &value);
@@ -302,21 +378,12 @@ where
             .unwrap_or_else(|error| error.into_inner());
         let mut setting = read_store_dat_setting(app_handle);
         update(&mut setting);
-        setting.zoom_factor = normalize_zoom_factor(setting.zoom_factor);
-        // 落盘前的第二道闸：调用方（含前端 invoke）写入的不可信取值不以原始形态进 store
-        setting.close_action = normalize_close_action(&setting.close_action);
-        normalize_backup_fields(&mut setting);
+        normalize_setting(&mut setting);
         let value = write_store_dat_setting(app_handle, &setting);
         (setting, value)
     };
     emit_setting(app_handle, &value);
     setting
-}
-
-pub fn set_store_dat_zoom_factor(app_handle: &AppHandle, zoom_factor: f64) -> Setting {
-    update_store_dat_setting(app_handle, |setting| {
-        setting.zoom_factor = zoom_factor;
-    })
 }
 
 /// 泛型 `Runtime`：允许从非 Wry 具体化的窗口句柄（如工具函数的
@@ -333,31 +400,92 @@ pub fn get_dsh_pkg_commit(app_handle: &AppHandle) -> Option<String> {
     get_store_dat_setting(app_handle).dsh_pkg_commit
 }
 
-/// 记录已安装 Harness 发行版的 GitHub release commit hash
-pub fn set_dsh_pkg_commit(app_handle: &AppHandle, commit: String) {
-    let mut setting = get_store_dat_setting(app_handle);
-    setting.dsh_pkg_commit = Some(commit);
-    set_store_dat_setting(app_handle, setting);
-}
-
 /// 已安装 Harness 发行版对应的 GitHub release tag
 pub fn get_dsh_pkg_tag(app_handle: &AppHandle) -> Option<String> {
     get_store_dat_setting(app_handle).dsh_pkg_tag
 }
 
-/// 记录已安装 Harness 发行版的 GitHub release tag
-pub fn set_dsh_pkg_tag(app_handle: &AppHandle, tag: String) {
-    let mut setting = get_store_dat_setting(app_handle);
-    setting.dsh_pkg_tag = Some(tag);
-    set_store_dat_setting(app_handle, setting);
+pub fn set_dsh_pkg_identity(app_handle: &AppHandle, commit: String, tag: String) {
+    update_store_dat_setting(app_handle, |setting| {
+        setting.dsh_pkg_commit = Some(commit);
+        setting.dsh_pkg_tag = Some(tag);
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        default_close_action, default_zoom_factor, normalize_close_action, normalize_zoom_factor,
-        preserve_persisted_fields, Setting, ZOOM_FACTOR_MAX, ZOOM_FACTOR_MIN,
+        default_close_action, default_zoom_factor, force_xwayland_in_store_json,
+        normalize_close_action, normalize_setting, normalize_zoom_factor,
+        preserve_persisted_fields, resolve_store_dat_file, setting_from_value, unwrap_json_value,
+        Setting, STORE_DAT_DEV_FILE, STORE_DAT_FILE, STORE_DAT_TEST_FILE, STORE_SETTING_KEY,
+        ZOOM_FACTOR_MAX, ZOOM_FACTOR_MIN,
     };
+
+    /// 启动前读取跑在 `logger::init()` 之前，任何损坏输入都只能静默回落到关闭。
+    #[test]
+    fn force_xwayland_falls_back_to_off_on_any_unreadable_store() {
+        // 正常形状：`setting` 的值是对象。
+        assert!(force_xwayland_in_store_json(
+            r#"{"setting":{"force_xwayland":true}}"#
+        ));
+        assert!(!force_xwayland_in_store_json(
+            r#"{"setting":{"force_xwayland":false}}"#
+        ));
+        // 历史形状：`setting` 的值是一个内含对象的 JSON 字符串，read_store_dat_setting
+        // 同样兼容；漏掉这一支会让部分用户的设置被静默读成关闭。
+        assert!(force_xwayland_in_store_json(
+            r#"{"setting":"{\"force_xwayland\":true}"}"#
+        ));
+        // 字段缺失（老版本写下的 store）。
+        assert!(!force_xwayland_in_store_json(
+            r#"{"setting":{"port":3080}}"#
+        ));
+        // 键缺失、JSON 非法、空文件。
+        assert!(!force_xwayland_in_store_json(r#"{"window_state":{}}"#));
+        assert!(!force_xwayland_in_store_json("{ not json"));
+        assert!(!force_xwayland_in_store_json(""));
+        // 字符串包裹但内层非法。
+        assert!(!force_xwayland_in_store_json(r#"{"setting":"not json"}"#));
+        // 值不是 bool：不做真值推断，按关闭处理。
+        assert!(!force_xwayland_in_store_json(
+            r#"{"setting":{"force_xwayland":"yes"}}"#
+        ));
+        assert!(!force_xwayland_in_store_json(
+            r#"{"setting":{"force_xwayland":1}}"#
+        ));
+    }
+
+    /// 启动前读取按字符串字面量取字段，与 `Setting` 的序列化形状只靠约定对齐。
+    /// 字段改名不会有编译错误，只会让读取静默失效，这里拿真实序列化结果兜住。
+    #[test]
+    fn force_xwayland_key_matches_the_serialized_setting() {
+        let setting = Setting {
+            force_xwayland: true,
+            ..Setting::default()
+        };
+        let raw = serde_json::json!({ STORE_SETTING_KEY: setting }).to_string();
+        assert!(force_xwayland_in_store_json(&raw));
+    }
+
+    #[test]
+    fn store_dat_file_name_isolates_the_three_modes() {
+        assert_eq!(resolve_store_dat_file(true, true), STORE_DAT_TEST_FILE);
+        assert_eq!(resolve_store_dat_file(true, false), STORE_DAT_TEST_FILE);
+        assert_eq!(resolve_store_dat_file(false, true), STORE_DAT_DEV_FILE);
+        assert_eq!(resolve_store_dat_file(false, false), STORE_DAT_FILE);
+    }
+
+    /// 三方文件名必须互不相同：任何一处塌缩都会让某一方改写另一方的用户状态。
+    #[test]
+    fn store_dat_file_names_are_pairwise_distinct() {
+        let names = [STORE_DAT_FILE, STORE_DAT_DEV_FILE, STORE_DAT_TEST_FILE];
+        for (i, a) in names.iter().enumerate() {
+            for b in names.iter().skip(i + 1) {
+                assert_ne!(a, b, "Store 文件名重复：{a} 与 {b}");
+            }
+        }
+    }
 
     #[test]
     fn zoom_factor_defaults_for_legacy_settings() {
@@ -389,24 +517,221 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_setting_write_preserves_latest_fields() {
-        let mut stale = Setting::default();
-        stale.zoom_factor = 0.8;
-        stale.close_action = "quit".to_string();
-        stale.pet_enabled = false;
-        stale.active_pet = Some("chat:stale".to_string());
-        stale.pet_size = Some(80.0);
+    fn malformed_appearance_preserves_operational_settings() {
+        for (appearance, expected) in [
+            (
+                serde_json::json!({ "palette": "nord", "terminal": true, "opacity": 77.5 }),
+                ("nord", true, 78),
+            ),
+            (
+                serde_json::json!({ "opacity": 300 }),
+                ("default", false, 100),
+            ),
+            (serde_json::json!({ "opacity": -1 }), ("default", false, 20)),
+            (
+                serde_json::json!({ "opacity": "70" }),
+                ("default", false, 100),
+            ),
+            (
+                serde_json::json!({ "opacity": null }),
+                ("default", false, 100),
+            ),
+            (
+                serde_json::json!({ "palette": [], "terminal": "true", "opacity": 64 }),
+                ("default", false, 64),
+            ),
+            (serde_json::json!(null), ("default", false, 100)),
+            (serde_json::json!([]), ("default", false, 100)),
+            (serde_json::json!("invalid"), ("default", false, 100)),
+        ] {
+            let mut object = serde_json::json!({
+                "installed": true,
+                "port": 4099,
+                "manual_port": 4099,
+                "auto_start": false,
+                "language": "en-US",
+                "active_profile": "custom-profile",
+                "active_core": "app",
+                "dsh_pkg_commit": "saved-core",
+                "dsh_pkg_tag": "saved-release",
+                "preinstall_done": true,
+                "desktop_profile_ready": true,
+                "cli_link_enabled": false,
+                "harness_max_heap_mb": 2048,
+                "zoom_factor": 1.2,
+                "close_action": "quit"
+            });
+            object["appearance"] = appearance;
+            for value in [
+                object.clone(),
+                serde_json::Value::String(object.to_string()),
+            ] {
+                let setting = setting_from_value(Some(&value));
+                assert_eq!(setting.appearance.palette, expected.0, "{value}");
+                assert_eq!(setting.appearance.terminal, expected.1, "{value}");
+                assert_eq!(setting.appearance.opacity, expected.2, "{value}");
+                let saved = serde_json::to_value(setting).unwrap();
+                for (key, expected) in object.as_object().unwrap() {
+                    if key != "appearance" {
+                        assert_eq!(&saved[key], expected, "{key} changed for {value}");
+                    }
+                }
+            }
+        }
+    }
 
-        let mut current = Setting::default();
-        current.zoom_factor = 1.6;
-        current.close_action = "tray".to_string();
-        current.pet_enabled = true;
-        current.active_pet = Some("codex:latest".to_string());
-        current.pet_size = Some(140.0);
+    #[test]
+    fn settings_decode_object_and_wrapped_object_with_same_normalization() {
+        let object = serde_json::json!({
+            "installed": true,
+            "port": 4099,
+            "auto_start": false,
+            "language": "en-US",
+            "zoom_factor": 1.16,
+            "harness_max_heap_mb": 32769,
+            "close_action": "QUIT",
+            "backup_retention_count": 51
+        });
+        let wrapped = serde_json::Value::String(object.to_string());
+        for value in [&object, &wrapped] {
+            let setting = setting_from_value(Some(value));
+            assert!(setting.installed);
+            assert_eq!(setting.port, 4099);
+            assert!(!setting.auto_start);
+            assert_eq!(setting.language, "en-US");
+            assert_eq!(setting.zoom_factor, 1.2);
+            assert_eq!(setting.harness_max_heap_mb, None);
+            assert_eq!(setting.close_action, "tray");
+            assert_eq!(setting.backup_retention_count, 10);
+            assert_eq!(setting.active_profile, "web");
+        }
+    }
+
+    #[test]
+    fn settings_decode_invalid_shapes_keep_chinese_default_language() {
+        let invalid = [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!("not json"),
+            serde_json::json!("null"),
+            serde_json::json!({
+                "installed": true,
+                "port": 4099,
+                "auto_start": true
+            }),
+        ];
+        for value in &invalid {
+            let setting = setting_from_value(Some(value));
+            assert!(!setting.installed);
+            assert_eq!(setting.language, "zh-CN");
+            assert_eq!(setting.active_profile, "web");
+            assert_eq!(setting.close_action, "tray");
+        }
+        assert_eq!(setting_from_value(None).language, "zh-CN");
+    }
+
+    #[test]
+    fn unwrap_json_value_borrows_objects_and_parses_strings_once() {
+        let object = serde_json::json!({ "force_xwayland": true });
+        assert!(matches!(
+            unwrap_json_value(&object),
+            std::borrow::Cow::Borrowed(value) if std::ptr::eq(value, &object)
+        ));
+        let wrapped = serde_json::json!(object.to_string());
+        assert_eq!(unwrap_json_value(&wrapped).as_ref(), &object);
+        let invalid = serde_json::json!("not json");
+        assert_eq!(unwrap_json_value(&invalid).as_ref(), &invalid);
+        let nested = serde_json::json!(wrapped.to_string());
+        assert_eq!(unwrap_json_value(&nested).as_ref(), &wrapped);
+    }
+
+    #[test]
+    fn settings_normalization_preserves_boundary_values_and_unrelated_fields() {
+        for heap_mb in [1024, 32768] {
+            for retention in [1, 50] {
+                let mut setting = Setting {
+                    language: "custom-language".to_string(),
+                    port: 4099,
+                    zoom_factor: f64::NEG_INFINITY,
+                    harness_max_heap_mb: Some(heap_mb),
+                    close_action: "quit".to_string(),
+                    backup_retention_count: retention,
+                    backup_include_credentials: true,
+                    active_pet: Some(String::new()),
+                    ..Default::default()
+                };
+                normalize_setting(&mut setting);
+                assert_eq!(setting.harness_max_heap_mb, Some(heap_mb));
+                assert_eq!(setting.backup_retention_count, retention);
+                assert_eq!(setting.zoom_factor, 1.0);
+                assert_eq!(setting.close_action, "quit");
+                assert_eq!(setting.language, "custom-language");
+                assert_eq!(setting.port, 4099);
+                assert!(setting.backup_include_credentials);
+                assert_eq!(setting.active_pet.as_deref(), Some(""));
+            }
+        }
+        for heap_mb in [0, 1023, 32769, u32::MAX] {
+            let mut setting = Setting {
+                harness_max_heap_mb: Some(heap_mb),
+                backup_retention_count: 0,
+                ..Default::default()
+            };
+            normalize_setting(&mut setting);
+            assert_eq!(setting.harness_max_heap_mb, None);
+            assert_eq!(setting.backup_retention_count, 10);
+        }
+    }
+
+    #[test]
+    fn legacy_full_setting_write_preserves_latest_fields() {
+        let stale = Setting {
+            installed: true,
+            language: "en-US".to_string(),
+            port: 4099,
+            harness_max_heap_mb: Some(1024),
+            backup_retention_count: 50,
+            dsh_pkg_commit: Some("new-commit".to_string()),
+            dsh_pkg_tag: Some("new-tag".to_string()),
+            zoom_factor: 0.8,
+            close_action: "quit".to_string(),
+            pet_enabled: false,
+            active_pet: Some("chat:stale".to_string()),
+            pet_size: Some(80.0),
+            force_xwayland: false,
+            ..Default::default()
+        };
+
+        let current = Setting {
+            appearance: super::super::Appearance {
+                palette: "nord".into(),
+                terminal: true,
+                opacity: 70,
+                transparency: true,
+                sidebar_only: true,
+            },
+            harness_max_heap_mb: Some(4096),
+            zoom_factor: 1.6,
+            close_action: "tray".to_string(),
+            pet_enabled: true,
+            active_pet: Some("codex:latest".to_string()),
+            pet_size: Some(140.0),
+            force_xwayland: true,
+            ..Default::default()
+        };
 
         let merged = preserve_persisted_fields(stale, &current);
 
+        assert!(merged.installed);
+        assert_eq!(merged.language, "en-US");
+        assert_eq!(merged.port, 4099);
+        assert_eq!(merged.backup_retention_count, 50);
+        assert_eq!(merged.dsh_pkg_commit.as_deref(), Some("new-commit"));
+        assert_eq!(merged.dsh_pkg_tag.as_deref(), Some("new-tag"));
+        assert_eq!(merged.harness_max_heap_mb, Some(4096));
         assert_eq!(merged.zoom_factor, 1.6);
+        assert_eq!(merged.appearance, current.appearance);
         assert_eq!(merged.close_action, "tray");
         assert!(merged.pet_enabled);
         assert_eq!(merged.active_pet.as_deref(), Some("codex:latest"));
@@ -414,6 +739,10 @@ mod tests {
             merged.pet_size,
             Some(140.0),
             "整对象写入不得覆盖最新桌宠字段"
+        );
+        assert!(
+            merged.force_xwayland,
+            "整对象写入不得覆盖最新的 XWayland 开关"
         );
     }
 
