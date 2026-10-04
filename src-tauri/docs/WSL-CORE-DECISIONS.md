@@ -2460,3 +2460,12 @@ U5.3（iframe 契约）：`desktop/plugin_boot.rs` + `plugin_boot.js.inc`（fram
 - **D-U9-4（已知证据缺口，不为对齐文档而造证据）**：网络模式 mirrored/NAT（#17）在 `src-tauri/src` 零命中；同一 PID 热生效（#6）无仓库内断言；凭据 `umask 077`（#14）无现成夹具；`get_cores` 的 WSL 行字段与离线回包（T3.5/T3.6）无夹具；`wsl-core.tsx` 面板挂载观测（T6.4）无用例。**原列的两条已纠正**：帧身份握手**并非零命中**（见 D-U9-10）；前端 WSL 配置**已有单测**（`test/core-list.test.ts`、`test/wsl-runtime-info.test.ts`、`test/active-core-source.test.ts`、`test/wsl-core-install.test.ts`、`test/wsl-core-install-dialog.test.ts`，另 `src/ui/config/plugin.test.tsx` 8/8），但真实 restart 副作用仍归真机 #8/#11。
 - **交付口径**：目标桌面标签 v0.21.0；WSL 受控基线 `0.1.2-rc.1`；真机与发布包**未运行/未生成**；交付物定性为「**静态与构建完成的迁移候选**」，不得标注「WSL 同步完成」。
 - **落盘**：上述交付口径的固定说明见 `validation/sync-v0.21.0-20261003/SUMMARY.md`（§U9.3 / D-U9-6）。
+
+## D-U8-12（用户已批准）U8.4 本轮仅做 Windows 真机验收（2026-10-03）
+
+- **适用范围**：PLAN §U8.4 真机验收；二开版本当前聚焦 Windows，本轮只验 Windows 桌面客户端及该主机内的 WSL 场景。
+- **范围外**：macOS / 原生 Linux 桌面端真机检查记 `OUT_OF_SCOPE（本轮 Windows 范围）`，不纳入 U8.4 必过项或未完成阻塞项，不记 PASS。此前 U8.4「目录/平台」行中的非 Windows 真机检查以本裁决为准。
+- **仍须执行**：Windows 与 WSL 核心互切、受控安装/升级/回滚、真实 WebView、UNC 边界、凭据权限、Linux PID/进程组与 Windows relay 清理、Mirrored/NAT 及 Windows 本机核心回归。WSL 内的 Linux 检查不是原生 Linux 桌面端测试，仍在本轮范围内。
+- **记录与隔离**：执行台账保留 17 个 Windows + WSL 场景；未执行仍记 `NOT_RUN`，范围裁决不产生测试通过证据。专用发行版/用户、失败注入及网络变更的隔离与授权要求继续适用。
+- **不变项**：U8.3 非 Windows 防护断言、U8.5 三平台 CI 与现有平台守卫代码不变；本裁决不授权推送、安装发布包或改变 WSL 配置。
+- **执行入口**：`DSH-WSL-CORE-PLAN.md` §U8.4；台账 `validation/sync-v0.21.0-20261003/wsl-smoke.md` 与交付摘要 `SUMMARY.md` 同步采用本范围。REVIEW 仍用于审核事实，不与本裁决或执行计划合并。
