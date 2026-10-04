@@ -1,8 +1,14 @@
 /**
  * WSL 核心真机用例 A（U8.4 真机矩阵的桌面侧分支）。
  *
+ * **入口（D-U8-13 裁决）**：本文件不在普通桌面/CI 的收集范围内，只能显式运行
+ * `node node_modules/vitest/vitest.mjs run --config vitest.wsl-real.config.ts`。
+ * 因此这里用普通 `describe`：**前置不满足就直接失败**，不 `skipIf`、不自动改环境
+ * （`docs/specs/testing.md:168-177` 禁止用 skip 掩盖前置缺失）。非 Windows 平台在
+ * `beforeAll` 第一步抛错，且不调用 `wsl.exe`。
+ *
  * 与 `boot.e2e.ts` 的分工：那边验「Windows 内核装配 → 服务 → iframe」，这里验**同一套壳层
- * 在 WSL 核心下**的行为。四个用例都走应用自己的协议，不靠改文件：
+ * 在 WSL 核心下**的行为。这些用例都走应用自己的协议，不靠改文件：
  *
  *   1. 切到 WSL 核心：`update_app_config({ wslDistro })` → `set_active_core({ id: 'wsl' })`
  *      → 冷启动应用让服务换到新核心 → 独立数据根（UNC）与帧内渲染在真机上闭环；
@@ -60,13 +66,18 @@
  *     `~/.dsh-desktop.dev/runtime/node_modules/.bin/dsh` 是 U8.4 受控安装产物。
  *   - 该默认用户在测试窗口内不会被并行任务改动（应用自己不带 `-u`，落到默认用户家目录）。
  *
+ * 收尾（D-U8-13）：`scratchHome` 初始为 `undefined`，**只有前置全部通过后才创建**；
+ * 前置失败时 afterAll 只收掉可能已起的应用，不删任何目录、不进入发行版清理
+ * （旧写法 `rmSync(scratchHome)` 会抛 `TypeError: The "path" argument must be of type
+ * string...`，把真正的失败盖成次生错误 —— 这正是 CI 那次红里的第二个错）。
+ *
  * 不做的事：不在测试里改 `/etc/wsl.conf`、不 `wsl --shutdown`、不碰 `/home/pixel`。
  */
 
 import type { DesktopApp } from '../support/desktop'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { startDesktopApp } from '../support/desktop'
@@ -162,6 +173,25 @@ interface FrameStamp {
  */
 function makeScratchHome(): string {
   return mkdtempSync(join(tmpdir(), 'dsh-e2e-desktop-'))
+}
+
+/**
+ * 只删除**本次确实创建**的隔离根（D-U8-13）。
+ *
+ * 判据不止「非空」：父目录必须逐字等于本次 `tmpdir()`、目录名必须带 `dsh-e2e-desktop-`
+ * 前缀，而且入参只能是 `mkdtempSync` 的返回值 —— 不从环境变量或 store 回算删除目标。
+ * 任何一条不满足都在 `rmSync` 之前失败。
+ */
+function removeScratchHome(created: string): void {
+  expect(
+    resolve(dirname(created)),
+    `拒绝删除不在本次测试根下的目录：${created}`,
+  ).toBe(resolve(tmpdir()))
+  expect(
+    basename(created),
+    `拒绝删除不符合测试前缀的目录：${created}`,
+  ).toMatch(/^dsh-e2e-desktop-/)
+  rmSync(created, { force: true, recursive: true })
 }
 
 // ============================================================================
@@ -539,17 +569,32 @@ function releasePortInDistro(pid: number | undefined): void {
 // 用例
 // ============================================================================
 
-describe.skipIf(process.platform !== 'win32')('WSL 核心真机链路', () => {
+describe('WSL 核心真机链路', () => {
   let app: DesktopApp | undefined
   let browser: WebdriverIO.Browser
-  /** 本跑独占且跨重启复用的隔离根（store 就在它里面，见 makeScratchHome 的注释） */
-  let scratchHome: string
+  /**
+   * 本跑独占且跨重启复用的隔离根（store 就在它里面，见 makeScratchHome 的注释）。
+   *
+   * D-U8-13：初始 `undefined`，**只有真机前置全部通过后才创建**。旧写法把它声明成
+   * `string` 却在前置失败时保持 `undefined`，收尾 `rmSync(scratchHome, …)` 就抛
+   * `TypeError: The "path" argument must be of type string or an instance of Buffer or URL.
+   * Received undefined`，把 beforeAll 的真实失败盖成次生错误（CI run 37177575860 的第二个错）。
+   */
+  let scratchHome: string | undefined
+  /** 真机前置是否全部通过；收尾据此决定要不要进发行版清理（D-U8-13）。 */
+  let preconditionsPassed = false
 
   beforeAll(async () => {
+    // 平台先判：本文件只由 `vitest.wsl-real.config.ts` 收集，非 Windows 直接失败，
+    // 且**不调用 `wsl.exe`**（旧写法用顶层 `describe.skipIf`，会把前置缺失变成静默跳过）
+    if (process.platform !== 'win32')
+      throw new Error(`WSL 真机用例只在 Windows 上运行，当前平台是 ${process.platform}`)
+
     assertRealMachinePreconditions()
+    preconditionsPassed = true
     scratchHome = makeScratchHome()
 
-    app = await startDesktopApp({ homeDir: scratchHome, keepHome: true, resetStore: false })
+    app = await startDesktopApp({ homeDir: requireScratchHome(), keepHome: true, resetStore: false })
     browser = app.browser
 
     // 尽早装壳层收集器：装配失败、iframe 加载失败都会在壳层留下痕迹
@@ -564,11 +609,49 @@ describe.skipIf(process.platform !== 'win32')('WSL 核心真机链路', () => {
   }, READY_TIMEOUT_MS)
 
   afterAll(async () => {
-    // 保留隔离根到最后一刻再删：`stop()` 默认会删掉它，而 store 就在里面
-    await app?.stop({ keepHome: true })
-    rmSync(scratchHome, { force: true, recursive: true })
-    killOrphanWslHarness()
+    // 收尾分两段：应用会话收尾与「本次运行自有资源」清理。两段的错误都要冒出来，
+    // 但**绝不能**用清理去盖掉 beforeAll 的原始失败（D-U8-13）。
+    let stopError: unknown
+    try {
+      // 保留隔离根到最后一刻再删：`stop()` 默认会删掉它，而 store 就在里面
+      await app?.stop({ keepHome: true })
+    }
+    catch (error) {
+      stopError = error
+    }
+
+    let cleanupError: unknown
+    try {
+      if (!preconditionsPassed) {
+        // 前置没通过：本次运行没建隔离根、也没拿到发行版的任何资源所有权 ⇒ 什么都不清
+        process.stdout.write('[wsl-core] 真机前置未通过：跳过隔离根与发行版清理\n')
+      }
+      else {
+        const created = scratchHome
+        if (created !== undefined)
+          removeScratchHome(created)
+        killOrphanWslHarness()
+      }
+    }
+    catch (error) {
+      cleanupError = error
+    }
+
+    // 两段错误都要报出来；都没有就直接返回（前置失败时这里不会吞掉 beforeAll 的原始错误）。
+    if (stopError !== undefined && cleanupError !== undefined)
+      throw new Error(`收尾失败：应用会话收尾与资源清理都出错 —— ${String(stopError)}；${String(cleanupError)}`)
+    if (cleanupError !== undefined)
+      throw cleanupError
+    if (stopError !== undefined)
+      throw stopError
   })
+
+  /** 取本次隔离根。前置没通过时它仍是 `undefined`，属于测试自身的用法错误。 */
+  function requireScratchHome(): string {
+    if (scratchHome === undefined)
+      throw new Error('隔离根尚未创建：真机前置未通过')
+    return scratchHome
+  }
 
   /**
    * 只停机：走应用自己的停机协议，再把应用进程收掉（保留隔离根）。
@@ -600,7 +683,7 @@ describe.skipIf(process.platform !== 'win32')('WSL 核心真机链路', () => {
    */
   async function startAppHost(previous: FrameStamp, timeout = RESTART_TIMEOUT_MS): Promise<FrameStamp> {
     // 必须复用同一个隔离根：store 就写在里面，换根等于换 store（见 makeScratchHome）
-    app = await startDesktopApp({ homeDir: scratchHome, keepHome: true, resetStore: false })
+    app = await startDesktopApp({ homeDir: requireScratchHome(), keepHome: true, resetStore: false })
     browser = app.browser
     await browser.execute(collectPageErrors)
 

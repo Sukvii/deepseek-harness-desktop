@@ -8,6 +8,7 @@ import rootConfig from '../vitest.config'
 import desktopConfig from '../vitest.desktop.config'
 import pluginConfig from '../vitest.plugin.config'
 import unitConfig from '../vitest.unit.config'
+import wslRealConfig from '../vitest.wsl-real.config'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 let runtime: Awaited<ReturnType<typeof createVitest>>
@@ -81,6 +82,29 @@ describe('tooling configuration contracts', () => {
       { name: 'plugin', environment: 'node', maxWorkers: 1, testTimeout: 120_000, hookTimeout: 120_000 },
       { name: 'desktop', environment: 'node', maxWorkers: 1, testTimeout: 180_000, hookTimeout: 180_000 },
     ])
+  })
+
+  /**
+   * D-U8-13：真机车道必须「显式选择」而不是「默认收集 + 自动跳过」。
+   *
+   * 真机用例的前置是「发行版 `Ubuntu` 的默认用户 = 隔离用户，且该用户家目录里已有受控安装
+   * 产物」，普通 CI runner 两者都不具备；留在默认收集范围里会让整个 workflow 变红，
+   * 而用 skip 掩盖又会让「前置缺失」伪装成通过。这里把拆分本身钉成契约。
+   */
+  it('the WSL real-machine lane is excluded from every default project and keeps its own entry', () => {
+    expect(runtime.projects.map(project => project.name)).not.toContain('wsl-real')
+    expect(desktopConfig.test?.include).toEqual(['test/e2e/desktop/*.e2e.ts'])
+    expect(wslRealConfig.test).toEqual({
+      name: 'wsl-real',
+      include: ['test/e2e/wsl-real/*.e2e.ts'],
+      globalSetup: ['./test/e2e/setup-desktop.ts'],
+      environment: 'node',
+      fileParallelism: false,
+      testTimeout: 180_000,
+      hookTimeout: 180_000,
+    })
+    const lane = path.join(root, 'test/e2e/wsl-real/wsl-core.e2e.ts')
+    expect(runtime.projects.filter(project => project.matchesTestGlob(lane)).map(project => project.name)).toEqual([])
   })
 
   it('runtime collection routes unit and E2E files without admitting excluded paths', async () => {
@@ -168,6 +192,7 @@ describe('tooling configuration contracts', () => {
       'vitest.unit.config.ts',
       'vitest.plugin.config.ts',
       'vitest.desktop.config.ts',
+      'vitest.wsl-real.config.ts',
       'tooling.config.ts',
       'bump.config.ts',
       'genapi.config.ts',

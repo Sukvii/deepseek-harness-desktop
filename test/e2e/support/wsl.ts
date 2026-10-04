@@ -1,5 +1,7 @@
 /**
- * WSL 核心真机用例（`test/e2e/desktop/wsl-core.e2e.ts`）的宿主侧辅助。
+ * WSL 核心真机用例（`test/e2e/wsl-real/wsl-core.e2e.ts`）的宿主侧辅助。
+ *
+ * 入口是独立的 `vitest.wsl-real.config.ts`（D-U8-13）：普通桌面/CI 车道不收集该文件。
  *
  * 纯 `node:child_process`，不经 shell（[] 传参，无引号转义问题）。
  * `wsl.exe` 的 stdout 是 UTF-16LE 且带 CRLF，解码口径集中在这里。
